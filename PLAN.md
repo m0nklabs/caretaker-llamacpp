@@ -31,6 +31,18 @@ POST /unload            → unload (only when gateway says queue is empty)
 OpenAI inference stays direct to `llama-server` (`http://127.0.0.1:11440/v1`); the
 control API on `:11441` is lifecycle only.
 
+**Security (operator decision 2026-08-27):** the caretaker control API is
+**authenticated with a single per-caretaker key**, mirroring how Guardian
+connects to cloud providers. **Each caretaker gets its own key** (one per
+GPU host) — the gateway stores it in the corresponding provider entry
+(`config/providers/<host>-local.settings.yaml`, `${VAR}`-expanded, never
+committed). Every `/status`, `/ensure`, `/unload` requires
+`Authorization: Bearer ${CARETAKER_KEY}`; all others are rejected (401).
+The caretaker reads its key from env/secret (never from the repo). A LAN-IP
+allowlist may complement this but never replaces the key. This is primarily
+an implementation in the **caretaker repo**; the gateway only carries the key
+per provider entry.
+
 **Split boundary (hard counts from `GATEWAY_MANAGER_SPLIT.md`):** ~1050 lines true
 lifecycle (spawn/stop/restart, args build, launch-signature drift, health/crash watchdog
 + auto-restart, unload, ComfyUI VRAM freeing, context save/restore) + ~40 VRAM-slot
@@ -144,6 +156,10 @@ exposes idle-unload + recovery primitives.
   once before retry and surface 503 `{error, message, crash_details}` on failure. Caretaker
   exposes this as `POST /ensure` (idempotent) — the gateway catches 503 and calls `/ensure`,
   not its own reload.
+- **Control-API auth:** from the first LAN exposure, all control endpoints (`/status`,
+  `/ensure`, `/unload`) require `Authorization: Bearer ${CARETAKER_KEY}` (single
+  per-caretaker key; see Implementation note below). Add a shared FastAPI/route dependency
+  so the gate applies uniformly.
 
 **Tests:** crash-loop → watchdog restart with backoff; acquire blocks until VRAM frees;
 release notifies; unload guarded against double-unload; reload-after-connect-error path.
@@ -189,7 +205,9 @@ the gateway reaches both via `management_url`.
   (14700K file has Windows GGUF paths — no copy of the Linux list).
 - **LAN bind:** the control API binds to the LAN interface in this phase (today `127.0.0.1`);
   inference remains on `:11440`, control on `:11441` (`http://192.168.1.35:11441` +
-  `http://192.168.1.x:11441`).
+  `http://192.168.1.x:11441`). **Auth is mandatory from first LAN bind:** the single
+  per-caretaker key (see Context → Security) gates every control call — this is exactly
+  when the key model becomes load-bearing.
 - **Windows service:** no systemd → **NSSM** wrapper (or scheduled task at startup) running
   the same caretaker package + `llama-server.exe`; `ServerProcess` interface from Phase A
   gets a Windows impl (no `sudo systemctl`, process-group kill, `--host 0.0.0.0`).
@@ -239,6 +257,10 @@ Windo ws-side ops; gateway entry is **config-only → hot-reload**.
    passive in §7.
 3. **Gateway-side contract changes** (F5): the ensure-before-forward + 503/`model_not_loaded`
    recovery paths, and the idle-unload **decision** feeding `/unload`.
+4. **Per-caretaker key wiring (guardian, F5–F6):** the gateway stores one key per
+   caretaker-host provider entry (`config/providers/<host>-local.settings.yaml`,
+   `api_key: ${<HOST>_CARETAKER_KEY}`) and sends `Authorization: Bearer <key>` on every
+   control call (`/status`, `/ensure`, `/unload`) — the same pattern as cloud providers.
 4. **Provider naming** confirmed: `ai-kvm2-local`, `14700k-local` (F2 layout).
 
 **When caretaker work can start:** the standalone-repo caretaker (Phases A–E) is largely
@@ -261,9 +283,13 @@ permanent location.
    executes (`/ensure`). Confirm no move of choice into caretaker.
 3. **Windows IP / GGUF list / VRAM on the 14700K.** Which GGUFs, how much VRAM
    (`~limit_mb`), the exact LAN IP for `management_url`. Unknowns blocking E specifics.
-4. **Key handling for `/ensure` + `/unload`.** Once exposed on the LAN, these must be
-   authenticated — recommend a **shared secret** (`Authorization: Bearer ${CARETAKER_KEY}`)
-   or a **LAN-IP allowlist**; decide which and default the local loopback case.
+4. **Key handling for `/ensure` + `/unload`.** — **RESOLVED (operator 2026-08-27):**
+   **single per-caretaker key.** Each caretaker authenticates its control API with **one
+   key of its own** (`Authorization: Bearer ${CARETAKER_KEY}`, read from env/secret, never
+   committed). The gateway stores that key in the caretaker-host's provider entry (per-host
+   key, just like cloud providers) and sends it on every control call. A LAN-IP allowlist is
+   optional and never a replacement. Implementation lives primarily in this (caretaker) repo;
+   gateway wiring is a dependency (see §7/Dependencies).
 5. **Where does `scheduler/manager.py` (maintenance/services-stopper) go?** Stays in the
    gateway or moves to systemd/cron — operator choice (not caretaker scope).
 6. **Watchdog ownership.** Does caretaker own crash-restart (systemd unit as pure exec), or
