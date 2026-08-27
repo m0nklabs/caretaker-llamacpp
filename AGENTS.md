@@ -54,6 +54,15 @@ POST /unload            → unload (of zelf na N minuten — met verkeers-input)
 (OpenAI-inferentie-API blijft rechtstreeks llama-server: http://127.0.0.1:11440/v1)
 ```
 
+**Security (operator-besluit 2026-08-27): per-caretaker één eigen key.** Elke
+control-call (`/status`, `/ensure`, `/unload`) vereist
+`Authorization: Bearer ${CARETAKER_KEY}`; zonder geldige key → 401. Elke
+GPU-host heeft zijn eigen key (net als cloud providers bij Guardian): de
+gateway slaat die per host op in de provider-entry
+(`config/providers/<host>-local.settings.yaml`, `api_key: ${...}`, nooit
+committen). De caretaker leest de key uit env/secret, nooit uit de repo.
+LAN-IP-allowlist mag aanvullend, nooit vervangend.
+
 Contract gateway ↔ manager:
 
 - Gateway roept vóór een forward optioneel `POST /ensure {model}` aan;
