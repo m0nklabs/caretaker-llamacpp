@@ -36,15 +36,16 @@ def test_auth_gate_wrong_key_returns_401(monkeypatch: pytest.MonkeyPatch) -> Non
     assert resp.status_code == 401
 
 
-def test_auth_gate_non_ascii_configured_key_returns_401_not_500(
+def test_auth_gate_non_ascii_configured_key_returns_503_not_500(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-ASCII CARETAKER_KEY must not crash the gate (compare_digest
-    rejects non-ASCII str; the key is compared as UTF-8 bytes). HTTP headers
-    are ASCII-only, so a non-ASCII client token cannot even be sent."""
+    """A non-ASCII CARETAKER_KEY is a misconfiguration: the gate fails fast
+    with 503 instead of locking the API in a permanent 401 loop (HTTP header
+    values are latin-1 on the wire, so such a key can never be transmitted)."""
     monkeypatch.setenv("CARETAKER_KEY", "süper-çrète")
     resp = client.get("/status", headers={"Authorization": "Bearer wrong"})
-    assert resp.status_code == 401
+    assert resp.status_code == 503
+    assert "must be ASCII" in resp.text
 
 
 def test_auth_gate_correct_key_reaches_route_501(

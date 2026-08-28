@@ -32,6 +32,9 @@ async def require_caretaker_key(
     """Auth gate: enforce the single per-caretaker Bearer key.
 
     - No ``CARETAKER_KEY`` env var set → ``503`` "caretaker key not configured".
+    - Non-ASCII ``CARETAKER_KEY`` → ``503`` (HTTP headers are latin-1 on the
+      wire; a non-ASCII key can never be transmitted and would permanently
+      lock the control API in a confusing 401 loop).
     - Wrong/missing key → ``401``.
     - Correct key → pass through.
     """
@@ -40,6 +43,12 @@ async def require_caretaker_key(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="caretaker key not configured",
+        )
+    if not expected.isascii():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="CARETAKER_KEY must be ASCII: non-ASCII keys can never be "
+            "transmitted by HTTP clients and would lock the control API",
         )
     token = None
     if authorization and authorization.lower().startswith("bearer "):
