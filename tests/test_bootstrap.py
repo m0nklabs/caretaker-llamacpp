@@ -89,6 +89,23 @@ def test_config_invalid_utf8_raises_clear_error(
     assert "failed to read/parse" in str(excinfo.value)
 
 
+def test_entrypoint_defaults_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind defaults to loopback:11441; CARETAKER_HOST/PORT override (F5/F6
+    remote gateways reach the caretaker on its LAN interface)."""
+    monkeypatch.delenv("CARETAKER_HOST", raising=False)
+    monkeypatch.delenv("CARETAKER_PORT", raising=False)
+    assert entrypoint.resolve_bind_host() == "127.0.0.1"
+    assert entrypoint.resolve_bind_port() == 11441
+
+    monkeypatch.setenv("CARETAKER_HOST", "192.168.1.99")
+    monkeypatch.setenv("CARETAKER_PORT", "12441")
+    assert entrypoint.resolve_bind_host() == "192.168.1.99"
+    assert entrypoint.resolve_bind_port() == 12441
+
+    monkeypatch.setenv("CARETAKER_PORT", "not-a-number")
+    assert entrypoint.resolve_bind_port() == 11441
+
+
 def test_app_routes_registered() -> None:
     """The three control endpoints are registered on the app."""
     paths = {route.path for route in app.routes if hasattr(route, "path")}
