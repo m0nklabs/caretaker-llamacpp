@@ -53,6 +53,18 @@ def test_config_missing_file_raises_clear_error(
     assert "not found" in str(excinfo.value)
 
 
+def test_config_non_mapping_yaml_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+) -> None:
+    """A parseable-but-non-mapping YAML file raises a clear ModelsConfigError."""
+    cfg_file = tmp_path / "bad.settings.yaml"
+    cfg_file.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    monkeypatch.setenv("CARETAKER_MODELS_FILE", str(cfg_file))
+    with pytest.raises(ModelsConfigError) as excinfo:
+        config_mod.load_models_config()
+    assert "must be a YAML mapping" in str(excinfo.value)
+
+
 def test_app_routes_registered() -> None:
     """The three control endpoints are registered on the app."""
     paths = {route.path for route in app.routes if hasattr(route, "path")}

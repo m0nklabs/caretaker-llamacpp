@@ -63,7 +63,15 @@ def load_models_config() -> ModelsConfig:
             data = yaml.safe_load(fh) or {}
     except (OSError, yaml.YAMLError) as exc:
         raise ModelsConfigError(f"failed to read/parse {path!s}: {exc}") from exc
-    return ModelsConfig(
-        models=data.get("models") or {},
-        aliases=data.get("aliases") or {},
-    )
+    if not isinstance(data, dict):
+        raise ModelsConfigError(
+            f"models config file {path!s} must be a YAML mapping, "
+            f"got {type(data).__name__}"
+        )
+    models = data.get("models") or {}
+    aliases = data.get("aliases") or {}
+    if not isinstance(models, dict) or not isinstance(aliases, dict):
+        raise ModelsConfigError(
+            f"models config file {path!s} must have 'models' and 'aliases' as mappings"
+        )
+    return ModelsConfig(models=models, aliases=aliases)
