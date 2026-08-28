@@ -106,35 +106,9 @@ def test_entrypoint_defaults_to_loopback(monkeypatch: pytest.MonkeyPatch) -> Non
     assert entrypoint.resolve_bind_port() == 11441
 
 
-def test_app_routes_registered() -> None:
-    """The three control endpoints are registered on the app."""
-    paths = {route.path for route in app.routes if hasattr(route, "path")}
-    assert {"/status", "/ensure", "/unload"} <= paths
 
 def test_app_routes_registered() -> None:
     """The three control endpoints are registered on the app."""
     paths = {route.path for route in app.routes if hasattr(route, "path")}
     assert {"/status", "/ensure", "/unload"} <= paths
 
-def test_bind_resolution_loopback_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without CARETAKER_HOST/PORT the control API binds loopback :11441."""
-    monkeypatch.delenv("CARETAKER_HOST", raising=False)
-    monkeypatch.delenv("CARETAKER_PORT", raising=False)
-    assert entrypoint.resolve_bind_host() == "127.0.0.1"
-    assert entrypoint.resolve_bind_port() == 11441
-
-
-def test_bind_resolution_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A remote gateway (F5/F6) can bind the control API to the LAN host."""
-    monkeypatch.setenv("CARETAKER_HOST", "192.168.1.35")
-    monkeypatch.setenv("CARETAKER_PORT", "11441")
-    assert entrypoint.resolve_bind_host() == "192.168.1.35"
-    assert entrypoint.resolve_bind_port() == 11441
-
-
-def test_bind_resolution_invalid_port_falls_back(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A non-numeric CARETAKER_PORT falls back to the default port."""
-    monkeypatch.setenv("CARETAKER_PORT", "not-a-port")
-    assert entrypoint.resolve_bind_port() == 11441
