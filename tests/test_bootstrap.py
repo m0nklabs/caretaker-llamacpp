@@ -111,6 +111,11 @@ def test_app_routes_registered() -> None:
     paths = {route.path for route in app.routes if hasattr(route, "path")}
     assert {"/status", "/ensure", "/unload"} <= paths
 
+def test_app_routes_registered() -> None:
+    """The three control endpoints are registered on the app."""
+    paths = {route.path for route in app.routes if hasattr(route, "path")}
+    assert {"/status", "/ensure", "/unload"} <= paths
+
 def test_bind_resolution_loopback_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without CARETAKER_HOST/PORT the control API binds loopback :11441."""
     monkeypatch.delenv("CARETAKER_HOST", raising=False)
