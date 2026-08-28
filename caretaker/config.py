@@ -61,7 +61,7 @@ def load_models_config() -> ModelsConfig:
     try:
         with path.open(encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ModelsConfigError(f"failed to read/parse {path!s}: {exc}") from exc
     if not isinstance(data, dict):
         raise ModelsConfigError(

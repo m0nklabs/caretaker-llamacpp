@@ -33,6 +33,17 @@ def test_auth_gate_wrong_key_returns_401(monkeypatch: pytest.MonkeyPatch) -> Non
     assert resp.status_code == 401
 
 
+def test_auth_gate_non_ascii_configured_key_returns_401_not_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-ASCII CARETAKER_KEY must not crash the gate (compare_digest
+    rejects non-ASCII str; the key is compared as UTF-8 bytes). HTTP headers
+    are ASCII-only, so a non-ASCII client token cannot even be sent."""
+    monkeypatch.setenv("CARETAKER_KEY", "süper-çrète")
+    resp = client.get("/status", headers={"Authorization": "Bearer wrong"})
+    assert resp.status_code == 401
+
+
 def test_auth_gate_correct_key_reaches_route_501(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -63,6 +74,18 @@ def test_config_non_mapping_yaml_raises_clear_error(
     with pytest.raises(ModelsConfigError) as excinfo:
         config_mod.load_models_config()
     assert "must be a YAML mapping" in str(excinfo.value)
+
+
+def test_config_invalid_utf8_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+) -> None:
+    """Invalid UTF-8 bytes in the models file raise a clear ModelsConfigError."""
+    cfg_file = tmp_path / "bad-utf8.settings.yaml"
+    cfg_file.write_bytes(b"models:\n  name: \xff\xfe broken\n")
+    monkeypatch.setenv("CARETAKER_MODELS_FILE", str(cfg_file))
+    with pytest.raises(ModelsConfigError) as excinfo:
+        config_mod.load_models_config()
+    assert "failed to read/parse" in str(excinfo.value)
 
 
 def test_app_routes_registered() -> None:

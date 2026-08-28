@@ -44,7 +44,9 @@ async def require_caretaker_key(
     token = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:]
-    if token is None or not hmac.compare_digest(token, expected):
+    if token is None or not hmac.compare_digest(
+        token.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid caretaker key",
