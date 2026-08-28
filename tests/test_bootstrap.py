@@ -89,6 +89,30 @@ def test_config_invalid_utf8_raises_clear_error(
     assert "failed to read/parse" in str(excinfo.value)
 
 
+def test_config_falsy_non_mapping_root_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+) -> None:
+    """A falsy non-mapping root (e.g. `[]`) is not silently emptied into {}."""
+    cfg_file = tmp_path / "list-root.settings.yaml"
+    cfg_file.write_text("[]\n", encoding="utf-8")
+    monkeypatch.setenv("CARETAKER_MODELS_FILE", str(cfg_file))
+    with pytest.raises(ModelsConfigError) as excinfo:
+        config_mod.load_models_config()
+    assert "must be a YAML mapping" in str(excinfo.value)
+
+
+def test_config_falsy_models_value_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+) -> None:
+    """A falsy `models:` value (empty list) is not silently accepted as {}."""
+    cfg_file = tmp_path / "empty-list-models.settings.yaml"
+    cfg_file.write_text("models: []\n", encoding="utf-8")
+    monkeypatch.setenv("CARETAKER_MODELS_FILE", str(cfg_file))
+    with pytest.raises(ModelsConfigError) as excinfo:
+        config_mod.load_models_config()
+    assert "must have 'models' and 'aliases' as mappings" in str(excinfo.value)
+
+
 def test_entrypoint_defaults_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bind defaults to loopback:11441; CARETAKER_HOST/PORT override (F5/F6
     remote gateways reach the caretaker on its LAN interface)."""
