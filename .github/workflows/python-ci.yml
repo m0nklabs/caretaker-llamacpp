@@ -1,0 +1,20 @@
+name: Python CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-ci:
+    uses: m0nklabs/github-action-runners/.github/workflows/python-ci.yml@main
+    with:
+      python-version: "3.14"
+      src-dir: caretaker
+      test-dir: tests
+      lint-path: "caretaker tests"
+    secrets: inherit

@@ -18,6 +18,16 @@ is** en Guardian puur de gateway + logger wordt.
 
 ## Status (2026-08-26)
 
+- **Bootstrap-fase gedaan (2026-08-28).** Het walkable skeleton van PLAN.md §1 is
+  gebouwd: `pyproject.toml` (package `caretaker`, Python >=3.14), `caretaker/`
+  (uvicorn-runner via `__main__.py`, `config.py`, `manager.py`-skeleton,
+  `server.py` met de 3 control-routes + auth-gate), `deploy/systemd/`
+  (Linux-template; Windows gebruikt NSSM), `tests/test_bootstrap.py`. De 3
+  endpoints geven nu 501 met de auth-gate eromheen (lees `CARETAKER_KEY` uit
+  env; zonder → 503, foute key → 401). **Fases A–E (PLAN.md §2–§6) staan nog
+  open** — de lifecycle-kern verhuist uit
+  `guardian-llmprovider-gateway/app/engine/manager.py`. Zie `./PLAN.md` voor de
+  volgorde.
 - **Plan-only. Niks gebouwd, repo leeg.** Bronplannen leven nog in het
   guardian-repo: `~/guardian-llmprovider-gateway/docs/GATEWAY_MANAGER_SPLIT.md` en
   `~/guardian-llmprovider-gateway/docs/LAN_GPU_BACKENDS.md`.
