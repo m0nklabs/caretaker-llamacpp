@@ -61,8 +61,8 @@ def load_models_config() -> ModelsConfig:
     try:
         with path.open(encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
-    except yaml.YAMLError as exc:
-        raise ModelsConfigError(f"failed to parse {path!s}: {exc}") from exc
+    except (OSError, yaml.YAMLError) as exc:
+        raise ModelsConfigError(f"failed to read/parse {path!s}: {exc}") from exc
     return ModelsConfig(
         models=data.get("models") or {},
         aliases=data.get("aliases") or {},
