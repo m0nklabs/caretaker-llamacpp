@@ -2,7 +2,7 @@
 
 > Canonical AI-agent context voor dit repo. **Eerst lezen.**
 > Claude Code: `CLAUDE.md` → hier. Goose: `.goosehints` → hier.
-> Status: **init-scaffold (2026-08-26) — het repo is nog leeg, er is nog niets gebouwd.**
+> Status: **bootstrap gebouwd (2026-08-28); fases A–E open — zie `./PLAN.md`.**
 
 ## Wat is dit project
 
@@ -16,15 +16,72 @@ Ontstaan uit het opsplitsingsplan `GATEWAY_MANAGER_SPLIT.md` (operator-besluit
 naast llama-server draaien, zodat **alles wat modellen serveert een provider
 is** en Guardian puur de gateway + logger wordt.
 
-## Status (2026-08-26)
+## Waar dit project onderdeel van is
 
-- **Plan-only. Niks gebouwd, repo leeg.** Bronplannen leven nog in het
-  guardian-repo: `~/guardian-llmprovider-gateway/docs/GATEWAY_MANAGER_SPLIT.md` en
-  `~/guardian-llmprovider-gateway/docs/LAN_GPU_BACKENDS.md`.
-- Deel van een drietal plannen (alle drie niet gebouwd):
-  - Gateway/Manager-split → dit project + `guardian-llmprovider-gateway`
-  - LAN GPU backends (provider-unificatie)
-  - Per-provider config-bestanden (`config/providers/<naam>.settings.yaml`)
+Dit repo is **niet op zichzelf staand** — het is **fase F5 van de Guardian 2.0
+masterplan** (issue #1 in `m0nklabs/guardian-llmprovider-gateway`,
+`docs/IMPLEMENTATION_PLAN.md`, canoniek). Fasevolgorde F0–F7:
+
+- **F0–F4 (GEMMERGED):** foundation/rename, CI, per-provider config (F2),
+  local als managed provider (F3), en **F4 = registry/keuze/discovery
+  ontdraaien uit `engine/manager.py`** → de gateway-laag
+  (`app/local_inference/model_registry.py`, `ModelRegistry`). Die logica
+  **blijft definitief in de gateway** — dit repo neemt hem NIET over.
+- **F5 (DIT REPO, nu):** caretaker-daemon + local passief. De gateway wordt
+  een passieve provider-entry (`base_url: http://127.0.0.1:11440/v1`,
+  `management_url: http://127.0.0.1:11441`, `managed: false`) en praat via de
+  control-API (`:11441`, `CARETAKER_KEY`-Bearer) met deze manager.
+- **F6 (daarna):** Windows/14700K-provider (NSSM; elke manager leest zijn
+  EIGEN `models.local.settings.yaml`).
+- **F7 (slot):** cut-over naar de nieuwe dir + legacy bevriezen.
+
+**Gateway-wiring-blauwdruk (essentieel voor fase-1/2-contract):**
+`~/guardian-llmprovider-gateway/docs/F5_GATEWAY_WIRING_ANALYSIS.md` — kaart
+van alle lifecycle-aanroep-sites in de gateway (traffic/background/admin/
+discovery), wat verhuist (`load`/`switch_model`/`unload`, health-verificatie)
+en wat NIET verhuist (registry/keuze, `is_switch_allowed`, idle-unload-
+beslissing, admin/status/metrics-readouts) + risico's die het API-contract
+bepalen (`POST /ensure`, `POST /unload`, `GET /status`, allen Bearer).
+
+**Review-werkstroom (zelfde cultuur als guardian):** dit repo heeft
+`.github/workflows/pr-piet.yml` (org-reusable `m0nklabs/pr-piet`, tier-1
+deepseek + optionele tier-2; `single_call_review: true` experimenteel). Na
+**elke laatste commit** → `gh pr comment <n> --body "/review"` (mens-account
+`m0nk111`). **Merge-criterium (operator): mergeen pas als er GEEN openstaande
+bevindingen/threads uit de review zijn** (weerlegd+beantwoord telt niet);
+geen auto-approve/auto-merge — human merge. Concurrency-cancel van de
+auto-`pull_request`-run is een bekend patroon → herstel met
+`gh run rerun <run-id> --failed`. **PR's van `ecc-tools[bot]` (ECC-bundle,
+bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
+
+## Status (2026-08-28)
+
+- **Bootstrap-fase GEDAAN (2026-08-28, PR #1 `f5-bootstrap` — review-loop
+  actief).** Skeleton van PLAN.md §1: `pyproject.toml` (package `caretaker`,
+  Python >=3.12), `caretaker/` (`__main__.py` uvicorn-runner,
+  `config.py` loader, `manager.py`-skeleton, `server.py` met de 3
+  control-routes + auth-gate), `deploy/systemd/` (Linux-template; Windows
+  NSSM), `tests/test_bootstrap.py` (**12 tests groen**), `requirements.txt`
+  + `.github/workflows/python-ci.yml` (org-reusable, python 3.12 — de
+  self-hosted pool heeft de deps daar pre-installed; de reusable doet
+  `pip install --no-deps -r requirements.txt`).
+  - **Auth-gate:** leest `CARETAKER_KEY` uit env; zonder → 503, foute key →
+    401, constant-time via `hmac.compare_digest` op UTF-8-bytes (non-ASCII
+    key veilig). HTTP-headers zijn ASCII-only — non-ASCII client-token is
+    fysiek onmogelijk.
+  - **Config-loader:** `load_models_config()` uit `models.local.settings.yaml`
+    (pad via `CARETAKER_MODELS_FILE`); foutafhandeling volledig →
+    `ModelsConfigError` (missing/OSError/UnicodeDecodeError/YAMLError + type-
+    validatie: top-level mapping, `models`/`aliases` mappings).
+  - **Bind host/port configureerbaar:** `CARETAKER_HOST`/`CARETAKER_PORT`,
+    default loopback `127.0.0.1:11441` (test-pinned; remote-gateway F6 zet
+    LAN-interface).
+- **Fases A–E (PLAN.md §2–§6) staan nog open** — de lifecycle-kern
+  (~1050 regels) verhuist uit
+  `guardian-llmprovider-gateway/app/engine/manager.py`:
+  A = lifecycle core (spawn/stop/reload + args-bouw byte-identiek), B = drift,
+  C = watchdog + VRAM, D = idle-unload-contract, E = multi-host/Windows.
+- **Plan-only. Niks gebouwd, repo leeg** = VERLEDEN — zie boven.
 
 ## Scope — wat hoort WEL hier (alleen de lifecycle-kern)
 
@@ -36,12 +93,13 @@ Ontleed uit `engine/manager.py` (~1637 regels), hard geteld:
 | ~40 | VRAM-slot-acquisitie (`VRAMScheduler.acquire/release`) | Hier |
 | ~40 | `reload_backend_after_connect_error` (herstel-pad) | Hier |
 | ~25 | Idle-unload watcher | Hier, MAAR verweven met verkeer (contract met gateway) |
-| ~509 | Registry/keuze/discovery (`resolve_model`, preferred tool/reasoning model, vision-cache, context-metadata, public model map) | **Blijft in de gateway** (fase 0 = ontdraaien) |
+| ~509 | Registry/keuze/discovery (`resolve_model`, preferred tool/reasoning model, vision-cache, context-metadata, public model map) | **Blijft in de gateway — F4 GEDAAN** (`ModelRegistry`, `app/local_inference/model_registry.py`) |
 | ~130 | Resolutie/sizes/timeouts (`local_inference/models.py`) | Gateway |
 | ~78 | Settings lezen (`_load_aliases`, `_load_switch_allowlist`, `_load_config`) | Gedeeld — leest dezelfde YAML, geen kopie |
 
 **Principe: settings zijn geen manager-werk.** `models.local.settings.yaml`
-is de enige gedeelde bron; de caretaker leest hem alleen.
+is de enige gedeelde bron; de caretaker leest hem alleen (geen keuze-
+logica/registratie kopiëren).
 
 ## Design-contract (uit het plan)
 
@@ -110,7 +168,7 @@ ai-kvm-2 (Linux, GPU #1)              14700K (Windows, GPU #2)
 - **Slots/context-save:** `~/llama_slots/` (`auto_save_*`-bestanden).
 - **Guardian (de gateway-kant):** systemd-unit `llama-guardian.service`,
   venv `~/guardian-llmprovider-gateway/venv`, nginx-mux op `:11434`/`:11435`/`:11436`.
-- **Caretaker-controlpoort (gepland):** `11441`.
+- **Caretaker-controlpoort:** `11441` (bind via `CARETAKER_HOST`/`CARETAKER_PORT`).
 - **Zoekstack (user-basis):** searxng `127.0.0.1:28082`, kindly-web-search
   MCP `127.0.0.1:28083` — niet de kyberm0nk-containers (28080/28081) gebruiken.
 - **Browser-automatisering:** Playwright MCP (headless chromium) beschikbaar.
@@ -118,13 +176,17 @@ ai-kvm-2 (Linux, GPU #1)              14700K (Windows, GPU #2)
 ## Critical rules / conventies
 
 - **Testen vóór claimen:** zodra er code is: `py_compile` + pytest, nooit
-  "fixed" claimen zonder verifieerbare run.
+  "fixed" claimen zonder verifieerbare run. Tests groen houden: huidige suite
+  12 tests — bij elke wijziging volledig draaien (`./venv/bin/python -m pytest
+  tests/ -q -p no:cacheprovider`).
 - **Geen hardcoded variabelen.** Paden/poorten/namen/timeouts komen in
   config-YAML (`${VAR}`-expandable) of een paths-module; nooit literals
   "voor het gemak" kopiëren. Een hardcoded waarde die config omzeilt is een
   bug, geen shortcut.
 - **Commit-taal:** Nederlands is prima voor operator-facing notities
   (intern project); Engels voor code, API en publieke docs.
+- **Commit-identity = de modelnaam van de agent** (zelfde als guardian-repo;
+  nooit overschrijven naar `PR-Piet`).
 - **AGENTS.md altijd bijwerken — inclusief verse bevindingen.** Elke
   gedragsverandering, bugfix, config-wijziging én elk feit dat moest worden
   uitgezocht gaat in DEZELFDE sessie dit bestand in (vóór de commit). De
@@ -138,31 +200,60 @@ ai-kvm-2 (Linux, GPU #1)              14700K (Windows, GPU #2)
   + eigen logging horen erbij zodra er iets draait.
 - **Niet dupliceren:** de ontwerpdetails staan in de plan-docs van het
   guardian-repo; dit bestand indexeert en verwijst, legt niet opnieuw uit.
+- **PR-review-loop vóór elke merge:** na elke laatste commit `/review` posten
+  (mens-account `m0nk111`), merge pas zonder openstaande bevindingen
+  (weerlegd+beantwoord telt niet), human merge. ECC-bundle-PR's van
+  `ecc-tools[bot]` niet aanraken.
 
 ## Directory map
 
 ```text
-PLAN.md     Gefaseerd implementatieplan (F4-F6 van het Guardian 2.0 masterplan)
-AGENTS.md   Dit bestand (init-scaffold)
-(in te vullen zodra de eerste code er staat)
+PLAN.md             Gefaseerd implementatieplan (fases A–E + gateway-wiring)
+AGENTS.md           Dit bestand
+pyproject.toml      Package `caretaker` (Python >=3.12; dev: pytest/ruff)
+requirements.txt    Runtime-deps voor de org-reusable python-ci (--no-deps)
+caretaker/
+  __main__.py       uvicorn entrypoint (CARETAKER_HOST/PORT, default :11441)
+  config.py         load_models_config() → ModelsConfig (models/aliases)
+  manager.py        Skeleton `Caretaker`-klasse (fase-stubs A–D: NotImplementedError)
+  server.py         FastAPI: GET /status, POST /ensure, POST /unload (+ auth-gate)
+deploy/systemd/
+  caretaker-llamacpp.service   Linux-sjabloon (EnvironmentFile=/etc/caretaker/caretaker.env)
+tests/
+  test_bootstrap.py 12 tests: auth-gate (503/401/non-ASCII-key), config-fouten,
+                    routes, entrypoint bind-contract
+.github/workflows/
+  pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
+  python-ci.yml     Org-reusable python-ci (python 3.12, src caretaker)
 ```
 
 ## Handoff
 
 - 2026-08-26: repo aangemaakt (leeg, publiek: `m0nklabs/caretaker-llamacpp`).
-  AGENTS.md-scaffold geschreven op basis van
-  `~/guardian-llmprovider-gateway/docs/GATEWAY_MANAGER_SPLIT.md` +
-  `LAN_GPU_BACKENDS.md`. **`PLAN.md` toegevoegd: het gefaseerde
-  implementatieplan (fases A-E + gateway-wiring), geschreven door een
-  background worker op basis van de ontleding in GATEWAY_MANAGER_SPLIT.md.**
-  Volgende stap (beslissing nodig): monorepo met twee daemons vs. direct
-  twee aparte repos (plan raadt standalone aan, met in-gateway bootstrap
-  optioneel); en fase 0 = de ~509 regels registry/keuze/discovery ontdraaien
-  naar de gateway-laag (gebeurt in het guardian-repo, niet hier).
+  AGENTS.md-scaffold + **`PLAN.md`** (gefaseerd plan fases A–E + gateway-
+  wiring) op basis van `GATEWAY_MANAGER_SPLIT.md` + `LAN_GPU_BACKENDS.md`
+  (background worker). Operator koos (2026-08-28) **standalone repo** (niet
+  monorepo-first) voor F5.
+- **2026-08-28: bootstrap gebouwd + review-loop gestart.** Skeleton
+  (PLAN.md §1) gebouwd door background worker; lead reviewde + commit +
+  PR #1 (`f5-bootstrap`) + `/review`. PR-Piet vond 7 bevindingen, allemaal
+  gefixt + beantwoord (of weerlegd): requires-python >=3.12 i.p.v. 3.14;
+  OSError/UnicodeDecodeError/non-mapping-validatie in config-loader;
+  UTF-8-bytes voor `compare_digest`; **`CARETAKER_HOST`/`CARETAKER_PORT`**
+  configureerbaar (loopback default) voor remote-gateway (F6). CI: python-ci
+  op **3.12** omdat de self-hosted pool daar de deps pre-installed heeft
+  (org-reusable draait `--no-deps`). **12 tests groen**, ruff clean.
+  ECC-bot maakte autonoom PR #2 (bundle) — niet aanraken.
+  Volgende stap: **Phase A — lifecycle core** (`switch_model`,
+  `_build_args_string`, `_write_server_args`, `ServerProcess`-interface uit
+  `engine/manager.py` naar `caretaker/manager.py`, byte-identiek qua
+  start-args; zie PLAN.md §2).
 
 ## References
 
 - **Dit repo: gefaseerd plan** → `./PLAN.md` (canoniek voor caretaker-werk)
+- **Gateway-wiring-analyse (F5-contract)** →
+  `~/guardian-llmprovider-gateway/docs/F5_GATEWAY_WIRING_ANALYSIS.md`
 - Split-plan (bron): `~/guardian-llmprovider-gateway/docs/GATEWAY_MANAGER_SPLIT.md`
 - Provider-unificatie: `~/guardian-llmprovider-gateway/docs/LAN_GPU_BACKENDS.md`
 - Per-provider config: `~/guardian-llmprovider-gateway/docs/CONFIG_PROVIDER_FILES.md`
