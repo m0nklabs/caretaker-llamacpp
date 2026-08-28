@@ -52,16 +52,16 @@ def load_models_config() -> ModelsConfig:
     :class:`ModelsConfigError` when the file is missing or unparseable.
     """
     path = models_file_path()
-    if not path.is_file():
-        raise ModelsConfigError(
-            f"models config file not found at {path!s}; "
-            f"set {MODELS_FILE_ENV} to point at this host's "
-            "models.local.settings.yaml"
-        )
     try:
         with path.open(encoding="utf-8") as fh:
             loaded = yaml.safe_load(fh)
         data = {} if loaded is None else loaded
+    except FileNotFoundError:
+        raise ModelsConfigError(
+            f"models config file not found at {path!s}; "
+            f"set {MODELS_FILE_ENV} to point at this host's "
+            "models.local.settings.yaml"
+        ) from None
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ModelsConfigError(f"failed to read/parse {path!s}: {exc}") from exc
     if not isinstance(data, dict):

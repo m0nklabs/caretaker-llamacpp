@@ -6,6 +6,8 @@ lifecycle logic is exercised here — the handlers are stubs returning 501.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from caretaker import __main__ as entrypoint
 from caretaker import config as config_mod
@@ -63,6 +65,27 @@ def test_config_missing_file_raises_clear_error(
     with pytest.raises(ModelsConfigError) as excinfo:
         config_mod.load_models_config()
     assert "not found" in str(excinfo.value)
+
+
+def test_config_unreadable_file_reports_read_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+) -> None:
+    """An existing but unreadable file is a read failure, not 'not found'."""
+    if os.geteuid() == 0:
+        import pytest as _pytest  # noqa: PLC0415
+
+        _pytest.skip("running as root; permission bits are not enforced")
+    cfg_file = tmp_path / "locked.settings.yaml"
+    cfg_file.write_text("models: {}\n", encoding="utf-8")
+    cfg_file.chmod(0)
+    monkeypatch.setenv("CARETAKER_MODELS_FILE", str(cfg_file))
+    try:
+        with pytest.raises(ModelsConfigError) as excinfo:
+            config_mod.load_models_config()
+        assert "failed to read/parse" in str(excinfo.value)
+        assert "not found" not in str(excinfo.value)
+    finally:
+        cfg_file.chmod(0o600)
 
 
 def test_config_non_mapping_yaml_raises_clear_error(
