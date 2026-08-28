@@ -72,7 +72,7 @@ def test_config_unreadable_file_reports_read_failure(
 ) -> None:
     """An existing but unreadable file is a read failure, not 'not found'."""
     if os.geteuid() == 0:
-        import pytest as _pytest  # noqa: PLC0415
+        import pytest as _pytest
 
         _pytest.skip("running as root; permission bits are not enforced")
     cfg_file = tmp_path / "locked.settings.yaml"
