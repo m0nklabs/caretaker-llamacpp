@@ -739,6 +739,30 @@ class Caretaker:
             return True
         return persisted != current
 
+    def check_drift(
+        self,
+        model_name: str,
+        *,
+        enable_vision: bool | None = None,
+        context_hint: int | None = None,
+    ) -> bool:
+        """Report whether ``model_name`` must be reloaded to apply current config.
+
+        Pure reporting wrapper around :meth:`_config_drifted` (no side-effects):
+        ``True`` when the persisted launch signature is missing, or the model /
+        vision / args / env (incl. the client ``context_hint``) no longer match
+        the current config; ``False`` when identical. ``enable_vision`` semantics
+        match :meth:`switch_model` (None resolves the running/default mode).
+
+        Raises :class:`ValueError` when ``model_name`` is not configured, the
+        same contract as :meth:`switch_model`.
+        """
+        if model_name not in self.models:
+            raise ValueError(f"Model {model_name} not found in configuration")
+        return self._config_drifted(
+            model_name, enable_vision=enable_vision, context_hint=context_hint
+        )
+
     # ------------------------------------------------------------ health/crash
     async def _wait_for_health(self, model_name: str = "") -> bool:
         """Poll llama-server health endpoint. True if healthy, False if crashed.
@@ -1000,12 +1024,27 @@ class Caretaker:
         """Reload ``model`` (Phase A+B: idempotent, drift-aware swap)."""
         await self.switch_model(model)
 
-    async def health(self) -> dict[str, object]:
-        """Return a status dict consumed by ``GET /status``."""
+    def health(self) -> dict[str, object]:
+        """Return a status dict consumed by ``GET /status``.
+
+        ``needs_reload`` is True when the backend cannot serve the current
+        config as-is and a ``/ensure`` would be needed first: always when
+        unloaded, and when the loaded model's launch signature is drifted
+        (see :meth:`check_drift`)."""
         if self.is_unloaded:
-            return {"loaded_model": None, "is_unloaded": True}
+            return {
+                "loaded_model": None,
+                "vision_enabled": False,
+                "is_unloaded": True,
+                "needs_reload": True,
+            }
         return {
             "loaded_model": self.current_model,
             "vision_enabled": self.current_vision_enabled,
-            "is_unloaded": self.is_unloaded,
+            "is_unloaded": False,
+            "needs_reload": self.check_drift(
+                self.current_model, enable_vision=self.current_vision_enabled
+            )
+            if self.current_model is not None
+            else True,
         }
