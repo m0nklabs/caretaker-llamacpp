@@ -76,12 +76,61 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   - **Bind host/port configureerbaar:** `CARETAKER_HOST`/`CARETAKER_PORT`,
     default loopback `127.0.0.1:11441` (test-pinned; remote-gateway F6 zet
     LAN-interface).
-- **Fases A–E (PLAN.md §2–§6) staan nog open** — de lifecycle-kern
+- **Fases A–E (PLAN.md §2–§6):** **Phase A (lifecycle core) GEÏMPLEMENTEERD — zie hieronder**; B = drift, C = watchdog + VRAM, D = idle-unload-contract, E = multi-host/Windows staan nog open. De lifecycle-kern
   (~1050 regels) verhuist uit
   `guardian-llmprovider-gateway/app/engine/manager.py`:
   A = lifecycle core (spawn/stop/reload + args-bouw byte-identiek), B = drift,
   C = watchdog + VRAM, D = idle-unload-contract, E = multi-host/Windows.
 - **Plan-only. Niks gebouwd, repo leeg** = VERLEDEN — zie boven.
+
+### Phase A (lifecycle core) — status
+
+- **`caretaker/paths.py` (nieuw):** centrale deployment-literals met env-override
+  (gelijk aan guardian `app/paths.py`-patroon): `CONFIG_DIR`
+  (`CARETAKER_CONFIG_DIR`, default `<repo>/config`), `CURRENT_MODEL_{ARGS,ENV,SIG}_FILE`,
+  `LLAMA_SLOTS_DIR` (`CARETAKER_LLAMA_SLOTS_DIR` → valt terug op
+  `GUARDIAN_LLMPROVIDER_GATEWAY_SLOTS_DIR` → `~/llama_slots`), `LLAMA_SERVER_BIN`
+  (`LLAMA_SERVER_BINARY`/`LLAMA_CPP_OFFICIAL_ROOT`, default
+  `~/llama_cpp_official/build/bin/llama-server`), `SERVER_URL`
+  (`CARETAKER_SERVER_URL`, default `http://127.0.0.1:11440`), `SYSTEMD_SERVICE`
+  (`CARETAKER_SYSTEMD_SERVICE`, default `llama-server`). **Call-time helpers**
+  `llama_slots_dir()`/`server_url()` lezen env op aanroep-tijd (tests zetten env
+  na import — de module-constanten zouden die anders niet honoreren).
+- **`caretaker/manager.py`:** `Caretaker`-klasse krijgt `config_path`-injectie
+  (default `CARETAKER_MODELS_FILE`) én `server_process`-injectie (default
+  `SystemdServerProcess`). Geen module-globale `manager = Caretaker()`-singleton
+  (import is veilig zonder models-file; server.py instantieert in Phase C). Overgezet
+  gedrag-neutraal: `_resolve_vision_mmproj`/`_resolve_runtime_vision_flag`/
+  `_resolve_runtime_value`/`build_runtime_config` (van `model_registry.py`),
+  `_build_args_string`→`(str, env_dict)` (**byte-identiek aan guardian**, `<repo>`/
+  host/port/slots via paths), `_write_server_args`, `_save_context`/`_load_context`,
+  `_free_gpu_memory`/`_get_comfyui_url` (uit `services.comfyui_url` of
+  `CARETAKER_COMFYUI_URL`)/`_request_comfyui_free`, `_compute_launch_signature`/
+  `_read_persisted_signature`/`_write_persisted_signature`/`_config_drifted`,
+  `_wait_for_health` (poll `{server_url}/health`, crash-loop via
+  `server_process.restart_count()`/`is_failed()`), `_detect_crash`/`_extract_crash_error_from_lines`,
+  `_verify_backend_model` (vereenvoudigd: `/props`-path-check, warn-only), `switch_model`
+  (zonder registry/keuze/pinning/switch-allowlist), `unload` (double-unload-guard incl.
+  `current_model=None`).
+- **`ServerProcess`-interface** (in `manager.py`): ABC met `start`/`stop`/`health_ok(url)`/
+  `restart_count`/`is_failed`/`crash_error`/`service_exit_code`. `SystemdServerProcess` =
+  `sudo systemctl start|stop <service>` via `create_subprocess_exec`; `DirectServerProcess`
+  spawns `LLAMA_SERVER_BIN` met arg-array uit `current_model.args` (nieuwe process-group,
+  `os.killpg` bij stop; Phase E/Windows-voorloper). Health/crash-introspectie loopt via de
+  interface (Direct geeft 0/False/"Unknown").
+- **`caretaker/config.py`:** `load_models_config(config_path=None)` (optionele
+  path-injectie, default-behavior ongewijzigd) + `comfyui_url(config_path=None)` —
+  de 12 bootstrap-tests blijven groen.
+- **`tests/test_phase_a.py` (nieuw, 11 tests):** args-goldens (full/minimal/vision-override),
+  apples-to-apples guardian-cross-check (in-process import, skip zonder guardian-repo),
+  fake-`ServerProcess` (no-op, stop→start→health-flow, `ModelLoadError` bij health-fail,
+  unknown-model guard), `unload`-guard. **Test-tip:** `patch_paths`-fixture monkeypatcht
+  `CURRENT_MODEL_*` naar tmp — anders schrijft switch_model naar het echte
+  `<repo>/config/`-dir.
+- **Weetje (gedrag neutraal):** guardian `build_runtime_config` op een `{path}`-ook-model
+  geeft `context=None`/`ngl=None` (injecteert géén default), dus `_build_args_string`
+  produceert `-c None -ngl None` — dat IS de guardian-identieke output (de `4096`/`99`-
+  default geldt alleen bij afwezige key). Golden-test pinnt dit bewust.
 
 ## Scope — wat hoort WEL hier (alleen de lifecycle-kern)
 
@@ -214,14 +263,19 @@ pyproject.toml      Package `caretaker` (Python >=3.12; dev: pytest/ruff)
 requirements.txt    Runtime-deps voor de org-reusable python-ci (--no-deps)
 caretaker/
   __main__.py       uvicorn entrypoint (CARETAKER_HOST/PORT, default :11441)
-  config.py         load_models_config() → ModelsConfig (models/aliases)
-  manager.py        Skeleton `Caretaker`-klasse (fase-stubs A–D: NotImplementedError)
+  config.py         load_models_config(config_path?) → ModelsConfig (models/aliases)
+                    + comfyui_url() (services.comfyui_url / CARETAKER_COMFYUI_URL)
+  paths.py          Deployment-literals (env-override) + call-time llama_slots_dir()/server_url()
+  manager.py        `Caretaker` (Phase A lifecycle core) + ServerProcess-interface
+                    (SystemdServerProcess / DirectServerProcess), CrashRecord, ModelLoadError
   server.py         FastAPI: GET /status, POST /ensure, POST /unload (+ auth-gate)
 deploy/systemd/
   caretaker-llamacpp.service   Linux-sjabloon (EnvironmentFile=/etc/caretaker/caretaker.env)
 tests/
   test_bootstrap.py 12 tests: auth-gate (503/401/non-ASCII-key), config-fouten,
                     routes, entrypoint bind-contract
+  test_phase_a.py   11 tests: args-goldens (+ guardian cross-check), fake-ServerProcess
+                    switch_model / unload, comfyui_url-resolution
 .github/workflows/
   pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
   python-ci.yml     Org-reusable python-ci (python 3.12, src caretaker)
@@ -248,6 +302,16 @@ tests/
   `_build_args_string`, `_write_server_args`, `ServerProcess`-interface uit
   `engine/manager.py` naar `caretaker/manager.py`, byte-identiek qua
   start-args; zie PLAN.md §2).
+- **2026-08-29: Phase A (lifecycle core) geïmplementeerd (branch
+  `phase-a-lifecycle`, niet gecommit — lead reviewt).** `caretaker/paths.py`
+  (deployment-literals + env-override), `caretaker/manager.py` (Caretaker +
+  ServerProcess-interface + CrashRecord/ModelLoadError overgezet uit guardian,
+  gedrag-neutraal), `caretaker/config.py` (config_path-injectie +
+  comfyui_url), `tests/test_phase_a.py` (11 tests). **23 tests groen (12
+  bootstrap + 11 phase A), ruff clean.** Apples-to-apples bewezen: caretaker
+  `_build_args_string` == guardian `_build_args_string` byte-gelijk op
+  dezelfde fixture (full + minimal). Volgende stap: **Phase B — drift via
+  `/ensure`** (manager-implementatie staat al; alleen route-wiring in server.py).
 
 ## References
 
