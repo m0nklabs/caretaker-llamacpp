@@ -1,0 +1,23 @@
+name: Python CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-ci:
+    uses: m0nklabs/github-action-runners/.github/workflows/python-ci.yml@main
+    with:
+      # Deze self-hosted pool heeft de deps al pre-geïnstalleerd onder python 3.12
+      # (~/.local/lib/python3.12/site-packages); de org-reusable doet --no-deps.
+      # Python 3.14 (lokaal, pyproject) heeft geen pre-installed deps op de runners.
+      python-version: "3.12"
+      src-dir: caretaker
+      test-dir: tests
+      lint-path: "caretaker tests"
+    secrets: inherit

@@ -1,0 +1,27 @@
+# caretaker-llamacpp — per-GPU-host llama-server lifecycle daemon (Linux systemd)
+#
+# NOTE (Platform): this unit targets Linux/systemd (ai-kvm-2). On Windows
+# (14700K, Phase E / F6) there is no systemd: the same caretaker package runs
+# under NSSM (or a scheduled task at startup) instead. Keep ExecStart /
+# environment mirrors in sync when changing this file.
+
+[Unit]
+Description=Caretaker llama-server lifecycle manager (control API on :11441)
+After=network.target
+
+[Service]
+# Single per-caretaker key + the host's own models.local.settings.yaml,
+# injected from the environment file (never committed to the repo).
+EnvironmentFile=/etc/caretaker/caretaker.env
+User=flip
+WorkingDirectory=/home/flip/caretaker-llamacpp
+ExecStart=/home/flip/caretaker-llamacpp/venv/bin/python -m caretaker
+Restart=on-failure
+RestartSec=5
+
+# Expect at least CARETAKER_KEY (and CARETAKER_MODELS_FILE when the default is
+# not used) to be present in the EnvironmentFile; the API returns 503 otherwise.
+# (Placeholder: the file itself is operator-owned and outside this repo.)
+
+[Install]
+WantedBy=multi-user.target
