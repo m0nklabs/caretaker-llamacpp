@@ -430,6 +430,11 @@ class Caretaker:
         self._watchdog_max_backoff: float = DEFAULT_WATCHDOG_MAX_BACKOFF
         self._watchdog_backoff: float = DEFAULT_WATCHDOG_INITIAL_BACKOFF
         self._watchdog_running: bool = False
+        # Model the watchdog keeps retrying after a failed forced restart
+        # (switch_model clears ``current_model`` on failure; this remembers the
+        # target so a crash-looping model is retried with backoff instead of
+        # being abandoned after one attempt).
+        self._watchdog_retry_model: str | None = None
         # True while a switch/load/unload/stop is running, so the watchdog does
         # not race an in-flight lifecycle transition.
         self._switch_in_progress: bool = False
@@ -997,28 +1002,37 @@ class Caretaker:
             )
 
         # Mark a lifecycle transition in flight so the watchdog does not race
-        # this load. The acquire comes *after* the no-op fast-path above, so a
-        # no-op switch never double-accounts the VRAM slot. It only runs when we
-        # really (re)load; the target config is built once and reused below.
+        # this load. The no-op fast-path above returns early, so this only runs
+        # on a real (re)load; the target config is built once and reused.
         self._switch_in_progress = True
         target_config = self.build_runtime_config(
             model_name, enable_vision=desired_vision, context_hint=context_hint
         )
-        acquired = self.vram is not None
-        if acquired:
-            await self.vram.acquire(
-                model_name, get_model_size_mb(model_name, self.models.get(model_name))
-            )
-
-        logger.info(
-            "Switching from %s [%s] to %s [%s]",
-            self.current_model,
-            "vision" if self.current_vision_enabled else "text",
-            model_name,
-            "vision" if desired_vision else "text",
-        )
-
         try:
+            # VRAM slot: a swap A→B frees A's slot *before* acquiring B — this
+            # switch stops the old model itself, so waiting for space only this
+            # switch could free would deadlock forever. A same-model
+            # reload/restart (drift, force) keeps the slot it already holds, so
+            # it never double-acquires. Inside the try so a fail-fast (model
+            # bigger than the whole budget) can never leave
+            # ``_switch_in_progress`` stuck.
+            held_model = self.current_model if self.vram is not None else None
+            if self.vram is not None:
+                if held_model is not None and held_model != model_name:
+                    await self.vram.release(held_model)
+                if held_model != model_name:
+                    await self.vram.acquire(
+                        model_name,
+                        get_model_size_mb(model_name, self.models.get(model_name)),
+                    )
+
+            logger.info(
+                "Switching from %s [%s] to %s [%s]",
+                self.current_model,
+                "vision" if self.current_vision_enabled else "text",
+                model_name,
+                "vision" if desired_vision else "text",
+            )
             # 1. Auto-save current context (only if a model is actually loaded —
             #    on the first switch current_model is None, so nothing to save).
             if self.current_model is not None:
@@ -1095,10 +1109,13 @@ class Caretaker:
             except Exception:  # noqa: BLE001
                 logger.info(f"No auto-save found for {model_name}, starting fresh.")
         except BaseException:
-            # The load did not complete: give the VRAM slot back so another
-            # model is not blocked behind a phantom acquire. The acquired model
-            # is never active on this path, so the release cannot double-count.
-            if acquired:
+            # The load did not complete and no model is running, so the
+            # scheduler must hold nothing: release ``model_name``
+            # unconditionally. A swap already freed the old slot (the new one
+            # was never admitted → no-op decrement), a cold load frees its new
+            # slot, and a same-model reload failure frees the slot it kept —
+            # its server is dead, holding the slot would phantom-block others.
+            if self.vram is not None:
                 await self.vram.release(model_name)
             raise
         finally:
@@ -1237,14 +1254,23 @@ class Caretaker:
         This is the testable core: tests call it directly with a small/zero
         backoff instead of running the infinite :meth:`_watchdog_loop`.
         """
-        if self.is_unloaded or self.current_model is None or self._switch_in_progress:
+        if self.is_unloaded or self._switch_in_progress:
+            return False
+        if self.current_model is not None:
+            model = self.current_model
+        elif self._watchdog_retry_model is not None:
+            # A previous restart attempt failed and switch_model cleared
+            # current_model — keep retrying the same target with backoff
+            # instead of abandoning a crash-looping model after one attempt.
+            model = self._watchdog_retry_model
+        else:
             return False
         if await self.server_process.health_ok(self.server_url):
             # Healthy — a fresh crash later starts again from the initial backoff.
             self._watchdog_backoff = self._watchdog_initial_backoff
+            self._watchdog_retry_model = None
             return False
 
-        model = self.current_model
         logger.warning("Watchdog: backend unhealthy for '%s' — recording crash", model)
         await self._detect_crash(model)
         logger.warning(
@@ -1255,6 +1281,7 @@ class Caretaker:
         if self._watchdog_backoff > 0:
             await asyncio.sleep(self._watchdog_backoff)
         try:
+            self._watchdog_retry_model = model
             # force=True: the no-op fast-path in switch_model (same model +
             # no drift) must NOT skip the restart — the backend is known dead.
             await self.switch_model(model, force=True)
@@ -1264,6 +1291,7 @@ class Caretaker:
             )
             raise
         self._watchdog_backoff = self._watchdog_initial_backoff
+        self._watchdog_retry_model = None
         return True
 
     async def _watchdog_loop(self) -> None:

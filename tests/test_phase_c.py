@@ -24,7 +24,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 from caretaker.manager import ModelLoadError
 from caretaker.server import app, init
-from caretaker.vram import VramScheduler, get_model_size_mb
+from caretaker.vram import VramLimitExceededError, VramScheduler, get_model_size_mb
 
 from test_phase_a import FakeServerProcess, _make_manager
 
@@ -146,9 +146,16 @@ async def test_switch_model_acquires_and_releases_on_unload(
     assert mgr.is_unloaded
 
 
-async def test_switch_model_vram_block_then_unload_frees(
+async def test_switch_model_swap_frees_old_slot_without_deadlock(
     tmp_path: Path, isolated_paths: None
 ) -> None:
+    """A→B swap where size(A)+size(B) > limit must NOT block forever.
+
+    The swap stops the old model itself, so it frees A's slot *before*
+    acquiring B — otherwise acquire waits for space only the blocked switch
+    itself could free (the review-found deadlock). With the fix the swap
+    completes without any external unload.
+    """
     proc = FakeServerProcess()
     models = {
         "first": {"path": "/home/flip/models/first.gguf", "size_mb": 400},
@@ -156,13 +163,12 @@ async def test_switch_model_vram_block_then_unload_frees(
     }
     mgr = _make_manager(tmp_path, process=proc, vram_limit_mb=500, models=models)
     await mgr.switch_model("first")
-    task = asyncio.create_task(mgr.switch_model("second"))
-    await asyncio.sleep(0.05)
-    assert not task.done(), "switch to second must block: VRAM full"
-    await mgr.unload()  # frees 'first'
-    await asyncio.wait_for(task, timeout=2)
+    assert mgr.vram.active_counts.get("first", 0) == 1
+    await asyncio.wait_for(mgr.switch_model("second"), timeout=2)
     assert mgr.current_model == "second"
+    assert "first" not in mgr.vram.active_counts, "old slot must be freed"
     assert mgr.vram.active_counts.get("second", 0) == 1
+    assert not mgr._switch_in_progress
 
 
 async def test_switch_model_releases_vram_on_load_failure(
@@ -198,6 +204,53 @@ async def test_switch_model_noop_does_not_double_acquire(
     await mgr.switch_model("minimal")  # no-op
     assert proc.events == first_events
     assert mgr.vram.active_counts.get("minimal", 0) == 1, "no double acquire"
+
+
+async def test_switch_model_same_model_reload_keeps_single_slot(
+    tmp_path: Path, isolated_paths: None
+) -> None:
+    """A same-model reload (drift or force) must not double-acquire the slot.
+
+    The slot is kept from the original load; a second acquire of the same
+    model would over-count, and a later unload would then leak a phantom
+    slot that blocks other models.
+    """
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        vram_limit_mb=500,
+        models={"minimal": {"path": "/home/flip/models/minimal.gguf", "size_mb": 300}},
+    )
+    await mgr.switch_model("minimal")
+    await mgr.switch_model("minimal", force=True)  # forced restart, same model
+    assert mgr.current_model == "minimal"
+    assert mgr.vram.active_counts.get("minimal", 0) == 1, "no double acquire"
+    await mgr.unload()
+    assert "minimal" not in mgr.vram.active_counts, "unload must free the slot"
+
+
+async def test_switch_model_oversized_model_fail_fast(
+    tmp_path: Path, isolated_paths: None
+) -> None:
+    """A model whose footprint alone exceeds the budget must fail fast.
+
+    Without the fix, acquire would wait forever for space no release can
+    ever create — even a cold load of a single oversized model would hang,
+    and only a process restart would recover.
+    """
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        vram_limit_mb=500,
+        models={"big": {"path": "/home/flip/models/big.gguf", "size_mb": 600}},
+    )
+    with pytest.raises(VramLimitExceededError):
+        await mgr.switch_model("big")
+    assert mgr.current_model is None
+    assert not mgr._switch_in_progress, "fail-fast must not stick the transition flag"
+    assert mgr.vram.active_counts == {}, "no phantom slot after fail-fast"
 
 
 async def test_check_vram_false_disables_slot(tmp_path: Path, isolated_paths: None) -> None:
@@ -259,6 +312,34 @@ async def test_watchdog_tick_backoff_doubles_on_load_failure(
     assert mgr._watchdog_backoff == 0.5, "backoff doubles on failed restart"
 
 
+async def test_watchdog_tick_retries_after_failed_restart(
+    tmp_path: Path, isolated_paths: None
+) -> None:
+    """A failed forced restart must not abandon the model after one attempt.
+
+    switch_model clears ``current_model`` on failure; the watchdog remembers
+    the retry target and keeps restarting with doubled backoff instead of
+    returning False forever (the review-found one-shot-retry issue).
+    """
+    proc = _AlwaysDownFake(health_ok=False)
+    mgr = _make_manager(tmp_path, process=proc, health_polls=2, health_interval=0.01)
+    mgr._watchdog_backoff = 0.01
+    mgr.current_model = "minimal"  # pretend a model is loaded
+    starts_before = proc.events.count("start")
+
+    with pytest.raises(ModelLoadError):
+        await mgr._watchdog_tick()
+    assert mgr._watchdog_retry_model == "minimal"
+    assert proc.events.count("start") > starts_before
+    starts_after_first = proc.events.count("start")
+
+    # Second tick: current_model is None now, but the retry target is kept.
+    with pytest.raises(ModelLoadError):
+        await mgr._watchdog_tick()
+    assert proc.events.count("start") > starts_after_first, "retry must attempt again"
+    assert mgr._watchdog_backoff == 0.04, "backoff doubles on each failed attempt"
+
+
 async def test_watchdog_loop_stops_cleanly(tmp_path: Path, isolated_paths: None) -> None:
     proc = FakeServerProcess()
     mgr = _make_manager(tmp_path, process=proc)
@@ -287,6 +368,26 @@ def test_api_unload_200_and_idempotent(tmp_path: Path, isolated_paths: None, inj
 
     r2 = client.post("/unload", headers=AUTH)
     assert r2.status_code == 200, r2.text  # idempotent
+
+
+def test_api_ensure_oversized_model_503(
+    tmp_path: Path, isolated_paths: None, injection_reset, monkeypatch
+) -> None:
+    monkeypatch.setenv("CARETAKER_KEY", "test-secret")
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        vram_limit_mb=500,
+        models={"big": {"path": "/home/flip/models/big.gguf", "size_mb": 600}},
+    )
+    init(mgr)
+    client = TestClient(app)
+    r = client.post("/ensure", json={"model": "big"}, headers=AUTH)
+    assert r.status_code == 503, r.text
+    body = r.json()
+    assert body["error"] == "vram_limit_exceeded"
+    assert body["crash_details"] is None
 
 
 def test_api_unload_401_without_key(tmp_path: Path, isolated_paths: None, injection_reset, monkeypatch) -> None:

@@ -21,6 +21,16 @@ from typing import Any
 logger = logging.getLogger("caretaker.vram")
 
 
+class VramLimitExceededError(ValueError):
+    """A model's footprint alone exceeds the whole VRAM budget.
+
+    Raised by :meth:`VramScheduler.acquire` instead of blocking forever: no
+    release can ever free enough space, so waiting could only deadlock the
+    caller. Subclasses ``ValueError`` so generic handlers treat it as a
+    request-level error.
+    """
+
+
 def get_model_size_mb(model_name: str, config: dict[str, Any] | None = None) -> int:
     """Return the estimated VRAM footprint of ``model_name`` in megabytes.
 
@@ -112,6 +122,9 @@ class VramScheduler:
         If ``model_size_mb`` is 0 (no config size and no heuristic matched),
         the model claims no VRAM: acquire proceeds immediately and logs a
         warning so an operator notices the under-counted model.
+
+        Raises :class:`VramLimitExceededError` when the model alone is bigger
+        than the whole budget — such a model can never fit, so fail fast.
         """
         if model_size_mb <= 0:
             logger.warning(
@@ -120,6 +133,14 @@ class VramScheduler:
                 model_name,
             )
         async with self.condition:
+            # Fail fast for a model that can never fit: its footprint alone
+            # exceeds the budget, so no release can ever create room. Waiting
+            # would block this caller forever (only a restart would recover).
+            if model_name not in self.active_sizes and model_size_mb > self.limit_mb:
+                raise VramLimitExceededError(
+                    f"Model '{model_name}' needs {model_size_mb}MB but the VRAM "
+                    f"limit is {self.limit_mb}MB"
+                )
             while True:
                 needed_vram = sum(self.active_sizes.values())
                 if model_name not in self.active_sizes:

@@ -20,6 +20,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from .manager import Caretaker, ModelLoadError
+from .vram import VramLimitExceededError
 
 CARETAKER_KEY_ENV = "CARETAKER_KEY"
 
@@ -129,6 +130,18 @@ async def ensure(request: Request) -> dict:
             model,
             enable_vision=enable_vision,
             context_hint=context_hint,
+        )
+    except VramLimitExceededError as exc:
+        # A model that alone exceeds the VRAM budget can never fit: the
+        # gateway must not retry blindly, so surface the persistent
+        # configuration problem explicitly (503, no crash record).
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": "vram_limit_exceeded",
+                "message": str(exc),
+                "crash_details": None,
+            },
         )
     except ValueError as exc:
         return JSONResponse(
