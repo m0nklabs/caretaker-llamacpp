@@ -72,7 +72,7 @@ def test_config_unreadable_file_reports_read_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
 ) -> None:
     """An existing but unreadable file is a read failure, not 'not found'."""
-    if os.name != "posix":
+    if os.name != "posix" or not hasattr(os, "geteuid"):
         pytest.skip("permission bits are not enforced on non-POSIX platforms")
     if os.geteuid() == 0:
         pytest.skip("running as root; permission bits are not enforced")
