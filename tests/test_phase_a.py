@@ -454,9 +454,14 @@ def test_config_comfyui_url_from_env_overrides_yaml(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_switch_model_failure_clears_active_state(tmp_path):
+def test_switch_model_failure_clears_active_state(tmp_path, patch_paths: None):
     """Review fix 1: after a failed switch, current_model/vision are cleared so
-    a later same-model ensure actually restarts (no stale 'already active')."""
+    a later same-model ensure actually restarts (no stale 'already active').
+
+    `patch_paths` isolates the persisted launch-signature file to a per-test
+    tmp path: a matching leftover `config/current_model.sig` from an earlier
+    successful switch would otherwise make drift-detection short-circuit this
+    into the no-op path (no ModelLoadError raised)."""
     import asyncio
 
     fake = FakeServerProcess(health_ok=False)
@@ -515,9 +520,12 @@ def test_build_args_string_uses_injected_server_url(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-async def test_unload_then_switch_resets_unloaded_flag(tmp_path):
+async def test_unload_then_switch_resets_unloaded_flag(tmp_path, patch_paths: None):
     """Review round 2 / State Bug: after unload(), a later switch_model()
-    must reset is_unloaded so the freshly loaded server is not skipped."""
+    must reset is_unloaded so the freshly loaded server is not skipped.
+
+    `patch_paths` keeps the launch-signature write out of the real repo
+    `config/` dir."""
     fake = FakeServerProcess()
     mgr = _make_manager(tmp_path, process=fake)
     mgr.current_model = "minimal"
@@ -531,9 +539,11 @@ async def test_unload_then_switch_resets_unloaded_flag(tmp_path):
     assert mgr.current_model == "minimal"
 
 
-async def test_first_switch_does_not_auto_save_none(tmp_path):
+async def test_first_switch_does_not_auto_save_none(tmp_path, patch_paths: None):
     """Review round 2 / Context Save: on the first switch (current_model is
-    None) no auto_save_None context save may be attempted."""
+    None) no auto_save_None context save may be attempted.
+
+    `patch_paths` isolates the launch-signature file to a per-test tmp path."""
     save_calls: list[str] = []
     load_calls: list[str] = []
 
@@ -554,10 +564,14 @@ async def test_first_switch_does_not_auto_save_none(tmp_path):
     assert all("None" not in c for c in load_calls), f"auto_save_None leaked: {load_calls}"
 
 
-async def test_switch_exception_between_stop_and_start_clears_state(tmp_path):
+async def test_switch_exception_between_stop_and_start_clears_state(
+    tmp_path, patch_paths: None
+):
     """Review round 2 / Stale State: an exception between stop() and the
     health-success path (here: args-file write) must leave bookkeeping
-    cleared — no stale 'old model active' behind a stopped server."""
+    cleared — no stale 'old model active' behind a stopped server.
+
+    `patch_paths` isolates the deployment-file writes to a per-test tmp path."""
     fake = FakeServerProcess()
 
     def boom(config) -> None:
@@ -582,3 +596,68 @@ async def test_switch_exception_between_stop_and_start_clears_state(tmp_path):
 
     assert mgr.current_model is None
     assert mgr.current_vision_enabled is False
+
+
+# --------------------------------------------------------------------------
+# 7. Review-fix regressions (PR #3 review round 3)
+# --------------------------------------------------------------------------
+
+
+class _FakeProc:
+    """Minimal stand-in for asyncio.subprocess.Process."""
+
+    def __init__(self, returncode: int, stderr: bytes = b"") -> None:
+        self.returncode = returncode
+        self._stderr = stderr
+
+    async def communicate(self):
+        return b"", self._stderr
+
+
+async def test_systemd_start_failure_raises(monkeypatch):
+    """Review round 3 / Silent systemctl failure: a non-zero `systemctl start`
+    must raise (with the stderr detail), not be swallowed."""
+    import asyncio
+
+    from caretaker.manager import SystemdServerProcess
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc(1, b"Unit llama-server.service not found.\n")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    proc = SystemdServerProcess(service="llama-server")
+
+    with pytest.raises(RuntimeError, match="systemctl start llama-server failed"):
+        await proc.start()
+
+
+async def test_systemd_stop_failure_raises(monkeypatch):
+    """Review round 3 / Silent systemctl failure: same for `systemctl stop`."""
+    import asyncio
+
+    from caretaker.manager import SystemdServerProcess
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc(3, b"sudo: a password is required\n")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    proc = SystemdServerProcess(service="llama-server")
+
+    with pytest.raises(RuntimeError, match="systemctl stop llama-server failed"):
+        await proc.stop()
+
+
+async def test_caretaker_stop_clears_bookkeeping(tmp_path):
+    """Review round 3 / Stale state after stop: public stop() must clear
+    current_model/vision and mark unloaded, like unload()."""
+    fake = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=fake)
+    mgr.current_model = "minimal"
+    mgr.current_vision_enabled = False
+    mgr.is_unloaded = False
+
+    await mgr.stop()
+
+    assert mgr.current_model is None
+    assert mgr.current_vision_enabled is False
+    assert mgr.is_unloaded is True

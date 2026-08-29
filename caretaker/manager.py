@@ -137,21 +137,31 @@ class SystemdServerProcess(ServerProcess):
     def __init__(self, service: str = SYSTEMD_SERVICE) -> None:
         self.service = service
 
-    async def start(self) -> None:
+    async def _run_systemctl(self, action: str) -> None:
+        """Run ``sudo systemctl <action> <service>`` and surface failures.
+
+        A non-zero exit (unit missing, sudo denied, …) must not be swallowed
+        silently: the caller (switch_model / unload / stop) needs to know the
+        backend did not actually start or stop.
+        """
         proc = await asyncio.create_subprocess_exec(
-            "sudo", "systemctl", "start", self.service,
+            "sudo", "systemctl", action, self.service,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await proc.communicate()
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            detail = stderr.decode(errors="replace").strip() or "(no stderr)"
+            raise RuntimeError(
+                f"systemctl {action} {self.service} failed "
+                f"(rc={proc.returncode}): {detail}"
+            )
+
+    async def start(self) -> None:
+        await self._run_systemctl("start")
 
     async def stop(self) -> None:
-        proc = await asyncio.create_subprocess_exec(
-            "sudo", "systemctl", "stop", self.service,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
+        await self._run_systemctl("stop")
 
     async def restart_count(self) -> int:
         """Read ``NRestarts`` from systemd for the llama-server unit."""
@@ -795,8 +805,12 @@ class Caretaker:
             error_msg,
         )
 
-        # Stop the service to prevent restart loops
-        await self.server_process.stop()
+        # Stop the service to prevent restart loops (best-effort: a failing
+        # stop during crash handling must not swallow the original crash).
+        try:
+            await self.server_process.stop()
+        except Exception:  # best-effort on the crash path
+            logger.debug("Failed to stop service during crash handling", exc_info=True)
 
         return crash
 
@@ -879,10 +893,10 @@ class Caretaker:
         # 2. Stop llama-server. The old model is no longer running: clear the
         #    active-model bookkeeping NOW, so a later exception (args write,
         #    GPU free, start) cannot leave a stale "old model active" state.
-        await self.server_process.stop()
         self.current_model = None
         self.current_vision_enabled = False
         self.is_unloaded = False
+        await self.server_process.stop()
 
         # 3. Write new model args
         target_config = self.build_runtime_config(
@@ -971,8 +985,16 @@ class Caretaker:
         await self.switch_model(model)
 
     async def stop(self) -> None:
-        """Stop the running llama-server."""
+        """Stop the running llama-server and clear active-model bookkeeping.
+
+        Mirrors unload()'s state transition so a caller using stop() (e.g. a
+        Phase C health-check route) never sees a stale 'model active' state
+        while the backend is stopped.
+        """
         await self.server_process.stop()
+        self.current_model = None
+        self.current_vision_enabled = False
+        self.is_unloaded = True
 
     async def reload(self, model: str) -> None:
         """Reload ``model`` (Phase A+B: idempotent, drift-aware swap)."""
