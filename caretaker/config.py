@@ -33,6 +33,10 @@ class ModelsConfigError(RuntimeError):
     """Raised when models.local.settings.yaml cannot be located or parsed."""
 
 
+COMFYUI_URL_ENV = "CARETAKER_COMFYUI_URL"
+DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188"
+
+
 def models_file_path() -> Path:
     """Resolve the models config path from ``CARETAKER_MODELS_FILE``.
 
@@ -44,14 +48,43 @@ def models_file_path() -> Path:
     return Path(raw)
 
 
-def load_models_config() -> ModelsConfig:
+def comfyui_url(config_path: str | os.PathLike[str] | None = None) -> str:
+    """Resolve the ComfyUI URL caretaker politely asks to free GPU memory.
+
+    Precedence: ``CARETAKER_COMFYUI_URL`` env override (explicit), then the
+    ``services.comfyui_url`` key in the caretaker's own settings YAML, then the
+    ``http://127.0.0.1:8188`` default (mirrors the guardian's
+    ``global.settings.yaml`` shapes). File read errors fall back to the default
+    — this is a best-effort co-existence call, never a hard deployment dep.
+    """
+    env_value = os.environ.get(COMFYUI_URL_ENV)
+    if env_value:
+        return env_value
+    path = Path(config_path) if config_path is not None else models_file_path()
+    try:
+        with path.open(encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        url = (data.get("services") or {}).get("comfyui_url")
+        if isinstance(url, str) and url:
+            return url
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        pass
+    return DEFAULT_COMFYUI_URL
+
+
+def load_models_config(config_path: str | os.PathLike[str] | None = None) -> ModelsConfig:
     """Load ``models.local.settings.yaml`` and return its models/aliases.
+
+    ``config_path`` is optional (defaults to :func:`models_file_path`, i.e. the
+    ``CARETAKER_MODELS_FILE`` resolution) so callers can load a specific file,
+    e.g. the manager's injected ``config_path``. The default path is *not*
+    validated for existence here — see :class:`ModelsConfigError`.
 
     Returns a :class:`ModelsConfig` typed dict with ``models`` (name → config)
     and ``aliases`` (alias → canonical model). Raises
     :class:`ModelsConfigError` when the file is missing or unparseable.
     """
-    path = models_file_path()
+    path = Path(config_path) if config_path is not None else models_file_path()
     try:
         with path.open(encoding="utf-8") as fh:
             loaded = yaml.safe_load(fh)
