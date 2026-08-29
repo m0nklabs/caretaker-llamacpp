@@ -353,3 +353,92 @@ def test_api_auth_configured_key_required(tmp_path: Path, isolated_paths: None, 
         resp = client.get("/status")
         assert resp.status_code == 503, resp.text
         assert "not configured" in resp.json()["detail"]
+
+# ---------------------------------------------------------------------------
+# Review-fix regressions (PR #4, review round 1)
+# ---------------------------------------------------------------------------
+
+
+def test_health_detects_vision_default_config_change(
+    tmp_path: Path, isolated_paths: None
+) -> None:
+    """Review fix 1: health() must fold the vision *default* from config (not
+    the currently loaded vision mode) into drift detection, so a config change
+    that adds/removes mmproj surfaces as needs_reload — otherwise the gateway
+    never issues the needed /ensure reload.
+
+    The scenario is simulated without a live backend: the persisted launch
+    signature reflects a text-mode load, but the model's config now carries a
+    vision default (mmproj) — with enable_vision resolved as None the new
+    signature differs (vision flag True), so needs_reload must be True."""
+    import json
+
+    from caretaker.manager import Caretaker
+    from tests.test_phase_a import FakeServerProcess
+
+    mmproj = tmp_path / "mmproj.gguf"
+    mmproj.write_bytes(b"mmproj")
+    cfg = tmp_path / "models.local.settings.yaml"
+    # Config WITHOUT vision default (text mode):
+    cfg.write_text(
+        "models:\n  X:\n    path: /home/flip/models/x.gguf\n",
+        encoding="utf-8",
+    )
+    mgr = Caretaker(
+        config_path=str(cfg),
+        server_process=FakeServerProcess(),
+        server_url="http://127.0.0.1:11440",
+    )
+    # Seed a persisted signature for a text-mode load (what switch_model writes
+    # after loading with enable_vision resolved to False for vision-less config):
+    import caretaker.manager as manager_mod
+
+    text_sig = mgr._compute_launch_signature("X", enable_vision=False)
+    assert text_sig is not None
+    manager_mod.CURRENT_MODEL_SIG_FILE.write_text(json.dumps(text_sig), encoding="utf-8")
+
+    # Config NOW adds a vision default (mmproj):
+    cfg.write_text(
+        "models:\n  X:\n    path: /home/flip/models/x.gguf\n"
+        "    mmproj: " + str(mmproj) + "\n",
+        encoding="utf-8",
+    )
+    mgr2 = Caretaker(
+        config_path=str(cfg),
+        server_process=FakeServerProcess(),
+        server_url="http://127.0.0.1:11440",
+    )
+    mgr2.current_model = "X"
+    mgr2.current_vision_enabled = False  # loaded vision mode (old load)
+    # **The reviewer's exact bug:** health() folded the *loaded* vision mode
+    # into check_drift — for the ACTIVE model, _resolve_runtime_vision_flag
+    # resolves None to current_vision_enabled (False), so a config change that
+    # adds mmproj is invisible: needs_reload was False ← the gateway would
+    # never /ensure. Because the fix resolves the drift against the model's
+    # config *default* (vision not yet forced by the loaded runtime state),
+    # the persisted text signature no longer matches → needs_reload True.
+    assert mgr2.health()["needs_reload"] is True
+
+
+def test_api_ensure_rejects_boolean_context_hint(
+    tmp_path: Path, isolated_paths: None, injection_reset: None
+) -> None:
+    """Review fix 2: context_hint must reject bools explicitly (bool is an int
+    subclass); `context_hint: true` → 422, never `-c True`."""
+    import os
+
+    os.environ["CARETAKER_KEY"] = "smoke"
+    import caretaker.server as srv
+    from fastapi.testclient import TestClient
+
+    class Dummy:
+        async def switch_model(self, model, *, enable_vision=None, context_hint=None):
+            raise AssertionError("must not be called")
+
+    srv.init(Dummy())
+    client = TestClient(srv.app)
+    h = {"Authorization": "Bearer smoke"}
+    r = client.post("/ensure", json={"model": "X", "context_hint": True}, headers=h)
+    assert r.status_code == 422, r.text
+    assert r.json()["error"] == "invalid_request", r.text
+    srv.init(None)

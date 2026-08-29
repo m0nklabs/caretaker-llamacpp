@@ -119,7 +119,9 @@ async def ensure(request: Request) -> dict:
     if enable_vision is not None and not isinstance(enable_vision, bool):
         return _invalid_request("'enable_vision' must be a boolean or null")
     context_hint = body.get("context_hint")
-    if context_hint is not None and not isinstance(context_hint, bool) and not isinstance(context_hint, int):
+    # bool is an int subclass — reject it explicitly so `context_hint: true`
+    # cannot leak a boolean into the args builder (-c True).
+    if context_hint is not None and (isinstance(context_hint, bool) or not isinstance(context_hint, int)):
         return _invalid_request("'context_hint' must be an integer or null")
 
     try:

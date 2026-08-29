@@ -685,20 +685,39 @@ class Caretaker:
         *,
         enable_vision: bool | None,
         context_hint: int | None = None,
+        config_vision: bool | None = None,
     ) -> dict | None:
         """Compute the launch signature for a model+vision-mode from current models.yaml.
 
         Returns None if the model is unknown. Uses build_runtime_config (so
-        vision/text overrides and the client context hint resolve correctly)."""
+        vision/text overrides and the client context hint resolve correctly).
+
+        ``config_vision`` (internal): force the vision flag to the model's
+        config *default* without the loaded-runtime shortcut — pass
+        ``False``/``True`` when the caller wants drift against the config
+        default (health/needs_reload), not the currently loaded mode."""
         if model_name not in self.models:
             return None
+        # config_vision=True → the model's config *default* vision (mmproj
+        # present), independent of the loaded runtime mode: pass enable_vision
+        # through (None → default) but force vision from config; for the args
+        # builder use None when no mmproj (no vision) or None with the forced
+        # True only when mmproj exists.
+        if config_vision is True:
+            vision = bool(self._resolve_vision_mmproj(self.models.get(model_name, {})))
+        elif config_vision is False:
+            vision = False
+        else:
+            vision = bool(self._resolve_runtime_vision_flag(model_name, enable_vision))
         runtime_config = self.build_runtime_config(
-            model_name, enable_vision=enable_vision, context_hint=context_hint
+            model_name,
+            enable_vision=None if config_vision is None else (True if vision else None),
+            context_hint=context_hint,
         )
         args_str, env_dict = self._build_args_string(runtime_config)
         return {
             "model": model_name,
-            "vision": bool(self._resolve_runtime_vision_flag(model_name, enable_vision)),
+            "vision": vision,
             "args_sha256": hashlib.sha256(args_str.encode("utf-8")).hexdigest(),
             "env_sha256": hashlib.sha256(json.dumps(env_dict, sort_keys=True).encode("utf-8")).hexdigest(),
         }
@@ -723,6 +742,7 @@ class Caretaker:
         *,
         enable_vision: bool | None,
         context_hint: int | None = None,
+        config_vision: bool | None = None,
     ) -> bool:
         """True if the model must be reloaded to apply current models.yaml settings.
 
@@ -733,7 +753,10 @@ class Caretaker:
         if not persisted:
             return True
         current = self._compute_launch_signature(
-            model_name, enable_vision=enable_vision, context_hint=context_hint
+            model_name,
+            enable_vision=enable_vision,
+            context_hint=context_hint,
+            config_vision=config_vision,
         )
         if not current:
             return True
@@ -762,6 +785,10 @@ class Caretaker:
         return self._config_drifted(
             model_name, enable_vision=enable_vision, context_hint=context_hint
         )
+
+    def _config_vision_default(self, model_name: str) -> bool:
+        """The model's configured vision default (mmproj present → True)."""
+        return bool(self._resolve_vision_mmproj(self.models.get(model_name, {})))
 
     # ------------------------------------------------------------ health/crash
     async def _wait_for_health(self, model_name: str = "") -> bool:
@@ -1042,8 +1069,12 @@ class Caretaker:
             "loaded_model": self.current_model,
             "vision_enabled": self.current_vision_enabled,
             "is_unloaded": False,
-            "needs_reload": self.check_drift(
-                self.current_model, enable_vision=self.current_vision_enabled
+            # Drift against the model's config *default* vision (config_vision
+            # forces it), NOT the loaded vision mode: folding in the loaded
+            # mode would hide a config change that adds/removes mmproj and the
+            # gateway would never issue the needed /ensure reload.
+            "needs_reload": self._config_drifted(
+                self.current_model, enable_vision=None, config_vision=True
             )
             if self.current_model is not None
             else True,
