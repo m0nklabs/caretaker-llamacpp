@@ -302,6 +302,7 @@ tests/
   `_build_args_string`, `_write_server_args`, `ServerProcess`-interface uit
   `engine/manager.py` naar `caretaker/manager.py`, byte-identiek qua
   start-args; zie PLAN.md §2).
+<<<<<<< Updated upstream
 - **2026-08-29: Phase A (lifecycle core) geïmplementeerd (branch
   `phase-a-lifecycle`, niet gecommit — lead reviewt).** `caretaker/paths.py`
   (deployment-literals + env-override), `caretaker/manager.py` (Caretaker +
@@ -312,6 +313,59 @@ tests/
   `_build_args_string` == guardian `_build_args_string` byte-gelijk op
   dezelfde fixture (full + minimal). Volgende stap: **Phase B — drift via
   `/ensure`** (manager-implementatie staat al; alleen route-wiring in server.py).
+=======
+- **2026-08-29: Phase A (lifecycle core) geïmplementeerd.** Commits `38fb627`
+  (Phase A core) + `05c7e9c` (PR-#3 review-fixes) op branch `phase-a-lifecycle`.
+  - **`caretaker/paths.py`** (nieuw): deployment-literals met env-override
+    (`CARETAKER_CONFIG_DIR`/`CARETAKER_LLAMA_SLOTS_DIR`→`GUARDIAN_*_SLOTS_DIR`/
+    `LLAMA_SERVER_BINARY`/`CARETAKER_SERVER_URL`/`CARETAKER_SYSTEMD_SERVICE`) +
+    call-time helpers `llama_slots_dir()`/`server_url()`.
+  - **`caretaker/manager.py`**: `Caretaker(config_path=None, server_process=None,
+    health_polls=…)` + `ServerProcess`-interface (`SystemdServerProcess`/
+    `DirectServerProcess`), `CrashRecord`/`ModelLoadError`. Overgezet gedrag-
+    neutraal uit guardian: `build_runtime_config`, `_build_args_string` →
+    `(str, env)` **(byte-identiek; `--host/--port` uit geïnjecteerde
+    `server_url`, `--slot-save-path` uit `llama_slots_dir()`, `--load-mode
+    none`; `config["backend"]` wordt genegeerd)**, `_write_server_args`,
+    context save/restore, ComfyUI VRAM-free, drift-signature, health/crash,
+    `switch_model` (cleart `current_model` op falen — PR#3), `unload`.
+  - **`caretaker/config.py`**: `load_models_config(config_path=None)` +
+    `comfyui_url(config_path=None)` (bootstrap-tests blijven groen).
+  - **`tests/test_phase_a.py`** (19 fase-A tests): golden-args (full/minimal/
+    vision/GLM-4.7-Flash-rauw-spiegeling uit guardian `tests/unit/test_manager.py`:
+    `test_writes_basic_args`-mirror + `test_write_server_args_ignores_legacy_backend_key`),
+    **guardian-cross-check via de guardian-venv in een subprocess**
+    (`<guardian-root>/venv/bin/python`; caretaker-venv mist guardian-deps
+    psutil/schedule → in-process import is niet betrouwbaar; skip i.p.v. fail
+    als guardian-venv/fixture-instantiatie faalt), fake-`ServerProcess`-flows,
+    unload-guard, review-fix-testen.
+  - **Verificatie:** 31 tests groen (12 bootstrap + 19 fase A), ruff clean,
+    py_compile OK. Apples-to-apples: caretaker `_build_args_string` == guardian
+    byte-gelijk op dezelfde fixture (ook op guardian SAMPLE-style `ctx`/`ts`-
+    legacy-keys; daarom is raw-`build_runtime_config`-path `-c None -ngl None` —
+    dat IS guardian-identiek).
+  - **Test-isolatie-les (2026-08-29):** de switch/unload-lifecycle-tests die géén
+    `patch_paths`-fixture gebruikten schreven/lazen de echte repo-`config/
+    current_model.sig` (gitignored). Een achtergebleven `.sig` van een succesvolle
+    switch maakte `_config_drifted` ertoe de **no-op-fast-path** te nemen →
+    `test_switch_model_failure_clears_active_state` faalde ("DID NOT RAISE").
+    **Fix:** élke switch/unload-test injecteert nu `patch_paths` (= per-test tmp
+    `CURRENT_MODEL_*`-paden + deterministische env) zodat er nooit in de echte
+    `config/` geschreven wordt; suite is daarna robuust ongeacht achterblijvers.
+- **2026-08-29 ruff-gate geverifieerd (bleek al groen).** De org-reusable
+  `python-ci` draait `ruff check caretaker tests` met de **default-select**
+  (`[tool.ruff] target-version=py314 line-length=100`, géén eigen select →
+  default = ~F/E). **`ruff check caretaker/ tests/` is schoon** (0 errors) op
+  zowel ruff 0.15.15 als 0.16.5; `--select BLE001` = **0 errors** (élke
+  guardian-overgenomen broad `except Exception` in `caretaker/manager.py`
+  (14×) en `tests/test_phase_a.py` (1×) draagt al `# noqa: BLE001` — bewuste
+  guardian-parity keuze, NIET per `--fix` weggespoeld); `--select F` (F401/
+  F841/F821/unused) = **0 errors**. Enige risico = een toekomstige ruff die
+  BLE001 (of `--select ALL`-regels: S101/COM812/G004/PLR2004/ARG001/…) wél in
+  de default neemt — **bewust géén NoDeviate/ignore voor die** zolang de CI
+  default-select draait; als de reviewer `--select ALL` wil, zijn er 289 issues
+  (52 fixable, géén BLE) — dat is dan een aparte selectiebeslissing.
+>>>>>>> Stashed changes
 
 ## References
 
