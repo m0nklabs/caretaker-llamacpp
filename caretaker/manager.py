@@ -1003,12 +1003,15 @@ class Caretaker:
 
         # Mark a lifecycle transition in flight so the watchdog does not race
         # this load. The no-op fast-path above returns early, so this only runs
-        # on a real (re)load; the target config is built once and reused.
-        self._switch_in_progress = True
-        target_config = self.build_runtime_config(
-            model_name, enable_vision=desired_vision, context_hint=context_hint
-        )
+        # on a real (re)load. ``_switch_in_progress`` and the config build live
+        # INSIDE the try so a raise in either (e.g. a malformed model entry in
+        # build_runtime_config) still clears the flag via the finally — the
+        # watchdog must never be permanently disabled by a stuck transition.
         try:
+            self._switch_in_progress = True
+            target_config = self.build_runtime_config(
+                model_name, enable_vision=desired_vision, context_hint=context_hint
+            )
             # VRAM slot: a swap A→B frees A's slot *before* acquiring B — this
             # switch stops the old model itself, so waiting for space only this
             # switch could free would deadlock forever. A same-model
@@ -1109,14 +1112,29 @@ class Caretaker:
             except Exception:  # noqa: BLE001
                 logger.info(f"No auto-save found for {model_name}, starting fresh.")
         except BaseException:
-            # The load did not complete and no model is running, so the
-            # scheduler must hold nothing: release ``model_name``
-            # unconditionally. A swap already freed the old slot (the new one
-            # was never admitted → no-op decrement), a cold load frees its new
-            # slot, and a same-model reload failure frees the slot it kept —
-            # its server is dead, holding the slot would phantom-block others.
+            # Restore truthful VRAM accounting for whatever the failure state is:
+            # - current_model is still set (failure before the stop, e.g. a
+            #   failed acquire on the new model or a build error): the old
+            #   server keeps running, so its slot must be restored if it was
+            #   released for a swap — otherwise the scheduler under-counts and
+            #   a later load can overcommit.
+            # - current_model is None (failure after the stop, or cold start):
+            #   the new model is not running, so release its slot — a swap
+            #   frees the just-acquired slot, a same-model reload frees the
+            #   slot it kept (its server is dead; holding it would
+            #   phantom-block others), a cold-start failure is a no-op decrement.
             if self.vram is not None:
-                await self.vram.release(model_name)
+                if self.current_model is not None:
+                    if self.vram.active_counts.get(self.current_model, 0) == 0:
+                        await self.vram.acquire(
+                            self.current_model,
+                            get_model_size_mb(
+                                self.current_model,
+                                self.models.get(self.current_model),
+                            ),
+                        )
+                else:
+                    await self.vram.release(model_name)
             raise
         finally:
             self._switch_in_progress = False

@@ -206,6 +206,64 @@ async def test_switch_model_noop_does_not_double_acquire(
     assert mgr.vram.active_counts.get("minimal", 0) == 1, "no double acquire"
 
 
+async def test_switch_model_swap_fail_restores_old_slot(
+    tmp_path: Path, isolated_paths: None
+) -> None:
+    """A swap that fails before the stop must not leak the old model's slot.
+
+    A→B where B alone exceeds the budget: A's slot was released for the swap,
+    then acquire(B) fails. A's server is still running, so its slot must be
+    restored — otherwise the scheduler under-counts and a later load could
+    overcommit VRAM (review-found slot-leak).
+    """
+    proc = FakeServerProcess()
+    models = {
+        "first": {"path": "/home/flip/models/first.gguf", "size_mb": 400},
+        "big": {"path": "/home/flip/models/big.gguf", "size_mb": 600},
+    }
+    mgr = _make_manager(tmp_path, process=proc, vram_limit_mb=500, models=models)
+    await mgr.switch_model("first")
+    assert mgr.current_model == "first"
+    assert mgr.vram.active_counts.get("first", 0) == 1
+
+    with pytest.raises(VramLimitExceededError):
+        await mgr.switch_model("big")
+    # A is still the active model; its slot must be back (not leaked).
+    assert mgr.current_model == "first"
+    assert mgr.vram.active_counts.get("first", 0) == 1
+    assert not mgr._switch_in_progress, "flag must be cleared on failed swap"
+    # And a later unload frees the restored slot exactly once (no double-count).
+    await mgr.unload()
+    assert "first" not in mgr.vram.active_counts
+
+
+async def test_switch_model_build_error_clears_transition_flag(
+    tmp_path: Path, isolated_paths: None
+) -> None:
+    """A build_runtime_config failure must clear the transition flag.
+
+    If the config build raises (e.g. malformed model entry that
+    load_models_config does not validate per-model), the try/finally around the
+    switch must still clear ``_switch_in_progress`` — otherwise the watchdog is
+    permanently disabled until the process restarts (review-found stuck-flag).
+    """
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        vram_limit_mb=500,
+        models={"minimal": {"path": "/home/flip/models/minimal.gguf", "size_mb": 300}},
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("malformed model entry")
+
+    mgr.build_runtime_config = _boom  # instance-level override
+    with pytest.raises(RuntimeError):
+        await mgr.switch_model("minimal")
+    assert not mgr._switch_in_progress, "flag must be cleared on build error"
+
+
 async def test_switch_model_same_model_reload_keeps_single_slot(
     tmp_path: Path, isolated_paths: None
 ) -> None:
