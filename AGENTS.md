@@ -76,11 +76,30 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   - **Bind host/port configureerbaar:** `CARETAKER_HOST`/`CARETAKER_PORT`,
     default loopback `127.0.0.1:11441` (test-pinned; remote-gateway F6 zet
     LAN-interface).
-- **Fases A–E (PLAN.md §2–§6):** **Phase A (lifecycle core) GEÏMPLEMENTEERD — zie hieronder**; B = drift, C = watchdog + VRAM, D = idle-unload-contract, E = multi-host/Windows staan nog open. De lifecycle-kern
+- **Fases A–E (PLAN.md §2–§6):** **Phase A + B GEMERGED — zie hieronder**; C = watchdog + VRAM, D = idle-unload-contract, E = multi-host/Windows staan nog open. De lifecycle-kern
   (~1050 regels) verhuist uit
   `guardian-llmprovider-gateway/app/engine/manager.py`:
   A = lifecycle core (spawn/stop/reload + args-bouw byte-identiek), B = drift,
   C = watchdog + VRAM, D = idle-unload-contract, E = multi-host/Windows.
+- **Phase B (drift-contract) GEMERGED (2026-08-29, PR #4 → main, squash-commit `d0bc1d7`):**
+  `POST /ensure` is de correcte idempotente repair-primitive (drift her-detecteren →
+  reload; niet gedrift → no-op) en `GET /status` rapporteert `needs_reload` voor
+  discovery. `Caretaker.check_drift()` (publiek, pure wrapper over `_config_drifted`,
+  ValueError op onbekend model); `health()` met `needs_reload`. `/ensure`: 200
+  `{ok, loaded_model}`, 404 `model_not_found`, 503 `model_load_failed` + `crash_details`,
+  422 `invalid_request` — **top-level error-bodies (geen `detail`-wrapper)** zodat de
+  gateway direct op `error` kan branchen. `server.init(manager)` voor test-injectie +
+  lazy `_manager()` singleton; `/unload` blijft 501 (Phase C); auth-gate intact.
+  **Review-les ronde 1 (2 terecht):** (a) `health()` mag drift NIET tegen de loaded
+  runtime-vision-mode vouwen — `_resolve_runtime_vision_flag` resolved `enable_vision=None`
+  voor het actieve model naar `current_vision_enabled`, dus zélfs `check_drift(model)`
+  maskeert een mmproj-config-wijziging (bewezen: args-hash bleef identiek). Fix =
+  interne `config_vision`-parameter op `_compute_launch_signature`/`_config_drifted` die
+  de config-*default* forceert (mmproj-aanwezigheid; bypass loaded-mode-shortcut);
+  `health()` → `_config_drifted(model, enable_vision=None, config_vision=True)`.
+  (b) `bool` is een `int`-subklasse → `context_hint: true` glipte door validatie; nu
+  expliciet afgewezen (422). Beide gepind door regressietests. **54 tests totaal, ruff
+  clean.**
 - **Plan-only. Niks gebouwd, repo leeg** = VERLEDEN — zie boven.
 
 ### Phase A (lifecycle core) — status
