@@ -40,6 +40,7 @@ from .paths import (
     llama_slots_dir,
     server_url,
 )
+from .vram import VramScheduler, get_model_size_mb
 
 logger = logging.getLogger("caretaker.manager")
 
@@ -50,6 +51,13 @@ MAX_CRASH_HISTORY = 50  # Keep last N crash records
 DEFAULT_HEALTH_POLLS = 120
 DEFAULT_HEALTH_INTERVAL = 1.0
 DEFAULT_HEALTH_TIMEOUT = 5.0
+
+# Watchdog defaults (Phase C). The operator starts the watchdog explicitly via
+# ``manager.start_watchdog()``; interval/backoff are constructor-free here so
+# tests can exercise ``_watchdog_loop`` with short values directly.
+DEFAULT_WATCHDOG_INTERVAL = 15.0
+DEFAULT_WATCHDOG_INITIAL_BACKOFF = 5.0
+DEFAULT_WATCHDOG_MAX_BACKOFF = 60.0
 
 
 @dataclass
@@ -339,6 +347,36 @@ def _parse_server_url(url: str = "") -> tuple[str, int | None]:
     return host, parsed.port
 
 
+def _yaml_vram_limit_mb(config_path: str | None) -> int | None:
+    """Read an optional ``vram_limit_mb`` from the models YAML root.
+
+    A caretaker may declare its VRAM budget at the top of its own
+    ``models.local.settings.yaml`` (the same document that holds ``models``).
+    ``None`` (no field / unreadable / non-numeric) means "not configured" →
+    the caretaker enforces no VRAM slot. Best-effort: a parse error never
+    blocks construction.
+    """
+    import yaml as _yaml
+
+    try:
+        path = Path(config_path) if config_path else config_mod.models_file_path()
+        with path.open(encoding="utf-8") as fh:
+            data = _yaml.safe_load(fh) or {}
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("vram_limit_mb")
+    except Exception:  # noqa: BLE001 - best-effort config read
+        return None
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-integer vram_limit_mb=%r in %s", raw, path)
+        return None
+    return val
+
+
 class Caretaker:
     """Owns the local llama-server lifecycle behind the control API.
 
@@ -357,6 +395,8 @@ class Caretaker:
         health_polls: int = DEFAULT_HEALTH_POLLS,
         health_interval: float = DEFAULT_HEALTH_INTERVAL,
         server_url: str = SERVER_URL,
+        vram_limit_mb: int | None = None,
+        check_vram: bool = True,
     ) -> None:
         self.config_path = Path(config_path) if config_path else config_mod.models_file_path()
         loaded = config_mod.load_models_config(self.config_path)
@@ -366,11 +406,33 @@ class Caretaker:
         self.health_polls = health_polls
         self.health_interval = health_interval
 
+        # VRAM slot (Phase C): a single-per-caretaker scheduler serializes model
+        # loads within a configurable budget. ``vram_limit_mb`` is None (no field
+        # in the settings YAML) or enforced is off → no VRAM slot (None), so
+        # switch_model skips acquire/release entirely.
+        if check_vram and vram_limit_mb is None:
+            vram_limit_mb = _yaml_vram_limit_mb(config_path)
+        self.vram: VramScheduler | None = (
+            VramScheduler(vram_limit_mb) if check_vram and vram_limit_mb else None
+        )
+
         self.current_model: str | None = None
         self.current_vision_enabled: bool = False
         self.is_unloaded: bool = False
         self.crash_history: list[CrashRecord] = []
         self.last_crash: CrashRecord | None = None
+
+        # Watchdog bookkeeping (Phase C). The watchdog is not started here; the
+        # operator starts it via ``start_watchdog()`` (F5-deploy wiring).
+        self._watchdog_task: asyncio.Task | None = None
+        self._watchdog_interval: float = DEFAULT_WATCHDOG_INTERVAL
+        self._watchdog_initial_backoff: float = DEFAULT_WATCHDOG_INITIAL_BACKOFF
+        self._watchdog_max_backoff: float = DEFAULT_WATCHDOG_MAX_BACKOFF
+        self._watchdog_backoff: float = DEFAULT_WATCHDOG_INITIAL_BACKOFF
+        self._watchdog_running: bool = False
+        # True while a switch/load/unload/stop is running, so the watchdog does
+        # not race an in-flight lifecycle transition.
+        self._switch_in_progress: bool = False
 
         # Simple per-model vision-validation reset map (the authoritative vision
         # cache stays in the gateway; caretaker only needs a no-op/bookkeeping
@@ -904,6 +966,7 @@ class Caretaker:
         *,
         enable_vision: bool | None = None,
         context_hint: int | None = None,
+        force: bool = False,
     ) -> None:
         """Swap the running llama-server to ``model_name``.
 
@@ -918,7 +981,12 @@ class Caretaker:
 
         desired_vision = self._resolve_runtime_vision_flag(model_name, enable_vision)
         drifted = self._config_drifted(model_name, enable_vision=desired_vision, context_hint=context_hint)
-        if model_name == self.current_model and desired_vision == self.current_vision_enabled and not drifted:
+        if (
+            not force
+            and model_name == self.current_model
+            and desired_vision == self.current_vision_enabled
+            and not drifted
+        ):
             self.is_unloaded = False  # a live server is active; not unloaded
             logger.info(f"Model {model_name} is already active")
             return
@@ -926,6 +994,20 @@ class Caretaker:
             logger.info(
                 f"🔄 Config drift detected for '{model_name}' "
                 "(settings changed in models.yaml) — reloading to apply new settings"
+            )
+
+        # Mark a lifecycle transition in flight so the watchdog does not race
+        # this load. The acquire comes *after* the no-op fast-path above, so a
+        # no-op switch never double-accounts the VRAM slot. It only runs when we
+        # really (re)load; the target config is built once and reused below.
+        self._switch_in_progress = True
+        target_config = self.build_runtime_config(
+            model_name, enable_vision=desired_vision, context_hint=context_hint
+        )
+        acquired = self.vram is not None
+        if acquired:
+            await self.vram.acquire(
+                model_name, get_model_size_mb(model_name, self.models.get(model_name))
             )
 
         logger.info(
@@ -936,83 +1018,91 @@ class Caretaker:
             "vision" if desired_vision else "text",
         )
 
-        # 1. Auto-save current context (only if a model is actually loaded —
-        #    on the first switch current_model is None, so nothing to save).
-        if self.current_model is not None:
-            await self._save_context(f"auto_save_{self.current_model}")
+        try:
+            # 1. Auto-save current context (only if a model is actually loaded —
+            #    on the first switch current_model is None, so nothing to save).
+            if self.current_model is not None:
+                await self._save_context(f"auto_save_{self.current_model}")
 
-        # 2. Stop llama-server. The old model is no longer running: clear the
-        #    active-model bookkeeping NOW, so a later exception (args write,
-        #    GPU free, start) cannot leave a stale "old model active" state.
-        self.current_model = None
-        self.current_vision_enabled = False
-        self.is_unloaded = False
-        await self.server_process.stop()
-
-        # 3. Write new model args
-        target_config = self.build_runtime_config(
-            model_name, enable_vision=desired_vision, context_hint=context_hint
-        )
-        logger.info(
-            "Runtime config for %s [%s]: context=%s ngl=%s split=%s mmproj=%s",
-            model_name,
-            "vision" if desired_vision else "text",
-            target_config.get("context"),
-            target_config.get("ngl"),
-            target_config.get("tensor_split") or "auto",
-            target_config.get("mmproj") or "none",
-        )
-        self._write_server_args(target_config)
-
-        # 4. Free GPU memory
-        await self._free_gpu_memory()
-
-        # 5. Start llama-server
-        await self.server_process.start()
-
-        # 6. Wait for health with crash detection
-        healthy = await self._wait_for_health(model_name)
-
-        if not healthy:
-            # The old model is no longer running: clear the "active model"
-            # bookkeeping so a later same-model ensure/switch actually restarts
-            # llama-server instead of short-circuiting as "already active".
+            # 2. Stop llama-server. The old model is no longer running: clear the
+            #    active-model bookkeeping NOW, so a later exception (args write,
+            #    GPU free, start) cannot leave a stale "old model active" state.
             self.current_model = None
             self.current_vision_enabled = False
-            crash = await self._detect_crash(
+            self.is_unloaded = False
+            await self.server_process.stop()
+
+            # 3. Write new model args
+            logger.info(
+                "Runtime config for %s [%s]: context=%s ngl=%s split=%s mmproj=%s",
                 model_name,
-                config_snapshot=self._build_crash_config_snapshot(
+                "vision" if desired_vision else "text",
+                target_config.get("context"),
+                target_config.get("ngl"),
+                target_config.get("tensor_split") or "auto",
+                target_config.get("mmproj") or "none",
+            )
+            self._write_server_args(target_config)
+
+            # 4. Free GPU memory
+            await self._free_gpu_memory()
+
+            # 5. Start llama-server
+            await self.server_process.start()
+
+            # 6. Wait for health with crash detection
+            healthy = await self._wait_for_health(model_name)
+
+            if not healthy:
+                # The old model is no longer running: clear the "active model"
+                # bookkeeping so a later same-model ensure/switch actually
+                # restarts llama-server instead of short-circuiting as
+                # "already active".
+                self.current_model = None
+                self.current_vision_enabled = False
+                crash = await self._detect_crash(
                     model_name,
-                    runtime_config=target_config,
-                    vision_enabled=desired_vision,
-                ),
+                    config_snapshot=self._build_crash_config_snapshot(
+                        model_name,
+                        runtime_config=target_config,
+                        vision_enabled=desired_vision,
+                    ),
+                )
+                raise ModelLoadError(
+                    f"Model '{model_name}' failed to load: {crash.error_message}",
+                    crash_record=crash,
+                )
+
+            self.current_model = model_name
+            self.current_vision_enabled = desired_vision
+            self.is_unloaded = False
+            # Persist the launch signature so future same-model requests can
+            # detect config drift and reload instead of skipping.
+            launch_sig = self._compute_launch_signature(
+                model_name, enable_vision=desired_vision, context_hint=context_hint
             )
-            raise ModelLoadError(
-                f"Model '{model_name}' failed to load: {crash.error_message}",
-                crash_record=crash,
-            )
+            if launch_sig is not None:
+                self._write_persisted_signature(launch_sig)
+            self.reset_vision_validation(model_name)
+            logger.info(f"✅ Model '{model_name}' loaded successfully")
 
-        self.current_model = model_name
-        self.current_vision_enabled = desired_vision
-        self.is_unloaded = False
-        # Persist the launch signature so future same-model requests can detect
-        # config drift and reload instead of skipping.
-        launch_sig = self._compute_launch_signature(
-            model_name, enable_vision=desired_vision, context_hint=context_hint
-        )
-        if launch_sig is not None:
-            self._write_persisted_signature(launch_sig)
-        self.reset_vision_validation(model_name)
-        logger.info(f"✅ Model '{model_name}' loaded successfully")
+            # Post-switch verification — simplified: warn-only, never fail.
+            await self._verify_backend_model()
 
-        # Post-switch verification — simplified: warn-only, never fail.
-        await self._verify_backend_model()
-
-        # 7. Restore context if exists
-        try:
-            await self._load_context(f"auto_save_{model_name}")
-        except Exception:  # noqa: BLE001
-            logger.info(f"No auto-save found for {model_name}, starting fresh.")
+            # 7. Restore context if exists.
+            try:
+                await self._load_context(f"auto_save_{model_name}")
+            except Exception:  # noqa: BLE001
+                logger.info(f"No auto-save found for {model_name}, starting fresh.")
+        except BaseException:
+            # The load did not complete: give the VRAM slot back so another
+            # model is not blocked behind a phantom acquire. The acquired model
+            # is never active on this path, so the release cannot double-count.
+            if acquired:
+                await self.vram.release(model_name)
+            raise
+        finally:
+            self._switch_in_progress = False
 
     def reset_vision_validation(self, model_name: str) -> None:
         """Reset caretaker-local vision-validation bookkeeping after a load/switch."""
@@ -1023,12 +1113,21 @@ class Caretaker:
         if self.is_unloaded:
             logger.info("⚡ Already unloaded — nothing to do")
             return
-        logger.info(f"🔌 Unloading model '{self.current_model}' to free VRAM...")
-        await self.server_process.stop()
-        self.is_unloaded = True
-        self.current_model = None
-        self.current_vision_enabled = False
-        logger.info("✅ llama-server stopped — VRAM is free")
+        self._switch_in_progress = True
+        previous_model = self.current_model
+        try:
+            logger.info(f"🔌 Unloading model '{previous_model}' to free VRAM...")
+            await self.server_process.stop()
+            self.is_unloaded = True
+            self.current_model = None
+            self.current_vision_enabled = False
+            # Release the VRAM slot held by the just-stopped model (skip when
+            # there was no active model, e.g. none was ever loaded).
+            if self.vram is not None and previous_model is not None:
+                await self.vram.release(previous_model)
+            logger.info("✅ llama-server stopped — VRAM is free")
+        finally:
+            self._switch_in_progress = False
 
     # ------------------------------------------- public skeleton surface (Phase A)
     async def spawn(self, model: str) -> None:
@@ -1042,10 +1141,18 @@ class Caretaker:
         Phase C health-check route) never sees a stale 'model active' state
         while the backend is stopped.
         """
-        await self.server_process.stop()
-        self.current_model = None
-        self.current_vision_enabled = False
-        self.is_unloaded = True
+        self._switch_in_progress = True
+        previous_model = self.current_model
+        try:
+            await self.server_process.stop()
+            # Release the VRAM slot held by the just-stopped model, like unload().
+            if self.vram is not None and previous_model is not None:
+                await self.vram.release(previous_model)
+            self.current_model = None
+            self.current_vision_enabled = False
+            self.is_unloaded = True
+        finally:
+            self._switch_in_progress = False
 
     async def reload(self, model: str) -> None:
         """Reload ``model`` (Phase A+B: idempotent, drift-aware swap)."""
@@ -1079,3 +1186,103 @@ class Caretaker:
             if self.current_model is not None
             else True,
         }
+
+    # ------------------------------------------------------------- watchdog
+    def start_watchdog(
+        self,
+        *,
+        interval: float = DEFAULT_WATCHDOG_INTERVAL,
+        max_backoff: float = DEFAULT_WATCHDOG_MAX_BACKOFF,
+        initial_backoff: float = DEFAULT_WATCHDOG_INITIAL_BACKOFF,
+    ) -> None:
+        """Start the background health/crash watchdog (idempotent).
+
+        The watchdog is **not** started automatically: tests and the F5-deploy
+        wiring start it explicitly. A second call while running only updates the
+        timing parameters — it never spawns a duplicate background task.
+        """
+        self._watchdog_interval = interval
+        self._watchdog_initial_backoff = initial_backoff
+        self._watchdog_max_backoff = max_backoff
+        self._watchdog_backoff = initial_backoff
+        self._watchdog_running = True
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    def stop_watchdog(self) -> None:
+        """Stop the background watchdog (idempotent).
+
+        Clear the running flag (the loop exits at its next cadence) and cancel
+        any in-flight task so a long sleep is interrupted immediately.
+        """
+        self._watchdog_running = False
+        task = self._watchdog_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._watchdog_task = None
+
+    async def _watchdog_tick(self) -> bool:
+        """One deterministic watchdog pass: probe health and restart on a crash.
+
+        Returns ``True`` when a restart was attempted; ``False`` (no action) when
+        there is no active model, caretaker is unloaded, or a lifecycle
+        transition is in flight — so a tick never races a switch/unload/stop.
+
+        Backoff: ``_watchdog_backoff`` starts at ``initial_backoff`` and is
+        slept *before* the restart. A successful ``switch_model`` resets it to
+        ``initial_backoff``; a failed load (``ModelLoadError``) doubles it
+        (capped at ``_watchdog_max_backoff``) so a crash-looping model is not
+        thrashed.
+
+        This is the testable core: tests call it directly with a small/zero
+        backoff instead of running the infinite :meth:`_watchdog_loop`.
+        """
+        if self.is_unloaded or self.current_model is None or self._switch_in_progress:
+            return False
+        if await self.server_process.health_ok(self.server_url):
+            # Healthy — a fresh crash later starts again from the initial backoff.
+            self._watchdog_backoff = self._watchdog_initial_backoff
+            return False
+
+        model = self.current_model
+        logger.warning("Watchdog: backend unhealthy for '%s' — recording crash", model)
+        await self._detect_crash(model)
+        logger.warning(
+            "Watchdog: restarting '%s' after %.1fs backoff",
+            model,
+            self._watchdog_backoff,
+        )
+        if self._watchdog_backoff > 0:
+            await asyncio.sleep(self._watchdog_backoff)
+        try:
+            # force=True: the no-op fast-path in switch_model (same model +
+            # no drift) must NOT skip the restart — the backend is known dead.
+            await self.switch_model(model, force=True)
+        except ModelLoadError:
+            self._watchdog_backoff = min(
+                self._watchdog_backoff * 2, self._watchdog_max_backoff
+            )
+            raise
+        self._watchdog_backoff = self._watchdog_initial_backoff
+        return True
+
+    async def _watchdog_loop(self) -> None:
+        """The watchdog background loop: poll health every ``interval``.
+
+        Each pass calls :meth:`_watchdog_tick`; a failed restart (backed off by
+        the tick) does not abort the loop, so a later recovery is picked up.
+        Cancellation and ``_watchdog_running = False`` both stop the loop cleanly.
+        """
+        while self._watchdog_running:
+            try:
+                await self._watchdog_tick()
+            except ModelLoadError:
+                # ModelLoadError is already backoff-doubled inside the tick; the
+                # loop keeps polling so a crash-looping model's recovery or a
+                # different model is still acted on.
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # best-effort: a failing tick never kills the loop
+                logger.exception("Watchdog tick failed")
+            await asyncio.sleep(self._watchdog_interval)

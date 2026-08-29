@@ -48,17 +48,30 @@ def test_auth_gate_non_ascii_configured_key_returns_503_not_500(
     assert "must be ASCII" in resp.text
 
 
-def test_auth_gate_correct_key_reaches_route_501(
+def test_auth_gate_correct_key_reaches_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A correct bearer key passes the gate and reaches the 501 stub route.
+    """A correct bearer key passes the gate and reaches a live route handler.
 
-    ``/unload`` is still a Phase C 501 stub (unlike ``/status`` and ``/ensure``,
-    which Phase B filled in), so it remains the route that proves the auth gate
-    lets a correct key through to a stub handler."""
+    All three control routes are implemented since Phase C (no 501 stub
+    remains), so the gate is proven by reaching the handler: with a dummy
+    manager injected, ``/status`` returns 200 — a wrong/absent key would have
+    stopped at 401 before the route body."""
     monkeypatch.setenv("CARETAKER_KEY", "super-secret")
-    resp = client.post("/unload", headers={"Authorization": "Bearer super-secret"})
-    assert resp.status_code == 501
+
+    class _Dummy:
+        def health(self):
+            return {"loaded_model": None, "is_unloaded": True, "needs_reload": True}
+
+    from caretaker.server import init
+
+    try:
+        init(_Dummy())
+        resp = client.get("/status", headers={"Authorization": "Bearer super-secret"})
+        assert resp.status_code == 200
+        assert resp.json()["is_unloaded"] is True
+    finally:
+        init(None)
 
 
 def test_config_missing_file_raises_clear_error(

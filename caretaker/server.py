@@ -155,9 +155,17 @@ async def ensure(request: Request) -> dict:
 
 
 @app.post("/unload", dependencies=[Depends(require_caretaker_key)])
-async def unload() -> None:
-    """Unload the current model (Phase C fills this in)."""
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="not implemented",
-    )
+async def unload() -> dict:
+    """Unload the current model: stop llama-server and free VRAM (idempotent).
+
+    ``unload()`` is guarded against double-unload, so a second ``/unload`` is a
+    no-op 200 — the gateway may call it freely when the queue is empty (Phase D).
+    """
+    try:
+        await _manager().unload()
+    except Exception as exc:  # noqa: BLE001 - best-effort surface; idempotent
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": "unload_failed", "message": str(exc)},
+        )
+    return {"ok": True, "is_unloaded": True}
