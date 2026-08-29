@@ -23,3 +23,6 @@ slots/
 # local builds
 build/
 dist/
+
+# caretaker runtime deployment files (written by the manager on launch)
+config/current_model.*
