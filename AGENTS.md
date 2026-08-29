@@ -2,7 +2,7 @@
 
 > Canonical AI-agent context voor dit repo. **Eerst lezen.**
 > Claude Code: `CLAUDE.md` → hier. Goose: `.goosehints` → hier.
-> Status: **Phase A + B + C GEMERGED (2026-08-29); fases D–E + gateway-wiring open — zie `./PLAN.md`.**
+> Status: **Phase A–D GEMERGED (2026-08-29); fase E (multi-host/Windows) + gateway-wiring open — zie `./PLAN.md`.**
 
 ## Wat is dit project
 
@@ -76,11 +76,11 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   - **Bind host/port configureerbaar:** `CARETAKER_HOST`/`CARETAKER_PORT`,
     default loopback `127.0.0.1:11441` (test-pinned; remote-gateway F6 zet
     LAN-interface).
-- **Fases A–E (PLAN.md §2–§6):** **Phase A + B + C GEMERGED — zie hieronder**; D = idle-unload-contract, E = multi-host/Windows staan nog open. De lifecycle-kern
+- **Fases A–E (PLAN.md §2–§6):** **Phase A–D GEMERGED — zie hieronder**; E (multi-host/Windows) + de gateway-wiring (§7) staan nog open. De lifecycle-kern
   (~1050 regels) verhuist uit
   `guardian-llmprovider-gateway/app/engine/manager.py`:
   A = lifecycle core (spawn/stop/reload + args-bouw byte-identiek), B = drift,
-  C = watchdog + VRAM ✅, D = idle-unload-contract, E = multi-host/Windows.
+  C = watchdog + VRAM ✅, D = idle-unload-contract ✅, E = multi-host/Windows.
 - **Phase B (drift-contract) GEMERGED (2026-08-29, PR #4 → main, squash-commit `d0bc1d7`):**
   `POST /ensure` is de correcte idempotente repair-primitive (drift her-detecteren →
   reload; niet gedrift → no-op) en `GET /status` rapporteert `needs_reload` voor
@@ -131,6 +131,18 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   - **Review rondes: ronde-1 3 terecht (deadlock, acquire-fail-fast, one-shot-retry) +
     ronde-2 2 terecht (slot-leak, stuck-flag) — alle 5 in 2 fix-commits (`4dee835`,
     `2b8adea`) met regressietests. 76 tests totaal, ruff clean.**
+- **Phase D (idle-unload-contract) GEMERGED (2026-08-29, PR #6 → main, squash-commit `b4ef3d1`, review schoon — 0 threads):**
+  - `health()`/`GET /status` rapporteert nu `loaded_at` + `idle_since` (unix-epoch van de
+    laatste succesvolle load; beide `null` na unload/stop). **De caretaker ziet geen
+    requestverkeer** — dit is een load-age-proxy; de gateway combineert `idle_since` met
+    zijn eigen `last_request_time` vóór hij `POST /unload` roept (beslissing in gateway).
+  - Het **unload→ensure-herstelcontract** is API-level gepind: `POST /unload` → `/status`
+    is_unloaded=true → `POST /ensure {model}` → 200 + loaded_model → `/status` loaded —
+    exact de 503 → /ensure-recovery-pad die de gateway-wiring straks gebruikt.
+  - VRAM-accounting blijft waarheidsgetrouw over herhaalde unload→ensure-cycli (geen
+    slot-leak, geen spurious crashes). Test `test_ensure_recovers_after_unload_api` pinnt
+    de restart-assert (start-count ≥ 2, ensure is een echte reload, geen no-op).
+  - **81 tests totaal, ruff clean.**
 - **Plan-only. Niks gebouwd, repo leeg** = VERLEDEN — zie boven.
 
 ### Phase A (lifecycle core) — status
@@ -330,6 +342,8 @@ tests/
   test_phase_c.py   22 tests: VramScheduler (acquire/release/blokkade/size), switch+VRAM
                     integratie (swap-deadlock, same-model, fail-fast, slot-leak, stuck-flag),
                     watchdog (tick healthy/crash/backoff/retry/loop), /unload + /ensure-503-API
+  test_phase_d.py   5 tests: idle-contract (loaded_at/idle_since), /status-API,
+                    ensure-recovery na unload (echte restart), unload→ensure-cycli + VRAM
 .github/workflows/
   pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
   python-ci.yml     Org-reusable python-ci (python 3.12, src caretaker)
