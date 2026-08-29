@@ -854,6 +854,7 @@ class Caretaker:
         desired_vision = self._resolve_runtime_vision_flag(model_name, enable_vision)
         drifted = self._config_drifted(model_name, enable_vision=desired_vision, context_hint=context_hint)
         if model_name == self.current_model and desired_vision == self.current_vision_enabled and not drifted:
+            self.is_unloaded = False  # a live server is active; not unloaded
             logger.info(f"Model {model_name} is already active")
             return
         if drifted:
@@ -870,11 +871,18 @@ class Caretaker:
             "vision" if desired_vision else "text",
         )
 
-        # 1. Auto-save current context
-        await self._save_context(f"auto_save_{self.current_model}")
+        # 1. Auto-save current context (only if a model is actually loaded —
+        #    on the first switch current_model is None, so nothing to save).
+        if self.current_model is not None:
+            await self._save_context(f"auto_save_{self.current_model}")
 
-        # 2. Stop llama-server
+        # 2. Stop llama-server. The old model is no longer running: clear the
+        #    active-model bookkeeping NOW, so a later exception (args write,
+        #    GPU free, start) cannot leave a stale "old model active" state.
         await self.server_process.stop()
+        self.current_model = None
+        self.current_vision_enabled = False
+        self.is_unloaded = False
 
         # 3. Write new model args
         target_config = self.build_runtime_config(
@@ -921,6 +929,7 @@ class Caretaker:
 
         self.current_model = model_name
         self.current_vision_enabled = desired_vision
+        self.is_unloaded = False
         # Persist the launch signature so future same-model requests can detect
         # config drift and reload instead of skipping.
         launch_sig = self._compute_launch_signature(

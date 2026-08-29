@@ -508,3 +508,77 @@ def test_build_args_string_uses_injected_server_url(tmp_path, monkeypatch):
     # The injected URL must appear in the args, NOT the env var.
     assert "--host inj-host --port 11441" in args_inj
     assert "--host env-host" not in args_inj
+
+
+# --------------------------------------------------------------------------
+# 6. Review-fix regressions (PR #3 review round 2)
+# --------------------------------------------------------------------------
+
+
+async def test_unload_then_switch_resets_unloaded_flag(tmp_path):
+    """Review round 2 / State Bug: after unload(), a later switch_model()
+    must reset is_unloaded so the freshly loaded server is not skipped."""
+    fake = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=fake)
+    mgr.current_model = "minimal"
+
+    await mgr.unload()
+    assert mgr.is_unloaded is True
+    assert mgr.current_model is None
+
+    await mgr.switch_model("minimal")
+    assert mgr.is_unloaded is False
+    assert mgr.current_model == "minimal"
+
+
+async def test_first_switch_does_not_auto_save_none(tmp_path):
+    """Review round 2 / Context Save: on the first switch (current_model is
+    None) no auto_save_None context save may be attempted."""
+    save_calls: list[str] = []
+    load_calls: list[str] = []
+
+    async def fake_save(filename: str) -> None:
+        save_calls.append(filename)
+
+    async def fake_load(filename: str) -> None:
+        load_calls.append(filename)
+
+    fake = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=fake)
+    mgr._save_context = fake_save  # type: ignore[method-assign]
+    mgr._load_context = fake_load  # type: ignore[method-assign]
+
+    await mgr.switch_model("minimal")
+
+    assert save_calls == [], f"expected no auto-save on first switch, got {save_calls}"
+    assert all("None" not in c for c in load_calls), f"auto_save_None leaked: {load_calls}"
+
+
+async def test_switch_exception_between_stop_and_start_clears_state(tmp_path):
+    """Review round 2 / Stale State: an exception between stop() and the
+    health-success path (here: args-file write) must leave bookkeeping
+    cleared — no stale 'old model active' behind a stopped server."""
+    fake = FakeServerProcess()
+
+    def boom(config) -> None:
+        raise RuntimeError("args write failed")
+
+    mgr = _make_manager(
+        tmp_path,
+        process=fake,
+        models={
+            "minimal": {"path": "/home/flip/models/minimal.gguf"},
+            "other": {"path": "/home/flip/models/other.gguf", "context": 8192},
+        },
+    )
+    mgr._write_server_args = boom  # type: ignore[method-assign]
+    mgr.current_model = "minimal"
+    mgr.current_vision_enabled = False
+
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        await mgr.switch_model("other")
+
+    assert mgr.current_model is None
+    assert mgr.current_vision_enabled is False
