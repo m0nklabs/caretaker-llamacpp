@@ -271,8 +271,8 @@ class DirectServerProcess(ServerProcess):
         argv = [self.binary, *shlex.split(args_text)]
         self._proc = await asyncio.create_subprocess_exec(
             *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
         )
 
@@ -478,7 +478,7 @@ class Caretaker:
         draft_cache_type_k = str(config.get("draft_cache_type_k", "f16")).strip()
         draft_cache_type_v = str(config.get("draft_cache_type_v", "f16")).strip()
 
-        host, port = _parse_server_url()
+        host, port = _parse_server_url(self.server_url)
         logger.info(f"Using official llama.cpp binary: {LLAMA_SERVER_BIN}")
 
         # Build args string
@@ -901,6 +901,11 @@ class Caretaker:
         healthy = await self._wait_for_health(model_name)
 
         if not healthy:
+            # The old model is no longer running: clear the "active model"
+            # bookkeeping so a later same-model ensure/switch actually restarts
+            # llama-server instead of short-circuiting as "already active".
+            self.current_model = None
+            self.current_vision_enabled = False
             crash = await self._detect_crash(
                 model_name,
                 config_snapshot=self._build_crash_config_snapshot(

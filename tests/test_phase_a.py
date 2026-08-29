@@ -13,8 +13,9 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import os
-import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,6 @@ from caretaker.manager import (
 )
 
 GUARDIAN_MANAGER_PATH = "/home/flip/guardian-llmprovider-gateway/app/engine/manager.py"
-GUARDIAN_ROOT = "/home/flip/guardian-llmprovider-gateway"
 
 # Deterministic, non-existent slot dir so the golden strings are stable across
 # hosts (a missing slot dir is fine — it is only a path literal here).
@@ -163,45 +163,149 @@ def test_args_vision_override_uses_vision_values(tmp_path: Path, patch_paths: No
     assert f"--mmproj {mmproj}" in args_str
 
 
+def test_writes_basic_args_mirror_guardian(tmp_path: Path, patch_paths: None) -> None:
+    """Mirror of guardian ``test_writes_basic_args``: a GLM-4.7-Flash-style model
+    with no ``context`` key resolves a default ctx (4096) and ngl 99, and the
+    full args string carries ``--load-mode none`` + ``--host 127.0.0.1 --port 11440``."""
+    model = {
+        "path": "/models/GLM-4.7-Flash.gguf",
+        "ngl": 99,
+        "ctx": 8192,  # legacy key the args-builder must ignore (no context: key)
+        "ts": "17,11",  # legacy tensor-split key (also ignored)
+    }
+    mgr = _make_manager(tmp_path, models={"GLM-4.7-Flash": model})
+
+    raw = mgr.models["GLM-4.7-Flash"]
+    assert raw["path"] == "/models/GLM-4.7-Flash.gguf"
+    assert raw.get("context", 4096) == 4096  # guardian golden: default ctx
+    assert raw.get("ngl", 99) == 99          # guardian golden: ngl 99
+
+    args_str, env_dict = mgr._build_args_string(raw)
+    golden = (
+        "-m /models/GLM-4.7-Flash.gguf -c 4096 -ngl 99 -ctk q4_0 -ctv q4_0 "
+        f"--host 127.0.0.1 --port 11440 --slot-save-path {SLOTS} --load-mode none"
+    )
+    assert args_str == golden
+    assert env_dict == {}
+
+
+def test_write_server_args_ignores_legacy_backend_key(
+    tmp_path: Path, patch_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirror of guardian ``test_write_server_args_ignores_legacy_backend_key``:
+    a ``backend`` config key must have NO effect on the written args (backwards
+    compat; the guardian ignores it too). Uses a GLM-4.7-Flash-style raw config."""
+    import caretaker.manager as manager_mod
+
+    base = {
+        "path": "/models/GLM-4.7-Flash.gguf",
+        "context": 4096,
+        "ngl": 99,
+    }
+    with_backend = dict(base, backend="unexpected_backend")
+
+    plain_mgr = _make_manager(tmp_path, models={"m": base})
+    with_backend_mgr = _make_manager(tmp_path, models={"m": with_backend})
+
+    plain_args_file = tmp_path / "plain.args"
+    backend_args_file = tmp_path / "backend.args"
+    monkeypatch.setattr(manager_mod, "CURRENT_MODEL_ARGS_FILE", plain_args_file)
+    plain_mgr._write_server_args(plain_mgr.models["m"])
+    monkeypatch.setattr(manager_mod, "CURRENT_MODEL_ARGS_FILE", backend_args_file)
+    with_backend_mgr._write_server_args(with_backend_mgr.models["m"])
+
+    plain = plain_args_file.read_text()
+    backend = backend_args_file.read_text()
+    assert "-m /models/GLM-4.7-Flash.gguf" in plain
+    assert "--host 127.0.0.1 --port 11440" in plain
+    assert "--load-mode none" in plain
+    assert plain == backend  # the backend key changes nothing
+
+
 # ------------------------------------------------- cross-check against the guardian
+# Guardian is bridged via its **own venv** in a subprocess: the caretaker venv does
+# not carry guardian deps (psutil, pydantic, schedule, …), so an in-process
+# ``import app.engine.manager`` is not reliable. We hand the guardian venv a small
+# script that runs a real ``ModelManager`` on the fixture and prints the args/env;
+# the caretaker side runs the same fixture and compares byte-equal.
+GUARDIAN_ROOT = "/home/flip/guardian-llmprovider-gateway"
+GUARDIAN_VENV = GUARDIAN_ROOT + "/venv/bin/python"
+
+_GUARDIAN_BRIDGE_SCRIPT = r"""
+import json, os, sys
+
+sys.path.insert(0, os.environ["GG_ROOT"])
+os.chdir(os.environ["GG_ROOT"])
+from app.engine.manager import ModelManager
+
+cfg = os.environ["GG_CFG"]
+mgr = ModelManager(config_path=cfg)
+out = {}
+for name in ("full-model", "minimal"):
+    runtime = mgr.build_runtime_config(name, enable_vision=False)
+    args_str, env_dict = mgr._build_args_string(runtime)
+    out[name] = {"args": args_str, "env": env_dict}
+print(json.dumps(out, sort_keys=True))
+"""
+
+
 @pytest.mark.skipif(
     not os.path.exists(GUARDIAN_MANAGER_PATH),
     reason=f"guardian manager not present at {GUARDIAN_MANAGER_PATH}",
+)
+@pytest.mark.skipif(
+    not os.path.exists(GUARDIAN_VENV),
+    reason=f"guardian venv python not present at {GUARDIAN_VENV}",
 )
 def test_args_crosscheck_guardian_byte_equal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, full_model: dict
 ) -> None:
     """Apples-to-apples: caretaker and guardian ``_build_args_string`` match bytes.
 
-    Sets both slot-dir env vars to the same value so ``--slot-save-path``
-    resolves identically in both implementations, then instantiates the real
-    guardian ``ModelManager`` in-process on the same fixture.
+    The guardian side runs in its own venv via a subprocess bridge (the caretaker
+    venv lacks guardian deps). Both slot-dir env vars are forced to the same value
+    so ``--slot-save-path`` resolves identically on both sides.
     """
     monkeypatch.setenv("CARETAKER_LLAMA_SLOTS_DIR", SLOTS)
     monkeypatch.setenv("GUARDIAN_LLMPROVIDER_GATEWAY_SLOTS_DIR", SLOTS)
     monkeypatch.setenv("CARETAKER_SERVER_URL", "http://127.0.0.1:11440")
 
-    models = {"full": full_model, "minimal": {"path": "/home/flip/models/minimal.gguf"}}
+    models = {"full-model": full_model, "minimal": {"path": "/home/flip/models/minimal.gguf"}}
     cfg = _write_models_yaml(tmp_path, models)
     caretaker = _make_manager(tmp_path, models=models)
 
-    if GUARDIAN_ROOT not in sys.path:
-        sys.path.insert(0, GUARDIAN_ROOT)
+    bridge_env = {
+        **os.environ,
+        "GG_ROOT": GUARDIAN_ROOT,
+        "GG_CFG": str(cfg),
+    }
     try:
-        from app.engine import manager as guardian_manager
-    except Exception as exc:  # noqa: BLE001 - cross-check import guard, per task
-        pytest.skip(f"guardian app is not importable from this venv: {exc}")
+        proc = subprocess.run(
+            [GUARDIAN_VENV, "-c", _GUARDIAN_BRIDGE_SCRIPT],
+            capture_output=True,
+            text=True,
+            env=bridge_env,
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - bridge availability guard
+        pytest.skip(f"guardian bridge subprocess could not run: {exc}")
+    if proc.returncode != 0:
+        pytest.skip(
+            "guardian bridge failed to instantiate ModelManager on the fixture "
+            f"(rc={proc.returncode}): {proc.stderr.strip()[-400:]}"
+        )
 
-    guardian = guardian_manager.ModelManager(config_path=str(cfg))
+    guardian_out = json.loads(proc.stdout.strip().splitlines()[-1])
 
-    for model in ("full", "minimal"):
+    for model in ("full-model", "minimal"):
         caretaker_args, caretaker_env = caretaker._build_args_string(
             caretaker.build_runtime_config(model)
         )
-        guardian_args, guardian_env = guardian._build_args_string(
-            guardian.build_runtime_config(model)
+        guardian_args, guardian_env = guardian_out[model]["args"], guardian_out[model]["env"]
+        assert caretaker_args == guardian_args, (
+            f"args mismatch for {model}:\nCaretaker: {caretaker_args}\nGuardian:  {guardian_args}"
         )
-        assert caretaker_args == guardian_args, f"args mismatch for {model}"
         assert caretaker_env == guardian_env, f"env mismatch for {model}"
 
 
@@ -344,3 +448,63 @@ def test_config_comfyui_url_from_env_overrides_yaml(tmp_path: Path) -> None:
         assert config_mod.comfyui_url(cfg) == "http://env:9000"
     finally:
         os.environ.pop("CARETAKER_COMFYUI_URL", None)
+
+# --------------------------------------------------------------------------
+# 5. Review-fix regressions (PR #3 review findings)
+# --------------------------------------------------------------------------
+
+
+def test_switch_model_failure_clears_active_state(tmp_path):
+    """Review fix 1: after a failed switch, current_model/vision are cleared so
+    a later same-model ensure actually restarts (no stale 'already active')."""
+    import asyncio
+
+    fake = FakeServerProcess(health_ok=False)
+    mgr = _make_manager(tmp_path, process=fake, health_polls=4, health_interval=0.01)
+    mgr.current_model = "minimal"
+    mgr.current_vision_enabled = False
+
+    with pytest.raises(ModelLoadError):
+        asyncio.run(mgr.switch_model("minimal"))
+
+    assert mgr.current_model is None
+    assert mgr.current_vision_enabled is False
+
+
+def test_direct_process_start_uses_devnull(tmp_path, monkeypatch):
+    """Review fix 2: DirectServerProcess must not hold unread PIPE buffers
+    (child would block once the pipe fills); output goes to DEVNULL."""
+    from caretaker.manager import DirectServerProcess
+
+    # Patch the args file path to a nonexistent one: start() reads it before
+    # spawning, so a missing file raises FileNotFoundError without spawning.
+    monkeypatch.setattr(
+        "caretaker.manager.CURRENT_MODEL_ARGS_FILE",
+        tmp_path / "nope" / "current_model.args",
+    )
+    import asyncio
+
+    proc = DirectServerProcess(binary="/bin/true")
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(proc.start())
+
+
+def test_build_args_string_uses_injected_server_url(tmp_path, monkeypatch):
+    """Review fix 3: _build_args_string honors the constructor-injected
+    server_url (self.server_url) instead of re-reading the env at call time.
+    The injected URL wins even when a different env var is set."""
+    cfg_yaml = _write_models_yaml(
+        tmp_path, {"minimal": {"path": "/home/flip/models/minimal.gguf"}}
+    )
+    monkeypatch.setenv("CARETAKER_SERVER_URL", "http://env-host:9999")
+
+    from caretaker.manager import Caretaker
+
+    mgr_inj = Caretaker(
+        config_path=str(cfg_yaml), server_url="http://inj-host:11441"
+    )
+    cfg = mgr_inj.build_runtime_config("minimal", enable_vision=False)
+    args_inj, _ = mgr_inj._build_args_string(cfg)
+    # The injected URL must appear in the args, NOT the env var.
+    assert "--host inj-host --port 11441" in args_inj
+    assert "--host env-host" not in args_inj
