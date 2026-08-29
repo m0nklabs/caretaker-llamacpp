@@ -685,20 +685,39 @@ class Caretaker:
         *,
         enable_vision: bool | None,
         context_hint: int | None = None,
+        config_vision: bool | None = None,
     ) -> dict | None:
         """Compute the launch signature for a model+vision-mode from current models.yaml.
 
         Returns None if the model is unknown. Uses build_runtime_config (so
-        vision/text overrides and the client context hint resolve correctly)."""
+        vision/text overrides and the client context hint resolve correctly).
+
+        ``config_vision`` (internal): force the vision flag to the model's
+        config *default* without the loaded-runtime shortcut — pass
+        ``False``/``True`` when the caller wants drift against the config
+        default (health/needs_reload), not the currently loaded mode."""
         if model_name not in self.models:
             return None
+        # config_vision=True → the model's config *default* vision (mmproj
+        # present), independent of the loaded runtime mode: pass enable_vision
+        # through (None → default) but force vision from config; for the args
+        # builder use None when no mmproj (no vision) or None with the forced
+        # True only when mmproj exists.
+        if config_vision is True:
+            vision = bool(self._resolve_vision_mmproj(self.models.get(model_name, {})))
+        elif config_vision is False:
+            vision = False
+        else:
+            vision = bool(self._resolve_runtime_vision_flag(model_name, enable_vision))
         runtime_config = self.build_runtime_config(
-            model_name, enable_vision=enable_vision, context_hint=context_hint
+            model_name,
+            enable_vision=None if config_vision is None else (True if vision else None),
+            context_hint=context_hint,
         )
         args_str, env_dict = self._build_args_string(runtime_config)
         return {
             "model": model_name,
-            "vision": bool(self._resolve_runtime_vision_flag(model_name, enable_vision)),
+            "vision": vision,
             "args_sha256": hashlib.sha256(args_str.encode("utf-8")).hexdigest(),
             "env_sha256": hashlib.sha256(json.dumps(env_dict, sort_keys=True).encode("utf-8")).hexdigest(),
         }
@@ -723,6 +742,7 @@ class Caretaker:
         *,
         enable_vision: bool | None,
         context_hint: int | None = None,
+        config_vision: bool | None = None,
     ) -> bool:
         """True if the model must be reloaded to apply current models.yaml settings.
 
@@ -733,11 +753,42 @@ class Caretaker:
         if not persisted:
             return True
         current = self._compute_launch_signature(
-            model_name, enable_vision=enable_vision, context_hint=context_hint
+            model_name,
+            enable_vision=enable_vision,
+            context_hint=context_hint,
+            config_vision=config_vision,
         )
         if not current:
             return True
         return persisted != current
+
+    def check_drift(
+        self,
+        model_name: str,
+        *,
+        enable_vision: bool | None = None,
+        context_hint: int | None = None,
+    ) -> bool:
+        """Report whether ``model_name`` must be reloaded to apply current config.
+
+        Pure reporting wrapper around :meth:`_config_drifted` (no side-effects):
+        ``True`` when the persisted launch signature is missing, or the model /
+        vision / args / env (incl. the client ``context_hint``) no longer match
+        the current config; ``False`` when identical. ``enable_vision`` semantics
+        match :meth:`switch_model` (None resolves the running/default mode).
+
+        Raises :class:`ValueError` when ``model_name`` is not configured, the
+        same contract as :meth:`switch_model`.
+        """
+        if model_name not in self.models:
+            raise ValueError(f"Model {model_name} not found in configuration")
+        return self._config_drifted(
+            model_name, enable_vision=enable_vision, context_hint=context_hint
+        )
+
+    def _config_vision_default(self, model_name: str) -> bool:
+        """The model's configured vision default (mmproj present → True)."""
+        return bool(self._resolve_vision_mmproj(self.models.get(model_name, {})))
 
     # ------------------------------------------------------------ health/crash
     async def _wait_for_health(self, model_name: str = "") -> bool:
@@ -1000,12 +1051,31 @@ class Caretaker:
         """Reload ``model`` (Phase A+B: idempotent, drift-aware swap)."""
         await self.switch_model(model)
 
-    async def health(self) -> dict[str, object]:
-        """Return a status dict consumed by ``GET /status``."""
+    def health(self) -> dict[str, object]:
+        """Return a status dict consumed by ``GET /status``.
+
+        ``needs_reload`` is True when the backend cannot serve the current
+        config as-is and a ``/ensure`` would be needed first: always when
+        unloaded, and when the loaded model's launch signature is drifted
+        (see :meth:`check_drift`)."""
         if self.is_unloaded:
-            return {"loaded_model": None, "is_unloaded": True}
+            return {
+                "loaded_model": None,
+                "vision_enabled": False,
+                "is_unloaded": True,
+                "needs_reload": True,
+            }
         return {
             "loaded_model": self.current_model,
             "vision_enabled": self.current_vision_enabled,
-            "is_unloaded": self.is_unloaded,
+            "is_unloaded": False,
+            # Drift against the model's config *default* vision (config_vision
+            # forces it), NOT the loaded vision mode: folding in the loaded
+            # mode would hide a config change that adds/removes mmproj and the
+            # gateway would never issue the needed /ensure reload.
+            "needs_reload": self._config_drifted(
+                self.current_model, enable_vision=None, config_vision=True
+            )
+            if self.current_model is not None
+            else True,
         }

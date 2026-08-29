@@ -51,9 +51,13 @@ def test_auth_gate_non_ascii_configured_key_returns_503_not_500(
 def test_auth_gate_correct_key_reaches_route_501(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A correct bearer key passes the gate and reaches the 501 stub route."""
+    """A correct bearer key passes the gate and reaches the 501 stub route.
+
+    ``/unload`` is still a Phase C 501 stub (unlike ``/status`` and ``/ensure``,
+    which Phase B filled in), so it remains the route that proves the auth gate
+    lets a correct key through to a stub handler."""
     monkeypatch.setenv("CARETAKER_KEY", "super-secret")
-    resp = client.get("/status", headers={"Authorization": "Bearer super-secret"})
+    resp = client.post("/unload", headers={"Authorization": "Bearer super-secret"})
     assert resp.status_code == 501
 
 
