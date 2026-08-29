@@ -20,6 +20,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from .manager import Caretaker, ModelLoadError
+from .vram import VramLimitExceededError
 
 CARETAKER_KEY_ENV = "CARETAKER_KEY"
 
@@ -130,6 +131,18 @@ async def ensure(request: Request) -> dict:
             enable_vision=enable_vision,
             context_hint=context_hint,
         )
+    except VramLimitExceededError as exc:
+        # A model that alone exceeds the VRAM budget can never fit: the
+        # gateway must not retry blindly, so surface the persistent
+        # configuration problem explicitly (503, no crash record).
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": "vram_limit_exceeded",
+                "message": str(exc),
+                "crash_details": None,
+            },
+        )
     except ValueError as exc:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -155,9 +168,17 @@ async def ensure(request: Request) -> dict:
 
 
 @app.post("/unload", dependencies=[Depends(require_caretaker_key)])
-async def unload() -> None:
-    """Unload the current model (Phase C fills this in)."""
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="not implemented",
-    )
+async def unload() -> dict:
+    """Unload the current model: stop llama-server and free VRAM (idempotent).
+
+    ``unload()`` is guarded against double-unload, so a second ``/unload`` is a
+    no-op 200 — the gateway may call it freely when the queue is empty (Phase D).
+    """
+    try:
+        await _manager().unload()
+    except Exception as exc:  # noqa: BLE001 - best-effort surface; idempotent
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": "unload_failed", "message": str(exc)},
+        )
+    return {"ok": True, "is_unloaded": True}
