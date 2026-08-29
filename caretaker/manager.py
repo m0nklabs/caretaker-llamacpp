@@ -21,6 +21,7 @@ import os
 import shlex
 import signal
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -419,6 +420,11 @@ class Caretaker:
         self.current_model: str | None = None
         self.current_vision_enabled: bool = False
         self.is_unloaded: bool = False
+        # Unix-epoch of the last successful model load (None when unloaded /
+        # never loaded). The caretaker sees no request traffic, so this is a
+        # load-age proxy: the gateway's own ``last_request_time`` is the
+        # authoritative idle signal (Phase D contract — decision in gateway).
+        self._loaded_at: float | None = None
         self.crash_history: list[CrashRecord] = []
         self.last_crash: CrashRecord | None = None
 
@@ -1093,6 +1099,7 @@ class Caretaker:
             self.current_model = model_name
             self.current_vision_enabled = desired_vision
             self.is_unloaded = False
+            self._loaded_at = time.time()
             # Persist the launch signature so future same-model requests can
             # detect config drift and reload instead of skipping.
             launch_sig = self._compute_launch_signature(
@@ -1156,6 +1163,7 @@ class Caretaker:
             self.is_unloaded = True
             self.current_model = None
             self.current_vision_enabled = False
+            self._loaded_at = None
             # Release the VRAM slot held by the just-stopped model (skip when
             # there was no active model, e.g. none was ever loaded).
             if self.vram is not None and previous_model is not None:
@@ -1186,6 +1194,7 @@ class Caretaker:
             self.current_model = None
             self.current_vision_enabled = False
             self.is_unloaded = True
+            self._loaded_at = None
         finally:
             self._switch_in_progress = False
 
@@ -1206,11 +1215,18 @@ class Caretaker:
                 "vision_enabled": False,
                 "is_unloaded": True,
                 "needs_reload": True,
+                "loaded_at": None,
+                "idle_since": None,
             }
         return {
             "loaded_model": self.current_model,
             "vision_enabled": self.current_vision_enabled,
             "is_unloaded": False,
+            # load-age proxy: the caretaker sees no request traffic; the
+            # gateway combines ``idle_since`` with its own ``last_request_time``
+            # to decide when it is safe to call ``POST /unload`` (Phase D).
+            "loaded_at": self._loaded_at,
+            "idle_since": self._loaded_at,
             # Drift against the model's config *default* vision (config_vision
             # forces it), NOT the loaded vision mode: folding in the loaded
             # mode would hide a config change that adds/removes mmproj and the
