@@ -2,7 +2,7 @@
 
 > Canonical AI-agent context voor dit repo. **Eerst lezen.**
 > Claude Code: `CLAUDE.md` → hier. Goose: `.goosehints` → hier.
-> Status: **bootstrap gebouwd (2026-08-28); fases A–E open — zie `./PLAN.md`.**
+> Status: **Phase A + B + C GEMERGED (2026-08-29); fases D–E + gateway-wiring open — zie `./PLAN.md`.**
 
 ## Wat is dit project
 
@@ -76,11 +76,11 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   - **Bind host/port configureerbaar:** `CARETAKER_HOST`/`CARETAKER_PORT`,
     default loopback `127.0.0.1:11441` (test-pinned; remote-gateway F6 zet
     LAN-interface).
-- **Fases A–E (PLAN.md §2–§6):** **Phase A + B GEMERGED — zie hieronder**; C = watchdog + VRAM, D = idle-unload-contract, E = multi-host/Windows staan nog open. De lifecycle-kern
+- **Fases A–E (PLAN.md §2–§6):** **Phase A + B + C GEMERGED — zie hieronder**; D = idle-unload-contract, E = multi-host/Windows staan nog open. De lifecycle-kern
   (~1050 regels) verhuist uit
   `guardian-llmprovider-gateway/app/engine/manager.py`:
   A = lifecycle core (spawn/stop/reload + args-bouw byte-identiek), B = drift,
-  C = watchdog + VRAM, D = idle-unload-contract, E = multi-host/Windows.
+  C = watchdog + VRAM ✅, D = idle-unload-contract, E = multi-host/Windows.
 - **Phase B (drift-contract) GEMERGED (2026-08-29, PR #4 → main, squash-commit `d0bc1d7`):**
   `POST /ensure` is de correcte idempotente repair-primitive (drift her-detecteren →
   reload; niet gedrift → no-op) en `GET /status` rapporteert `needs_reload` voor
@@ -100,6 +100,37 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   (b) `bool` is een `int`-subklasse → `context_hint: true` glipte door validatie; nu
   expliciet afgewezen (422). Beide gepind door regressietests. **54 tests totaal, ruff
   clean.**
+- **Phase C (watchdog + VRAM-slot + /unload) GEMERGED (2026-08-29, PR #5 → main, squash-commit `747d8fb`):**
+  - **`caretaker/vram.py` (nieuw):** `VramScheduler` (guardian-port uit
+    `app/local_inference/models.py`) + `get_model_size_mb` (config `size_mb` > naam-heuristics
+    > 0). De scheduler houdt `active_sizes` bij **per acquire** (niet herberekend uit de naam —
+    een geconfigureerde `size_mb` zou anders als 0 tellen en de budget-check liegen).
+    Acquire blokkeert op `asyncio.Condition` tot de som van actieve sizes + nieuwe ≤ limit;
+    `release` notificeert. `VramLimitExceededError(ValueError)`: een model dat alleen al
+    > budget is faalt nu fast-forward i.p.v. eeuwig te wachten.
+  - **watchdog:** `start_watchdog()/stop_watchdog()` (idempotent, **niet auto-startend** —
+    de F5-deploy-wiring start hem expliciet), `_watchdog_tick` (testbare kern: health-probe →
+    crash-record → restart met backoff; verdubbelt op `ModelLoadError` tot `max_backoff`),
+    `_watchdog_loop` (achtergrondtaak). `_switch_in_progress`-race-guard tegen concurrent
+    loads. `_watchdog_retry_model`: na een mislukte force-restart (switch_model wist
+    current_model) blijft de tick hetzelfde model herstarten met backoff.
+  - **`switch_model(force=True)`:** skipt de no-op-fast-path — de watchdog moet een dode
+    backend kunnen herstarten óók bij zelfde model + geen drift.
+  - **VRAM-slot in switch_model:** `vram_limit_mb` (config-veld `vram_limit_mb` in
+    models.yaml root of constructor) + `check_vram`-kill-switch. Een swap A→B released A's
+    slot **vóór** acquire(B) (anders deadlock: ruimte die alleen de geblokkeerde switch zelf
+    kon vrijgeven); same-model reload/restart behoudt het slot (no double-acquire); de
+    except-tak herstelt A's slot bij een mislukte swap vóór de stop (slot-leak) óf released
+    model_name ná de stop. `_switch_in_progress` + `build_runtime_config` leven **in** de try,
+    zodat een raise daar de flag altijd cleart (stuck-flag → watchdog permanent uit).
+  - **`POST /unload`** → `manager.unload()` (idempotent): 200 `{ok, is_unloaded}`, 500
+    `unload_failed`; alle routes live sinds C (geen 501-stub meer — bootstrap auth-test
+    bewijst de gate nu via dummy-manager-injectie). `/ensure` kent nu ánders:
+    503 `vram_limit_exceeded` (geen crash_record) vóór 404 `model_not_found` — let op de
+    **except-volgorde** (subclass vóór base).
+  - **Review rondes: ronde-1 3 terecht (deadlock, acquire-fail-fast, one-shot-retry) +
+    ronde-2 2 terecht (slot-leak, stuck-flag) — alle 5 in 2 fix-commits (`4dee835`,
+    `2b8adea`) met regressietests. 76 tests totaal, ruff clean.**
 - **Plan-only. Niks gebouwd, repo leeg** = VERLEDEN — zie boven.
 
 ### Phase A (lifecycle core) — status
@@ -285,8 +316,9 @@ caretaker/
   config.py         load_models_config(config_path?) → ModelsConfig (models/aliases)
                     + comfyui_url() (services.comfyui_url / CARETAKER_COMFYUI_URL)
   paths.py          Deployment-literals (env-override) + call-time llama_slots_dir()/server_url()
-  manager.py        `Caretaker` (Phase A lifecycle core) + ServerProcess-interface
+  manager.py        `Caretaker` (lifecycle core + watchdog + VRAM-slot) + ServerProcess-interface
                     (SystemdServerProcess / DirectServerProcess), CrashRecord, ModelLoadError
+  vram.py           VramScheduler (guardian-port) + get_model_size_mb + VramLimitExceededError
   server.py         FastAPI: GET /status, POST /ensure, POST /unload (+ auth-gate)
 deploy/systemd/
   caretaker-llamacpp.service   Linux-sjabloon (EnvironmentFile=/etc/caretaker/caretaker.env)
@@ -295,6 +327,9 @@ tests/
                     routes, entrypoint bind-contract
   test_phase_a.py   11 tests: args-goldens (+ guardian cross-check), fake-ServerProcess
                     switch_model / unload, comfyui_url-resolution
+  test_phase_c.py   22 tests: VramScheduler (acquire/release/blokkade/size), switch+VRAM
+                    integratie (swap-deadlock, same-model, fail-fast, slot-leak, stuck-flag),
+                    watchdog (tick healthy/crash/backoff/retry/loop), /unload + /ensure-503-API
 .github/workflows/
   pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
   python-ci.yml     Org-reusable python-ci (python 3.12, src caretaker)
