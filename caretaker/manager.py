@@ -1009,11 +1009,14 @@ class Caretaker:
             # The no-op is only truthful when the backend actually lives: a
             # crash between watchdog ticks (or a KillMode=control-group stop)
             # can leave ``current_model`` set with a dead llama-server.
-            # Reporting "already active" then would lie to the gateway
+            # Report "already active" then would lie to the gateway
             # (``ok: true, fresh_load: false`` on a dead backend) — refuse the
             # no-op and fall through to the real (re)load path so the ensure
-            # heals the backend instead.
-            if await self.server_process.health_ok():
+            # heals the backend instead.  Uses ``self.server_url`` (call-time
+            # resolved, same as _wait_for_health and the watchdog tick) — NOT
+            # the import-time SERVER_URL default — so the gate probes the same
+            # endpoint the rest of the flow probes.
+            if await self.server_process.health_ok(self.server_url):
                 self.is_unloaded = False  # a live server is active; not unloaded
                 logger.info(f"Model {model_name} is already active")
                 return False
