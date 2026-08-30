@@ -20,6 +20,7 @@ Platform notes:
 from __future__ import annotations
 
 import asyncio
+import logging
 import shlex
 import subprocess
 import sys
@@ -27,6 +28,8 @@ from pathlib import Path
 
 from .manager import ServerProcess
 from .paths import CURRENT_MODEL_ARGS_FILE, LLAMA_SERVER_BIN
+
+logger = logging.getLogger("caretaker.windows_process")
 
 
 def _split_args_windows(args_text: str) -> list[str]:
@@ -80,6 +83,16 @@ class WindowsDirectServerProcess(ServerProcess):
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 await killer.wait()
+                if killer.returncode != 0:
+                    # taskkill also exits non-zero when the process is already
+                    # gone — this warning keeps that apart from a real
+                    # "access denied / tree still alive" failure.
+                    logger.warning(
+                        "taskkill /PID %s /T /F exited %s — llama-server tree "
+                        "may still be running",
+                        proc.pid,
+                        killer.returncode,
+                    )
                 # taskkill only initiates termination (TerminateProcess is
                 # asynchronous per MSDN); wait (bounded) for the tree to
                 # actually exit so a follow-up start() can re-bind the port
@@ -87,7 +100,11 @@ class WindowsDirectServerProcess(ServerProcess):
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
                 except TimeoutError:
-                    pass
+                    logger.warning(
+                        "llama-server pid %s still alive 5s after taskkill — "
+                        "it may still hold its port/VRAM",
+                        proc.pid,
+                    )
             else:
                 # POSIX host (tests): plain terminate/kill — no killpg here.
                 try:

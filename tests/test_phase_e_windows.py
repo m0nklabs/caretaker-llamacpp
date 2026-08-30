@@ -9,6 +9,8 @@ mocked/scripted and the selection logic is pinned via monkeypatched
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
@@ -138,4 +140,35 @@ async def test_windows_stop_falls_back_to_terminate_on_posix(monkeypatch):
     await impl.stop()
     fake_proc.terminate.assert_called_once()
     assert exec_calls == [], "no taskkill on POSIX"
+    assert impl._proc is None
+
+
+async def test_windows_stop_logs_taskkill_failure(monkeypatch, caplog):
+    """A failed taskkill (non-zero exit) or a tree that survives the bounded
+    wait must not fail silently: the win32 branch logs a warning. The manager
+    clears its bookkeeping when stop() returns, so the service log is the
+    only trace of a tree that is still alive."""
+    impl = WindowsDirectServerProcess()
+    fake_proc = MagicMock(pid=4242, returncode=None)
+
+    async def _hang():
+        await asyncio.sleep(30)
+
+    # The tree survives the bounded wait → wait_for raises TimeoutError.
+    fake_proc.wait = _hang
+    impl._proc = fake_proc
+
+    killer = MagicMock(returncode=1)
+    killer.wait = AsyncMock(return_value=1)
+
+    async def _fake_exec(*argv, **kwargs):
+        return killer
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    with caplog.at_level(logging.WARNING):
+        await impl.stop()
+    assert "taskkill /PID 4242 /T /F exited 1" in caplog.text
+    assert "still alive 5s after taskkill" in caplog.text
     assert impl._proc is None
