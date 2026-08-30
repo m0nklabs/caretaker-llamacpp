@@ -56,7 +56,7 @@ class WindowsDirectServerProcess(ServerProcess):
         args_text = Path(CURRENT_MODEL_ARGS_FILE).read_text(encoding="utf-8").strip()
         argv = [self.binary, *_split_args_windows(args_text)]
         creationflags = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x400)
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
             if sys.platform == "win32"
             else 0
         )

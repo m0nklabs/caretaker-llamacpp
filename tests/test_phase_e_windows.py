@@ -81,9 +81,10 @@ async def test_windows_start_spawns_with_process_group(monkeypatch, tmp_path):
     await impl.start()
     assert captured["argv"][:2] == ("llama-server.exe", "-m")
     assert "C:\\models\\qwen3.gguf" in captured["argv"]
-    # Windows CREATE_NEW_PROCESS_GROUP (0x400); the constant itself only
-    # exists on Windows, so the literal is pinned here.
-    assert captured["creationflags"] == 0x400
+    # Windows CREATE_NEW_PROCESS_GROUP (0x200); the constant itself only
+    # exists on Windows, so the literal is pinned here (0x400 would be
+    # CREATE_UNICODE_ENVIRONMENT).
+    assert captured["creationflags"] == 0x200
     assert impl._proc is fake_proc
 
 
