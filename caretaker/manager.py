@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import shlex
 import signal
 import subprocess
@@ -328,9 +329,16 @@ class DirectServerProcess(ServerProcess):
 def _default_server_process() -> ServerProcess:
     """Return the default ServerProcess on this platform.
 
-    systemd is the default on Linux (production). ``DirectServerProcess`` is
-    the NSSM/Windows predecessor and also serves as a fallback.
+    systemd is the default on Linux (production). Windows (F6, Phase E) gets
+    :class:`WindowsDirectServerProcess` (spawns llama-server.exe directly,
+    tree-killed via taskkill — no killpg/systemd there).
+    ``DirectServerProcess`` remains the non-systemd Linux fallback and the
+    test double.
     """
+    if sys.platform == "win32":
+        from .windows_process import WindowsDirectServerProcess
+
+        return WindowsDirectServerProcess()
     return SystemdServerProcess()
 
 
