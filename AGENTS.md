@@ -156,11 +156,18 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   gateway tegen deze daemon praat, activeert zijn `supports_fresh_load`-gate
   (re-gevalideerd op elke 200) automatisch de context-restore, en de
   daemon-confirmed `vision_enabled` wint boven de lokale mmproj-probe.
+  **Review-les (1 terecht):** de no-op fast-path liep "already active" terug
+  zonder de backend-health te checken — een crash tussen watchdog-ticks kan
+  `current_model` gezet achterlaten met een DODE llama-server, en /ensure zou
+  dan liegen (`ok: true, fresh_load: false` op een dode backend). Fix: de
+  no-op-gate eist nu een geslaagde `server_process.health_ok()`; bij een dode
+  backend wordt de no-op geweigerd en herlaadt de ensure de backend (healing,
+  fresh_load=True). Gepind door `test_switch_model_noop_refused_when_backend_dead`.
   **Gepind:** `test_switch_model_returns_fresh_load_semantics` (no-op False,
   cold load True, reload-na-unload True) + 
   `test_ensure_response_carries_fresh_load_and_vision_contract` (API-level:
   ensure → fresh_load True → herhaald ensure → False → unload→ensure → True).
-  **83 tests totaal, ruff clean.**
+  **84 tests totaal, ruff clean.**
 - **Plan-only. Niks gebouwd, repo leeg** = VERLEDEN — zie boven.
 
 ### Phase A (lifecycle core) — status

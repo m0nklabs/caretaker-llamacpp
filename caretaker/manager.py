@@ -1006,9 +1006,21 @@ class Caretaker:
             and desired_vision == self.current_vision_enabled
             and not drifted
         ):
-            self.is_unloaded = False  # a live server is active; not unloaded
-            logger.info(f"Model {model_name} is already active")
-            return False
+            # The no-op is only truthful when the backend actually lives: a
+            # crash between watchdog ticks (or a KillMode=control-group stop)
+            # can leave ``current_model`` set with a dead llama-server.
+            # Reporting "already active" then would lie to the gateway
+            # (``ok: true, fresh_load: false`` on a dead backend) — refuse the
+            # no-op and fall through to the real (re)load path so the ensure
+            # heals the backend instead.
+            if await self.server_process.health_ok():
+                self.is_unloaded = False  # a live server is active; not unloaded
+                logger.info(f"Model {model_name} is already active")
+                return False
+            logger.warning(
+                f"Model {model_name} is marked active but the backend does not "
+                "answer health — reloading to heal (no-op refused)"
+            )
         if drifted:
             logger.info(
                 f"🔄 Config drift detected for '{model_name}' "
