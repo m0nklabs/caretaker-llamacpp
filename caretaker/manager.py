@@ -978,7 +978,7 @@ class Caretaker:
         enable_vision: bool | None = None,
         context_hint: int | None = None,
         force: bool = False,
-    ) -> None:
+    ) -> bool:
         """Swap the running llama-server to ``model_name``.
 
         The gateway keeps registry/choice/pinning/switch-allowlist; here we only
@@ -986,6 +986,14 @@ class Caretaker:
         drifted, else auto-save context → stop → write args → free GPU memory →
         start → wait for health (crash-aware) → persist signature → verify →
         restore context.
+
+        Returns ``fresh_load``: ``True`` when this call actually (re)started
+        llama-server (the backend is fresh — any prior in-memory session state
+        is gone and the gateway may restore the saved context), ``False`` when
+        the request was a no-op fast-path (the live session is authoritative —
+        nothing was restarted, so restoring a saved context would clobber the
+        live one).  Raises on failure; the caller never receives a stale
+        backend on an exception path.
         """
         if model_name not in self.models:
             raise ValueError(f"Model {model_name} not found in configuration")
@@ -998,9 +1006,24 @@ class Caretaker:
             and desired_vision == self.current_vision_enabled
             and not drifted
         ):
-            self.is_unloaded = False  # a live server is active; not unloaded
-            logger.info(f"Model {model_name} is already active")
-            return
+            # The no-op is only truthful when the backend actually lives: a
+            # crash between watchdog ticks (or a KillMode=control-group stop)
+            # can leave ``current_model`` set with a dead llama-server.
+            # Report "already active" then would lie to the gateway
+            # (``ok: true, fresh_load: false`` on a dead backend) — refuse the
+            # no-op and fall through to the real (re)load path so the ensure
+            # heals the backend instead.  Uses ``self.server_url`` (call-time
+            # resolved, same as _wait_for_health and the watchdog tick) — NOT
+            # the import-time SERVER_URL default — so the gate probes the same
+            # endpoint the rest of the flow probes.
+            if await self.server_process.health_ok(self.server_url):
+                self.is_unloaded = False  # a live server is active; not unloaded
+                logger.info(f"Model {model_name} is already active")
+                return False
+            logger.warning(
+                f"Model {model_name} is marked active but the backend does not "
+                "answer health — reloading to heal (no-op refused)"
+            )
         if drifted:
             logger.info(
                 f"🔄 Config drift detected for '{model_name}' "
@@ -1145,6 +1168,11 @@ class Caretaker:
             raise
         finally:
             self._switch_in_progress = False
+
+        # Only reached on the successful (re)load path: the backend was freshly
+        # started, so in-memory session state is gone and the gateway may
+        # restore the target model's saved context.
+        return True
 
     def reset_vision_validation(self, model_name: str) -> None:
         """Reset caretaker-local vision-validation bookkeeping after a load/switch."""

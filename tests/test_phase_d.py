@@ -146,6 +146,50 @@ def test_ensure_recovers_after_unload_api(
     assert proc.events.count("start") >= 2, "unload→ensure must actually restart"
 
 
+def test_ensure_response_carries_fresh_load_and_vision_contract(
+    tmp_path: Path, isolated_paths: None, injection_reset, monkeypatch
+) -> None:
+    """The gateway's remote-first hotpath (guardian PR #12, caretaker_runtime)
+    consumes three contract fields from the /ensure response:
+
+    - ``fresh_load``: True when this call actually (re)started llama-server
+      (the gateway may restore the saved context), False on the no-op
+      fast-path (the live session is authoritative — restoring would clobber
+      the live one).
+    - ``vision_enabled``: the daemon's own resolution of the flag the loaded
+      process runs with — authoritative over any gateway-side probe.
+    - ``loaded_model``: what the daemon actually loaded.
+    """
+    monkeypatch.setenv("CARETAKER_KEY", "test-secret")
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc)
+    init(mgr)
+    client = TestClient(app)
+
+    # 1. First ensure: a real (cold) load -> fresh_load True.
+    r = client.post("/ensure", json={"model": "minimal"}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["loaded_model"] == "minimal"
+    assert body["fresh_load"] is True
+    assert body["vision_enabled"] is False  # fixture model is text-only
+
+    # 2. Immediate repeat: no-op fast-path -> fresh_load False, vision unchanged.
+    r2 = client.post("/ensure", json={"model": "minimal"}, headers=AUTH)
+    assert r2.status_code == 200, r2.text
+    body2 = r2.json()
+    assert body2["fresh_load"] is False
+    assert body2["vision_enabled"] is False
+
+    # 3. Unload → ensure: a real reload again -> fresh_load True.
+    client.post("/unload", headers=AUTH)
+    r3 = client.post("/ensure", json={"model": "minimal"}, headers=AUTH)
+    assert r3.status_code == 200, r3.text
+    assert r3.json()["fresh_load"] is True
+    assert r3.json()["loaded_model"] == "minimal"
+
+
 def test_unload_ensure_unload_cycles_keep_vram_truthful(
     tmp_path: Path, isolated_paths: None
 ) -> None:

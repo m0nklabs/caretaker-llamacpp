@@ -206,6 +206,51 @@ async def test_switch_model_noop_does_not_double_acquire(
     assert mgr.vram.active_counts.get("minimal", 0) == 1, "no double acquire"
 
 
+async def test_switch_model_returns_fresh_load_semantics(
+    tmp_path: Path, isolated_paths: None
+) -> None:
+    """``switch_model`` returns ``fresh_load`` — the gateway's context-restore
+    gate (guardian PR #12 contract): True when this call actually (re)started
+    llama-server (in-memory session state is gone), False when the no-op
+    fast-path ran (the live session is authoritative — nothing restarted)."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc)
+    assert await mgr.switch_model("minimal") is True, "cold load = fresh"
+    assert await mgr.switch_model("minimal") is False, "no-op fast-path = not fresh"
+    await mgr.unload()
+    assert await mgr.switch_model("minimal") is True, "reload after unload = fresh"
+
+
+async def test_switch_model_noop_refused_when_backend_dead(
+    tmp_path: Path, isolated_paths: None
+) -> None:
+    """A crash between watchdog ticks can leave ``current_model`` set with a
+    dead llama-server: the no-op fast-path must then be refused so /ensure
+    heals the backend (fresh_load True), instead of lying "already active" on
+    a dead backend."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc)
+    await mgr.switch_model("minimal")
+    assert mgr.current_model == "minimal"
+
+    # The backend dies between watchdog ticks: the FIRST health check (the
+    # no-op gate) must see a dead backend; the real (re)load then brings it
+    # back up (later checks healthy).
+    gate = {"seen": 0}
+    orig_health_ok = proc.health_ok
+
+    async def dead_first_check(url: str = "") -> bool:
+        gate["seen"] += 1
+        if gate["seen"] == 1:
+            return False  # crashed backend
+        return await orig_health_ok(url)
+
+    proc.health_ok = dead_first_check  # type: ignore[method-assign]
+    assert await mgr.switch_model("minimal") is True, "healing reload = fresh"
+    assert proc.events.count("stop") >= 2, "the dead server was restarted"
+    assert mgr.current_model == "minimal"
+
+
 async def test_switch_model_swap_fail_restores_old_slot(
     tmp_path: Path, isolated_paths: None
 ) -> None:
