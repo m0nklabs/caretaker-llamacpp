@@ -239,6 +239,13 @@ Windo ws-side ops; gateway entry is **config-only → hot-reload**.
     ```
 - Gateway calls `POST /ensure {model}` before forwarding (when model not already loaded),
   then `POST /v1/chat/completions` on llama-server. `GET /status` feeds discovery.
+- **Ensure-response contract (2026-08-30, verrijkt):** the 200 response now carries
+  `loaded_model` (what the daemon actually loaded), `fresh_load` (True = this call
+  actually (re)started llama-server — in-memory session state is gone and the gateway
+  may restore the saved context; False = the no-op fast-path ran, the live session is
+  authoritative) and `vision_enabled` (the daemon's own resolution of the flag the
+  loaded process runs with — authoritative over any gateway-side probe). This lets the
+  gateway drop its heuristic probes in favour of daemon-confirmed facts.
 - **Gateway restart does NOT drop the loaded model** (lifecycle lives outside the gateway).
 - **Manager/caretaker restart → gateway recovers via `/ensure`** (Phase C/D recovery).
 - Old direct lifecycle code is removed from the gateway; `engine/manager.py` (lifecycle

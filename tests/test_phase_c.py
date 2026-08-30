@@ -206,6 +206,21 @@ async def test_switch_model_noop_does_not_double_acquire(
     assert mgr.vram.active_counts.get("minimal", 0) == 1, "no double acquire"
 
 
+async def test_switch_model_returns_fresh_load_semantics(
+    tmp_path: Path, isolated_paths: None
+) -> None:
+    """``switch_model`` returns ``fresh_load`` — the gateway's context-restore
+    gate (guardian PR #12 contract): True when this call actually (re)started
+    llama-server (in-memory session state is gone), False when the no-op
+    fast-path ran (the live session is authoritative — nothing restarted)."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc)
+    assert await mgr.switch_model("minimal") is True, "cold load = fresh"
+    assert await mgr.switch_model("minimal") is False, "no-op fast-path = not fresh"
+    await mgr.unload()
+    assert await mgr.switch_model("minimal") is True, "reload after unload = fresh"
+
+
 async def test_switch_model_swap_fail_restores_old_slot(
     tmp_path: Path, isolated_paths: None
 ) -> None:

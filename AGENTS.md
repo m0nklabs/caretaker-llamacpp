@@ -143,6 +143,24 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
     slot-leak, geen spurious crashes). Test `test_ensure_recovers_after_unload_api` pinnt
     de restart-assert (start-count ≥ 2, ensure is een echte reload, geen no-op).
   - **81 tests totaal, ruff clean.**
+- **Ensure-response-contract verrijkt (2026-08-30, PR — gateway `caretaker_runtime`-tranche 2 is gemerged, guardian PR #12 → squash `1402b10`):**
+  de gateway's remote-first hotpath consumeert nu drie daemon-geautoriseerde
+  velden uit het `/ensure`-ANTWOORD i.p.v. gateway-side heuristiek (probes,
+  flag-detectie): `switch_model` retourneert een bool `fresh_load` (True =
+  echte (re)load — de backend is vers gestart en in-memory sessie-state is
+  weg; False = no-op fast-path — de live sessie is authoritatief, restore
+  zou die overschrijven), en het 200-antwoord is nu
+  `{ok, loaded_model, fresh_load, vision_enabled, needs_reload}` waar
+  `vision_enabled` de daemon's eigen resolutie is van de flag waarmee het
+  geladen process draait (authoritatief boven gateway-probes). Zodra de
+  gateway tegen deze daemon praat, activeert zijn `supports_fresh_load`-gate
+  (re-gevalideerd op elke 200) automatisch de context-restore, en de
+  daemon-confirmed `vision_enabled` wint boven de lokale mmproj-probe.
+  **Gepind:** `test_switch_model_returns_fresh_load_semantics` (no-op False,
+  cold load True, reload-na-unload True) + 
+  `test_ensure_response_carries_fresh_load_and_vision_contract` (API-level:
+  ensure → fresh_load True → herhaald ensure → False → unload→ensure → True).
+  **83 tests totaal, ruff clean.**
 - **Plan-only. Niks gebouwd, repo leeg** = VERLEDEN — zie boven.
 
 ### Phase A (lifecycle core) — status
@@ -370,18 +388,6 @@ tests/
   `_build_args_string`, `_write_server_args`, `ServerProcess`-interface uit
   `engine/manager.py` naar `caretaker/manager.py`, byte-identiek qua
   start-args; zie PLAN.md §2).
-<<<<<<< Updated upstream
-- **2026-08-29: Phase A (lifecycle core) geïmplementeerd (branch
-  `phase-a-lifecycle`, niet gecommit — lead reviewt).** `caretaker/paths.py`
-  (deployment-literals + env-override), `caretaker/manager.py` (Caretaker +
-  ServerProcess-interface + CrashRecord/ModelLoadError overgezet uit guardian,
-  gedrag-neutraal), `caretaker/config.py` (config_path-injectie +
-  comfyui_url), `tests/test_phase_a.py` (11 tests). **23 tests groen (12
-  bootstrap + 11 phase A), ruff clean.** Apples-to-apples bewezen: caretaker
-  `_build_args_string` == guardian `_build_args_string` byte-gelijk op
-  dezelfde fixture (full + minimal). Volgende stap: **Phase B — drift via
-  `/ensure`** (manager-implementatie staat al; alleen route-wiring in server.py).
-=======
 - **2026-08-29: Phase A (lifecycle core) geïmplementeerd.** Commits `38fb627`
   (Phase A core) + `05c7e9c` (PR-#3 review-fixes) op branch `phase-a-lifecycle`.
   - **`caretaker/paths.py`** (nieuw): deployment-literals met env-override
@@ -433,7 +439,6 @@ tests/
   de default neemt — **bewust géén NoDeviate/ignore voor die** zolang de CI
   default-select draait; als de reviewer `--select ALL` wil, zijn er 289 issues
   (52 fixable, géén BLE) — dat is dan een aparte selectiebeslissing.
->>>>>>> Stashed changes
 
 ## References
 

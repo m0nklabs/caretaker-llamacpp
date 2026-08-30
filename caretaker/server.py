@@ -126,7 +126,7 @@ async def ensure(request: Request) -> dict:
         return _invalid_request("'context_hint' must be an integer or null")
 
     try:
-        await _manager().switch_model(
+        fresh_load = await _manager().switch_model(
             model,
             enable_vision=enable_vision,
             context_hint=context_hint,
@@ -163,6 +163,16 @@ async def ensure(request: Request) -> dict:
     return {
         "ok": True,
         "loaded_model": mgr.current_model,
+        # Gateway contract (read by app/gateway/caretaker_client.py +
+        # caretaker_runtime.py): fresh_load=True means this call actually
+        # (re)started llama-server — in-memory session state is gone, so the
+        # gateway may restore the saved context.  False means the no-op
+        # fast-path ran (the live session is authoritative — restoring a saved
+        # context would clobber it).  vision_enabled is the daemon's own
+        # resolution of the flag the loaded process runs with (mmproj present)
+        # — authoritative over any gateway-side probe.
+        "fresh_load": bool(fresh_load),
+        "vision_enabled": bool(mgr.current_vision_enabled),
         "needs_reload": False,
     }
 
