@@ -37,12 +37,14 @@ def _split_args_windows(args_text: str) -> list[str]:
 
     POSIX shlex would treat backslashes as escape characters (mangling
     ``C:\\models\\x.gguf``), so the non-POSIX shlexer keeps them verbatim;
-    the matching surrounding quotes it preserves per token are stripped here.
+    the surrounding quotes it preserves per token (double or single — the
+    POSIX impl strips both via posix semantics, so the Windows splitter
+    mirrors that for operator-quoted values) are stripped here.
     """
     tokens = shlex.split(args_text, posix=False)
     return [
         token[1:-1]
-        if len(token) > 1 and token[0] == token[-1] == '"'
+        if len(token) > 1 and token[0] == token[-1] and token[0] in "\"'"
         else token
         for token in tokens
     ]

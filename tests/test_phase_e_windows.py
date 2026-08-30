@@ -55,6 +55,16 @@ def test_split_args_windows_keeps_backslash_paths():
         "--host",
         "0.0.0.0",
     ]
+    # Single-quoted operator values are stripped too — the POSIX impl's
+    # posix-shlex semantics strip them, so the Windows splitter mirrors
+    # that instead of passing literal quotes into llama-server's argv.
+    single = "-m 'C:\\models\\qwen3 8b.gguf' -ngl 99"
+    assert _split_args_windows(single) == [
+        "-m",
+        "C:\\models\\qwen3 8b.gguf",
+        "-ngl",
+        "99",
+    ]
 
 
 async def test_windows_start_spawns_with_process_group(monkeypatch, tmp_path):
