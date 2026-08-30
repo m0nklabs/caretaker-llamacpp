@@ -80,6 +80,14 @@ class WindowsDirectServerProcess(ServerProcess):
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 await killer.wait()
+                # taskkill only initiates termination (TerminateProcess is
+                # asynchronous per MSDN); wait (bounded) for the tree to
+                # actually exit so a follow-up start() can re-bind the port
+                # without racing the dying llama-server.
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except TimeoutError:
+                    pass
             else:
                 # POSIX host (tests): plain terminate/kill — no killpg here.
                 try:

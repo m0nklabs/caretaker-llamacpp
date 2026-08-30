@@ -108,6 +108,10 @@ async def test_windows_stop_tree_kills_on_win32(monkeypatch):
 
     await impl.stop()
     assert captured["argv"] == ("taskkill", "/PID", "4242", "/T", "/F")
+    # taskkill only initiates termination (TerminateProcess is asynchronous
+    # per MSDN) — stop() must still wait (bounded) for the tree to actually
+    # exit so a follow-up start() can re-bind the port deterministically.
+    fake_proc.wait.assert_awaited_once()
     assert impl._proc is None
 
 
