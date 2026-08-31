@@ -1,0 +1,6 @@
+interface:
+  display_name: "Caretaker Llamacpp"
+  short_description: "Repo-specific patterns and workflows for caretaker-llamacpp"
+  default_prompt: "Use the caretaker-llamacpp repo skill to follow existing architecture, testing, and workflow conventions."
+policy:
+  allow_implicit_invocation: true
