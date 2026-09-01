@@ -334,3 +334,71 @@ def test_api_ensure_unknown_model_404_without_props_call(
     assert resp.status_code == 404, resp.text
     assert resp.json()["error"] == "model_not_found"
     assert mgr.props_calls == 0  # validation happens before any backend probing
+
+
+# ----------------------------------------------- (review r1) path normalization
+
+
+def test_verification_accepts_symlink_resolved_props_path(
+    tmp_path: Path, isolated_paths: None, injection_reset: None
+) -> None:
+    """A /props path that resolves to the same file must verify OK (no 503).
+
+    Regression pin for the PR-Piet review finding (2026-09-02, PR #9): llama-server
+    may echo the launched path in resolved form while the configured path is a
+    symlink/relative variant. Strict string equality would report a correctly
+    loaded model as model_mismatch and burn a pointless stop/start retry.
+    """
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc)
+    # Real model file + a symlink used as the CONFIGURED path.
+    real_file = tmp_path / "real-model.gguf"
+    real_file.write_bytes(b"gguf")
+    symlink = tmp_path / "link-to-model.gguf"
+    symlink.symlink_to(real_file)
+    mgr.models["minimal"]["path"] = str(symlink)
+    # Backend echoes the RESOLVED path (what llama-server would report).
+    _install_props(mgr, [{"model_path": str(real_file)}])
+    init(mgr)
+    with _client() as client:
+        resp = client.post("/ensure", json={"model": "minimal"}, headers=AUTH_HEADER)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True
+
+
+def test_verification_realpath_does_not_mask_true_mismatch(
+    tmp_path: Path, isolated_paths: None, injection_reset: None
+) -> None:
+    """A genuinely different file is still a model_mismatch after realpath."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc)
+    other_file = tmp_path / "other-model.gguf"
+    other_file.write_bytes(b"gguf")
+    _install_props(mgr, [{"model_path": str(other_file)}])
+    init(mgr)
+    with _client() as client:
+        resp = client.post("/ensure", json={"model": "minimal"}, headers=AUTH_HEADER)
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"] == "model_mismatch"
+
+
+def test_model_paths_diverge_helper_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Direct contract of the path-normalization helper."""
+    from caretaker.manager import Caretaker as _C
+
+    real = tmp_path / "m.gguf"
+    real.write_bytes(b"x")
+    link = tmp_path / "l.gguf"
+    link.symlink_to(real)
+    # Same file via symlink / relative segment / ~-form: NOT divergent.
+    assert _C._model_paths_diverge(str(real), str(link)) is False
+    assert _C._model_paths_diverge(str(tmp_path / "sub" / ".." / "m.gguf"), str(real)) is False
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _C._model_paths_diverge("~/m.gguf", str(real)) is False
+    # A different file IS divergent, in both string-equal-looking forms.
+    other = tmp_path / "other.gguf"
+    other.write_bytes(b"y")
+    assert _C._model_paths_diverge(str(other), str(real)) is True

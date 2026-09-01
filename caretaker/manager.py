@@ -1040,10 +1040,30 @@ class Caretaker:
                 message="backend /props did not expose a model path",
             )
         actual = str(actual)
-        if actual != expected:
+        if self._model_paths_diverge(actual, expected):
             raise ModelMismatchError(model_name, expected, actual)
         logger.info(f"✅ Backend model verified: {model_name} ({Path(actual).name})")
         return actual
+
+    @staticmethod
+    def _model_paths_diverge(actual: str, expected: str) -> bool:
+        """True when the /props model path and the configured path differ.
+
+        Compared on :func:`os.path.realpath` (after ``~``-expansion) rather
+        than strict string equality: llama-server may echo the launched path
+        in resolved form while the configured path uses a symlink, relative
+        segment or trailing-slash variant — the same file must verify OK,
+        otherwise a correctly loaded model is reported as model_mismatch and
+        /ensure burns a pointless stop/start retry before 503-ing. Only a
+        genuinely different file counts as a mismatch. Falls back to raw
+        string equality if the filesystem cannot resolve a path.
+        """
+        try:
+            actual_resolved = os.path.realpath(os.path.expanduser(actual))
+            expected_resolved = os.path.realpath(os.path.expanduser(expected))
+        except Exception:
+            return actual != expected
+        return actual_resolved != expected_resolved
 
     async def _retry_verified_start(
         self,
