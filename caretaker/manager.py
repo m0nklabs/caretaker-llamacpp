@@ -444,6 +444,13 @@ class Caretaker:
         self.config_path = Path(config_path) if config_path else config_mod.models_file_path()
         loaded = config_mod.load_models_config(self.config_path)
         self.models: dict[str, dict] = dict(loaded["models"])
+        # Alias map (alias → canonical model name) from the same host config.
+        # The gateway resolves aliases for gateway traffic (F4 contract), but
+        # /ensure is also called directly (operator curls, tooling) — resolving
+        # here makes every name from models.local.settings.yaml addressable.
+        # Double resolution is harmless: a canonical name is not an alias key,
+        # so it passes through unchanged.
+        self.aliases: dict[str, str] = dict(loaded.get("aliases", {}))
         self.server_process = server_process or _default_server_process()
         self.server_url = server_url
         self.health_polls = health_polls
@@ -1157,6 +1164,7 @@ class Caretaker:
         /ensure confirmed a model while llama-server still served the previous
         one).
         """
+        model_name = self.resolve_model_alias(model_name)
         if model_name not in self.models:
             raise ValueError(f"Model {model_name} not found in configuration")
 
@@ -1382,6 +1390,17 @@ class Caretaker:
                         )
                 else:
                     await self.vram.release(model_name)
+            if self.current_model is None:
+                # The new model is not running (failure after the stop, or a
+                # cold-start failure): nothing is loaded, so a stale
+                # _loaded_at from the PREVIOUS model must not survive —
+                # health() would report a phantom load-age while
+                # current_model is None (pre-existing oddity, fixed
+                # 2026-09-02).
+                self._loaded_at = None
+            # One-shot scope: a failure must not leave the skip-flag armed and
+            # silently suppress a legitimate auto-save on the NEXT switch.
+            self._skip_next_context_save = False
             raise
         finally:
             self._switch_in_progress = False
@@ -1390,6 +1409,25 @@ class Caretaker:
         # started, so in-memory session state is gone and the gateway may
         # restore the target model's saved context.
         return True
+
+    def resolve_model_alias(self, model_name: str) -> str:
+        """Resolve ``model_name`` through the host config's alias map.
+
+        Bounded walk (max 5 hops) so alias→alias chains resolve while a cycle
+        in the operator config cannot loop forever. Names not present in the
+        alias map pass through unchanged — the canonical membership check
+        downstream still rejects genuinely unknown models with the existing
+        404 ``model_not_found`` contract.
+        """
+        name = model_name
+        seen: set[str] = set()
+        for _ in range(5):
+            target = self.aliases.get(name)
+            if target is None or target in seen:
+                break
+            seen.add(name)
+            name = target
+        return name
 
     def reset_vision_validation(self, model_name: str) -> None:
         """Reset caretaker-local vision-validation bookkeeping after a load/switch."""
