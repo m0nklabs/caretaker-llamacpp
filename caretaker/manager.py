@@ -487,6 +487,15 @@ class Caretaker:
         # not race an in-flight lifecycle transition.
         self._switch_in_progress: bool = False
 
+        # Set when the no-op fast-path refuses because the backend serves a
+        # DIFFERENT model than the active-model bookkeeping claims (heal
+        # reload): the running backend's session then belongs to the wrong
+        # model, so the reload's context auto-save must NOT write it under the
+        # target model's auto_save_ filename (cross-model slot restore is
+        # refused by llama-server anyway, and a polluted file would be restored
+        # as "valid" slot state on a later load of the target model).
+        self._skip_next_context_save: bool = False
+
         # Simple per-model vision-validation reset map (the authoritative vision
         # cache stays in the gateway; caretaker only needs a no-op/bookkeeping
         # reset surface for Phase A).
@@ -1191,6 +1200,10 @@ class Caretaker:
                         f"serves a different model ({exc}) — reloading to heal "
                         "(no-op refused)"
                     )
+                    # The running session belongs to the WRONG model: its
+                    # context must not be auto-saved under this target model's
+                    # auto_save_ filename during the healing reload below.
+                    self._skip_next_context_save = True
                 else:
                     self.is_unloaded = False  # a live server is active; not unloaded
                     logger.info(f"Model {model_name} is already active")
@@ -1243,8 +1256,20 @@ class Caretaker:
             )
             # 1. Auto-save current context (only if a model is actually loaded —
             #    on the first switch current_model is None, so nothing to save).
+            #    Skipped when the active-model bookkeeping is known-stale (no-op
+            #    refused on a wrong-model backend): the running session belongs
+            #    to a different model and saving it under the target's
+            #    auto_save_ name would pollute the target's restore file.
             if self.current_model is not None:
-                await self._save_context(f"auto_save_{self.current_model}")
+                if getattr(self, "_skip_next_context_save", False):
+                    self._skip_next_context_save = False
+                    logger.info(
+                        "Skipping context auto-save: the backend was serving a "
+                        "different model than the active-model bookkeeping claims "
+                        f"(healing reload to '{model_name}')"
+                    )
+                else:
+                    await self._save_context(f"auto_save_{self.current_model}")
 
             # 2. Stop llama-server. The old model is no longer running: clear the
             #    active-model bookkeeping NOW, so a later exception (args write,

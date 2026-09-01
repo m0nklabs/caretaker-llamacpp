@@ -402,3 +402,84 @@ def test_model_paths_diverge_helper_contract(tmp_path: Path, monkeypatch: pytest
     other = tmp_path / "other.gguf"
     other.write_bytes(b"y")
     assert _C._model_paths_diverge(str(other), str(real)) is True
+
+
+# --------------------------- (review r2) wrong-model context save on heal reload
+
+
+def test_heal_reload_skips_wrong_model_context_save(
+    tmp_path: Path, isolated_paths: None, injection_reset: None
+) -> None:
+    """Healing reload must NOT auto-save the wrong model's session under the
+    target model's auto_save_ filename (PR-Piet finding, PR #9 r2).
+
+    The no-op path proves the backend serves a DIFFERENT model while the
+    bookkeeping claims the target: the falling-through reload used to run
+    `_save_context("auto_save_<target>")` against the still-running wrong
+    backend, polluting the target's restore file with cross-model slot state
+    (llama-server refuses cross-model restores, so the file would sit there
+    poisoning every later restore attempt).
+    """
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc)
+    _install_props(
+        mgr,
+        [
+            {"model_path": EXPECTED},  # cold load verified
+            {"model_path": WRONG},  # no-op verification sees the wrong model…
+            {"model_path": EXPECTED},  # …the heal reload serves the right one
+        ],
+    )
+    init(mgr)
+    with _client() as client:
+        client.post("/ensure", json={"model": "minimal"}, headers=AUTH_HEADER)
+
+        save_calls: list[str] = []
+
+        async def _spy_save(filename: str) -> None:
+            save_calls.append(filename)
+
+        mgr._save_context = _spy_save  # type: ignore[method-assign]
+
+        r2 = client.post("/ensure", json={"model": "minimal"}, headers=AUTH_HEADER)
+
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["fresh_load"] is True
+    assert save_calls == [], (
+        f"healing reload must not save the wrong model's context, got {save_calls}"
+    )
+    # The one-shot flag is consumed: a later normal switch saves again.
+    assert mgr._skip_next_context_save is False
+
+
+def test_normal_switch_still_autosaves_previous_model(
+    tmp_path: Path, isolated_paths: None, injection_reset: None
+) -> None:
+    """Control pin: a REAL switch (A actually serving, request B) still auto-saves
+    A's context under A's own name — the skip-flag only arms on stale bookkeeping."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={
+            "minimal": {"path": EXPECTED},
+            "other": {"path": "/home/flip/models/other.gguf"},
+        },
+    )
+    # _stub_props_ok echoes the ACTIVE model's configured path, so the
+    # post-switch verification agrees with the newly loaded model.
+    init(mgr)
+    with _client() as client:
+        client.post("/ensure", json={"model": "minimal"}, headers=AUTH_HEADER)
+
+        save_calls: list[str] = []
+
+        async def _spy_save(filename: str) -> None:
+            save_calls.append(filename)
+
+        mgr._save_context = _spy_save  # type: ignore[method-assign]
+
+        r2 = client.post("/ensure", json={"model": "other"}, headers=AUTH_HEADER)
+
+    assert r2.status_code == 200, r2.text
+    assert save_calls == ["auto_save_minimal"], save_calls
