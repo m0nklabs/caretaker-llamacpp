@@ -7,7 +7,12 @@ requires ``Authorization: Bearer ${CARETAKER_KEY}`` read from the environment
 
 Error responses carry machine-readable bodies at the top level (no ``detail``
 wrapper), e.g. ``{"error": "model_not_found", "message": "..."}``, so the
-gateway's repair logic can branch on ``error`` directly.
+gateway's repair logic can branch on ``error`` directly. A 200 from
+``POST /ensure`` means the backend was **verified** (via llama-server
+``GET /props``) to serve the requested model; when verification fails even
+after one bounded retry, ``/ensure`` returns ``503
+{"error": "model_mismatch", "expected": ..., "actual": ..., "model": ...}``
+and never reports success (2026-09-01 false-positive incident).
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from .manager import Caretaker, ModelLoadError
+from .manager import Caretaker, ModelLoadError, ModelMismatchError
 from .vram import VramLimitExceededError
 
 CARETAKER_KEY_ENV = "CARETAKER_KEY"
@@ -147,6 +152,21 @@ async def ensure(request: Request) -> dict:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={"error": "model_not_found", "message": str(exc)},
+        )
+    except ModelMismatchError as exc:
+        # Strict /props verification failed even after the manager's one
+        # bounded stop/start retry: the backend does not provably serve the
+        # requested model. Report the machine-readable mismatch — NEVER a
+        # success (the 2026-09-01 incident reported 200 for the wrong model).
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": "model_mismatch",
+                "message": str(exc),
+                "expected": exc.expected,
+                "actual": exc.actual,
+                "model": exc.model,
+            },
         )
     except ModelLoadError as exc:
         crash = exc.crash_record

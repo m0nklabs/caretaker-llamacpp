@@ -76,7 +76,25 @@ def _make_manager(tmp_path: Path, process: ServerProcess | None = None, **kwargs
         "minimal": {"path": "/home/flip/models/minimal.gguf"}
     }
     cfg = _write_models_yaml(tmp_path, models)
-    return Caretaker(config_path=str(cfg), server_process=process, **kwargs)
+    mgr = Caretaker(config_path=str(cfg), server_process=process, **kwargs)
+    _stub_props_ok(mgr)
+    return mgr
+
+
+def _stub_props_ok(mgr: Caretaker) -> None:
+    """Simulate a well-behaved llama-server for the strict /props verification.
+
+    ``_fetch_props`` (the manager's single GET /props call) reports the
+    configured path of the manager's active model, so ``_verify_loaded_model``
+    passes whenever bookkeeping and backend agree — exactly what a healthy
+    launch looks like. Mismatch-specific tests override ``_fetch_props``.
+    """
+
+    async def _fake_props() -> dict:
+        path = str(mgr.models.get(mgr.current_model or "", {}).get("path") or "")
+        return {"model_path": path}
+
+    mgr._fetch_props = _fake_props  # type: ignore[method-assign]
 
 
 @pytest.fixture

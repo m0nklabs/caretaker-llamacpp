@@ -168,6 +168,42 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   `test_ensure_response_carries_fresh_load_and_vision_contract` (API-level:
   ensure → fresh_load True → herhaald ensure → False → unload→ensure → True).
   **84 tests totaal, ruff clean.**
+- **Strict /ensure-modelverificatie (2026-09-01-incident, branch `f6-phase-e-windows-process`):**
+  het 2026-09-01-incident (verkeerde launcher draaide na de stop/start het OUDE
+  model; de warn-only-verificatie logde de mismatch maar `/ensure` antwoordde
+  tóch 200 "model loaded" — ook op de daaropvolgende no-op-ensure) is gefixt in
+  de verificatie zelf. `_verify_backend_model` (warn-only, fail-open) is
+  vervangen door **strict** `_verify_loaded_model(model)`: GET `/props` met
+  korte timeout (`DEFAULT_PROPS_TIMEOUT = 5.0`, nieuwe constante; /health wordt
+  eerst bounded gepolld), vergelijkt `model_path` (fallback `model`) met de
+  geconfigureerde `path` van het **opgevraagde** model; de HTTP-aanroep zit in
+  `_fetch_props` (het enige mockpunt voor tests). Na élke echte (re)load ÉN op
+  de no-op-fast-path ("already active") moet /props het juiste model bewijzen;
+  bij mismatch na een (re)start volgt **exact één** gebonden retry (nog een
+  stop/start-cyclus + wait + verify, `_retry_verified_start`; de args-file
+  staat er al, de launcher leest hem bij de start opnieuw) en nog een mismatch
+  → nieuwe `ModelMismatchError` (model/expected/actual) → `/ensure` **503**
+  `{"error": "model_mismatch", "message", "expected", "actual", "model"}` —
+  nooit succes. De no-op-path weigert bij mismatch de no-op en valt door naar
+  de echte (heal-)reload (zelfde patroon als de dode-backend-weigering van
+  2026-08-30); blijft de backend daarna fout → 503. Bij een definitieve
+  mismatch wordt de active-model-bookkeeping gewist (`current_model=None`,
+  vision=False → `/status` rapporteert needs_reload=true; VRAM-slot wordt in de
+  except-tak released). `/props` onbereikbaar/niet-parseerbaar telt óók als
+  verificatiefout (**fail-closed**, `actual: null`) — de oude fail-open was de
+  incident-kern. 200-body ongewijzigd backward-compat
+  (`{ok, loaded_model, fresh_load, vision_enabled, needs_reload}`); auth
+  ongewijzigd; `/unload`//`/status`//`/health` onaangetast; onbekend model
+  blijft 404 `model_not_found` (nu gepinnd: géén props-call vóór validatie).
+  **Latent gevonden, NIET gefixt:** (1) `aliases` uit
+  models.local.settings.yaml worden geladen maar in `switch_model` niet
+  geresolved (alias-lookup is bewust gateway-werk, F4) — een alias-naam via
+  /ensure geeft 404; (2) op de no-op-heal-reload wordt de context van de nog
+  draaiende (verkeerde) server gesaved onder de doelmodel-naam — herstel faalt
+  veilig ("starting fresh", llama-server weigert cross-model slot-restore).
+  **101 tests groen (10 nieuw: `tests/test_ensure_verification.py`), ruff
+  clean** (incl. opkuizen van de pre-existing I001-importsortering in
+  manager.py — importblok was identiek op HEAD).
 - **Plan-only. Niks gebouwd, repo leeg** = VERLEDEN — zie boven.
 
 ### Phase A (lifecycle core) — status
@@ -446,6 +482,17 @@ tests/
   de default neemt — **bewust géén NoDeviate/ignore voor die** zolang de CI
   default-select draait; als de reviewer `--select ALL` wil, zijn er 289 issues
   (52 fixable, géén BLE) — dat is dan een aparte selectiebeslissing.
+- **2026-09-01 (incident-fix): strikte /ensure-modelverificatie** op branch
+  `f6-phase-e-windows-process` (voltekst → Status-entry "Strict
+  /ensure-modelverificatie"): `_verify_loaded_model` strict via /props +
+  `DEFAULT_PROPS_TIMEOUT`, één gebonden stop/start-retry bij mismatch
+  (`_retry_verified_start`), no-op-path verifieert óók en healt via
+  fall-through, definitieve mismatch → `ModelMismatchError` → 503
+  `model_mismatch` {expected, actual, model}. Launcher-split-brain zelf was al
+  gefixt in `34dec2b`. Tests: `tests/test_ensure_verification.py` (10 nieuw,
+  101 totaal). Volgende stap: PR aanmaken + `/review`; optioneel de gateway
+  (`caretaker_runtime.py`) het `model_mismatch`-errorveld expliciet laten
+  consumeren i.p.v. generieke 503-afhandeling.
 
 ## References
 

@@ -18,10 +18,10 @@ import hashlib
 import json
 import logging
 import os
-import sys
 import shlex
 import signal
 import subprocess
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -53,6 +53,13 @@ MAX_CRASH_HISTORY = 50  # Keep last N crash records
 DEFAULT_HEALTH_POLLS = 120
 DEFAULT_HEALTH_INTERVAL = 1.0
 DEFAULT_HEALTH_TIMEOUT = 5.0
+
+# Short timeout for the strict GET /props model verification. Callers poll
+# /health first (bounded ``_wait_for_health`` after a start; a single
+# ``health_ok`` on the no-op path), so by the time /props is queried the
+# backend answers requests — a single short-timeout call must suffice and
+# keeps total /ensure latency bounded.
+DEFAULT_PROPS_TIMEOUT = 5.0
 
 # Watchdog defaults (Phase C). The operator starts the watchdog explicitly via
 # ``manager.start_watchdog()``; interval/backoff are constructor-free here so
@@ -88,6 +95,33 @@ class ModelLoadError(Exception):
     def __init__(self, message: str, crash_record: CrashRecord | None = None):
         super().__init__(message)
         self.crash_record = crash_record
+
+
+class ModelMismatchError(Exception):
+    """Raised when the backend does not provably serve the requested model.
+
+    Strict post-load verification (GET /props) failed: either the backend
+    reports a different model path than configured, or /props could not be
+    consulted at all (verification must be proven, never assumed — the
+    2026-09-01 incident let /ensure confirm success while llama-server was
+    still serving the previous model). Carries the machine-readable fields
+    the control API maps into its 503 ``model_mismatch`` body.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        expected: str | None,
+        actual: str | None,
+        message: str | None = None,
+    ) -> None:
+        self.model = model
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            message
+            or f"backend serves {actual!r}, expected {expected!r} for model '{model}'"
+        )
 
 
 class ServerProcess(ABC):
@@ -946,37 +980,121 @@ class Caretaker:
 
         return crash
 
-    async def _verify_backend_model(self) -> bool:
-        """Simplified post-load verification: compare the `/props` model path to the expected one.
+    async def _fetch_props(self) -> dict[str, Any] | None:
+        """Fetch llama-server ``GET /props`` with a short timeout.
 
-        If the backend cannot be queried/parsed, log a warning and return True
-        (never fail — the full verification stays gateway work in F5 wiring).
+        Returns the parsed JSON object, or ``None`` when the backend is
+        unreachable, answers non-200, or returns an unparseable/non-object
+        body. The caller decides whether that is fatal — under strict
+        verification it is: success must be proven, never assumed.
         """
-        expected = self.models.get(self.current_model or "", {}).get("path")
-        if not expected:
-            logger.warning("⚠️ No expected model path configured for verification")
-            return True
         try:
-            async with httpx.AsyncClient(timeout=DEFAULT_HEALTH_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=DEFAULT_PROPS_TIMEOUT) as client:
                 resp = await client.get(f"{self.server_url}/props")
-            if resp.status_code != 200:
-                logger.warning("⚠️ /props returned HTTP %s — backend verification skipped", resp.status_code)
-                return True
+        except Exception:  # noqa: BLE001 - any transport failure means "unverified"
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
             data = resp.json()
-            actual = data.get("model_path") or data.get("model") or None
-            if actual is None:
-                logger.warning("⚠️ /props did not expose a model path — backend verification skipped")
-                return True
-            if actual == expected:
-                logger.info(f"✅ Backend model verified: {self.current_model} ({Path(actual).name})")
-                return True
-            logger.warning(
-                f"⚠️ Backend model mismatch: expected {expected!s}, backend runs {actual!s}"
+        except Exception:  # noqa: BLE001 - unparseable body means "unverified"
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def _verify_loaded_model(self, model_name: str) -> str:
+        """Strict post-load verification: /props must report the expected model path.
+
+        Compares the backend-reported model path (``model_path`` field, with
+        ``model`` as legacy fallback) against the configured path for
+        ``model_name`` and returns the actually-served path on success.
+
+        Raises :class:`ModelMismatchError` when the backend provably serves a
+        different model, or when /props cannot be consulted at all — a
+        fail-open here is exactly what let the 2026-09-01 incident confirm
+        ``/ensure`` success while llama-server still served the previous
+        model. Callers poll /health first (bounded), so a single
+        short-timeout /props call suffices once the backend answers.
+        """
+        expected = str(self.models.get(model_name, {}).get("path") or "")
+        if not expected:
+            raise ModelMismatchError(
+                model_name,
+                None,
+                None,
+                message=f"no configured model path to verify against for '{model_name}'",
             )
-            return False
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"⚠️ Backend verification failed ({e}) — not fatal")
-            return True
+        data = await self._fetch_props()
+        if data is None:
+            raise ModelMismatchError(
+                model_name,
+                expected,
+                None,
+                message=f"backend verification unavailable: GET {self.server_url}/props failed",
+            )
+        actual = data.get("model_path") or data.get("model") or None
+        if actual is None:
+            raise ModelMismatchError(
+                model_name,
+                expected,
+                None,
+                message="backend /props did not expose a model path",
+            )
+        actual = str(actual)
+        if actual != expected:
+            raise ModelMismatchError(model_name, expected, actual)
+        logger.info(f"✅ Backend model verified: {model_name} ({Path(actual).name})")
+        return actual
+
+    async def _retry_verified_start(
+        self,
+        model_name: str,
+        *,
+        desired_vision: bool,
+        target_config: dict[str, Any],
+    ) -> None:
+        """One bounded stop/start cycle + wait + verify after a failed verification.
+
+        The launch args for ``model_name`` are already written (the launcher
+        re-reads them on start), so the retry is exactly stop → start → wait
+        for health → verify — the bounded single retry for a launcher race
+        that left the old model running after the first start.
+
+        Raises :class:`ModelLoadError` (crash-recorded, active-model
+        bookkeeping cleared) when the retried backend never becomes healthy,
+        and :class:`ModelMismatchError` (bookkeeping cleared — nothing is
+        verified-loaded) when the second verification also fails.
+        """
+        await self.server_process.stop()
+        await self.server_process.start()
+        if not await self._wait_for_health(model_name):
+            # The old model is no longer running: clear the "active model"
+            # bookkeeping so a later same-model ensure/switch actually
+            # restarts llama-server instead of short-circuiting as
+            # "already active" (same contract as the primary load path).
+            self.current_model = None
+            self.current_vision_enabled = False
+            crash = await self._detect_crash(
+                model_name,
+                config_snapshot=self._build_crash_config_snapshot(
+                    model_name,
+                    runtime_config=target_config,
+                    vision_enabled=desired_vision,
+                ),
+            )
+            raise ModelLoadError(
+                f"Model '{model_name}' failed to load: {crash.error_message}",
+                crash_record=crash,
+            )
+        try:
+            await self._verify_loaded_model(model_name)
+        except ModelMismatchError:
+            # Truthful final state: the backend does not provably serve the
+            # target model even after the bounded retry. Clear the active-model
+            # bookkeeping so /status reports needs_reload instead of a model
+            # the backend is not actually serving.
+            self.current_model = None
+            self.current_vision_enabled = False
+            raise
 
     # ------------------------------------------------------------- orchestrator
     async def switch_model(
@@ -990,18 +1108,25 @@ class Caretaker:
         """Swap the running llama-server to ``model_name``.
 
         The gateway keeps registry/choice/pinning/switch-allowlist; here we only
-        execute: no-op when the same model+vision is already active and not
-        drifted, else auto-save context → stop → write args → free GPU memory →
-        start → wait for health (crash-aware) → persist signature → verify →
-        restore context.
+        execute: no-op when the same model+vision is already active, not
+        drifted, and /props verifies the backend really serves it; else
+        auto-save context → stop → write args → free GPU memory → start →
+        wait for health (crash-aware) → persist signature → verify /props
+        (strict; one bounded stop/start retry on mismatch) → restore context.
 
         Returns ``fresh_load``: ``True`` when this call actually (re)started
         llama-server (the backend is fresh — any prior in-memory session state
         is gone and the gateway may restore the saved context), ``False`` when
         the request was a no-op fast-path (the live session is authoritative —
         nothing was restarted, so restoring a saved context would clobber the
-        live one).  Raises on failure; the caller never receives a stale
-        backend on an exception path.
+        live one).
+
+        Raises :class:`ModelLoadError` when the backend fails to become
+        healthy, and :class:`ModelMismatchError` when GET /props cannot prove
+        the backend serves ``model_name`` (after the bounded retry) — the
+        caller must never report success in that case (2026-09-01 incident:
+        /ensure confirmed a model while llama-server still served the previous
+        one).
         """
         if model_name not in self.models:
             raise ValueError(f"Model {model_name} not found in configuration")
@@ -1025,13 +1150,36 @@ class Caretaker:
             # the import-time SERVER_URL default — so the gate probes the same
             # endpoint the rest of the flow probes.
             if await self.server_process.health_ok(self.server_url):
-                self.is_unloaded = False  # a live server is active; not unloaded
-                logger.info(f"Model {model_name} is already active")
-                return False
-            logger.warning(
-                f"Model {model_name} is marked active but the backend does not "
-                "answer health — reloading to heal (no-op refused)"
-            )
+                # The no-op is only truthful when the backend actually lives AND
+                # provably serves the requested model: a crash between watchdog
+                # ticks (or a KillMode=control-group stop) can leave
+                # ``current_model`` set with a dead llama-server, and a launcher
+                # race can leave it alive but serving the WRONG model (the
+                # 2026-09-01 incident: bookkeeping said qwen, /props showed
+                # gemma). Either way the no-op would lie to the gateway
+                # (``ok: true, fresh_load: false`` on a wrong backend) — refuse
+                # it and fall through to the real (re)load path so the ensure
+                # heals the backend instead.  Uses ``self.server_url`` (call-time
+                # resolved, same as _wait_for_health and the watchdog tick) — NOT
+                # the import-time SERVER_URL default — so the gate probes the same
+                # endpoint the rest of the flow probes.
+                try:
+                    await self._verify_loaded_model(model_name)
+                except ModelMismatchError as exc:
+                    logger.warning(
+                        f"Model {model_name} is marked active but the backend "
+                        f"serves a different model ({exc}) — reloading to heal "
+                        "(no-op refused)"
+                    )
+                else:
+                    self.is_unloaded = False  # a live server is active; not unloaded
+                    logger.info(f"Model {model_name} is already active")
+                    return False
+            else:
+                logger.warning(
+                    f"Model {model_name} is marked active but the backend does not "
+                    "answer health — reloading to heal (no-op refused)"
+                )
         if drifted:
             logger.info(
                 f"🔄 Config drift detected for '{model_name}' "
@@ -1141,8 +1289,24 @@ class Caretaker:
             self.reset_vision_validation(model_name)
             logger.info(f"✅ Model '{model_name}' loaded successfully")
 
-            # Post-switch verification — simplified: warn-only, never fail.
-            await self._verify_backend_model()
+            # Post-switch verification — STRICT since the 2026-09-01 incident:
+            # /ensure may only report success when GET /props proves the
+            # backend serves the requested model (a warn-only check here let a
+            # launcher race confirm the old model as "loaded"). On a mismatch,
+            # retry ONCE — bounded: one more stop/start cycle + wait + verify —
+            # before failing the request.
+            try:
+                await self._verify_loaded_model(model_name)
+            except ModelMismatchError as first:
+                logger.warning(
+                    f"⚠️ Post-load verification failed for '{model_name}' ({first}) "
+                    "— retrying once (stop/start + wait + verify)"
+                )
+                await self._retry_verified_start(
+                    model_name,
+                    desired_vision=desired_vision,
+                    target_config=target_config,
+                )
 
             # 7. Restore context if exists.
             try:
