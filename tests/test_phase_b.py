@@ -79,6 +79,9 @@ def _fast_manager(
     The real switch_model path calls ``_free_gpu_memory`` (nvidia-smi +
     ComfyUI HTTP) and context save/load against a live llama-server; these are
     stubbed to no-ops so the drift/lifecycle tests run fast and touch nothing.
+    GET /props verification is served by the ``_stub_props_ok`` fake installed
+    by ``_make_manager`` (a well-behaved backend), so the real strict
+    verification runs in these tests; mismatch tests override ``_fetch_props``.
     """
     process = process or FakeServerProcess()
     kwargs.setdefault("health_polls", 3)
@@ -91,7 +94,6 @@ def _fast_manager(
     mgr._save_context = _noop  # type: ignore[method-assign]
     mgr._load_context = _noop  # type: ignore[method-assign]
     mgr._free_gpu_memory = _noop  # type: ignore[method-assign]
-    mgr._verify_backend_model = _noop  # type: ignore[method-assign]
     return mgr
 
 
