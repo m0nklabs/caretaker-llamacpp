@@ -195,15 +195,20 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   (`{ok, loaded_model, fresh_load, vision_enabled, needs_reload}`); auth
   ongewijzigd; `/unload`//`/status`//`/health` onaangetast; onbekend model
   blijft 404 `model_not_found` (nu gepinnd: géén props-call vóór validatie).
-  **Latent gevonden, NIET gefixt:** (1) `aliases` uit
-  models.local.settings.yaml worden geladen maar in `switch_model` niet
-  geresolved (alias-lookup is bewust gateway-werk, F4) — een alias-naam via
-  /ensure geeft 404; (2) op de no-op-heal-reload wordt de context van de nog
-  draaiende (verkeerde) server gesaved onder de doelmodel-naam — herstel faalt
-  veilig ("starting fresh", llama-server weigert cross-model slot-restore).
+  **Latent-items: ALLE DRIE opgelost** — (2) heal-reload context-save onder de
+  doelmodel-naam gefixt in PR #9 (`0c19ed7`, `_skip_next_context_save`-guard);
+  (1) alias-resolutie + (3) `_loaded_at`-oddity gefixt in PR #10 (`f0bdeb6`):
+  `resolve_model_alias()` (bounded walk) aan de switch_model-ingang maakt elke
+  naam uit de host-config adresseerbaar (gateway blijft F4-alias-autoriteit;
+  double resolution is harmloos), en de failed-switch-path cleared nu
+  `_loaded_at` + de skip-flag (truthful health(), geen phantom save-skip).
   **101 tests groen (10 nieuw: `tests/test_ensure_verification.py`), ruff
   clean** (incl. opkuizen van de pre-existing I001-importsortering in
   manager.py — importblok was identiek op HEAD).
+- **Latent-items PR #10 (2026-09-02, gemerged):** alias-resolutie +
+  failed-switch bookkeeping — 6 pins in `tests/test_latent_items.py`; suite
+  112 passed; live: /ensure met alias `qwen3.8-uncensored` → 200 in 0,08 s
+  (no-op, canonieke naam gerapporteerd).
 - **Plan-only. Niks gebouwd, repo leeg** = VERLEDEN — zie boven.
 
 ### Phase A (lifecycle core) — status
