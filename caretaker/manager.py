@@ -1061,7 +1061,7 @@ class Caretaker:
         try:
             actual_resolved = os.path.realpath(os.path.expanduser(actual))
             expected_resolved = os.path.realpath(os.path.expanduser(expected))
-        except Exception:
+        except (OSError, ValueError):
             return actual != expected
         return actual_resolved != expected_resolved
 
