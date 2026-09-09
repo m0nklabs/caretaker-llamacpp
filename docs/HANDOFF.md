@@ -12,3 +12,15 @@
 - **Slot-comment** op PR #8 (issuecomment-5471009832) met de eindstatus, nadien ge-edit met de gateway-journal-flake-citatie. **Let op: er staat ook een tweede merge-signaal-comment op de PR** (20:18:16 UTC, zelfde account `m0nk111` via een sibling-sessie) — inhoudelijk gelijkluidend; de operator kan beide als merge-signaal lezen.
 - **Workflow-quirk**: PR-Piet triggert op élke `issue_comment` (`types: [created, edited]`) maar behandelt non-slash-comments als onbekende commands → de tier-1 job faalt met exit 3 ("Unknown command", "geen verse review") zónder een review te posten. De rode comment-runs (20:15, 20:18, en de gequeuede na de slot-comment-edit) zijn daardoor verwacht en hinderloos: comment-runs hangen niet aan de head-rollup, dus merge-state blijft `CLEAN`.
 - **Open**: human merge van PR #8; daarna vervolg F6 (gateway-kant Windows/14700K) — zie `PLAN.md` §6.
+
+## 2026-09-09 — Handoff (guardian agent, inter-repo): OOM-detectie ontbreekt in het crash-rapportage-oppervlak
+
+**Vraag van de operator:** "rapporteert de caretaker OOM's terug aan Guardian?" Onderzoek (guardian-zijde: `app/gateway/caretaker_client.py`/`caretaker_runtime.py`; caretaker-zijde: deze repo).
+
+**Gevonden (feit):**
+- Crash-rapportage WERKT: `CrashRecord` (caretaker/manager.py:73 — timestamp/model/error_message/exit_code/config_snapshot, geschiedenis 50 diep) stroomt via de 503 `model_load_failed`-respons als `crash_details` (caretaker/server.py:172-179) naar Guardian, die het doorgeeft aan de client-503 (guardian `app/gateway/routing.py:639-650`) en logt.
+- Maar: **geen OOM-classificatie** in deze repo — geen exit-code-interpretatie (137 = OOM-kill/SIGKILL), geen CUDA-OOM-herkenning in de llama-server-logscan, geen dmesg-oom-killer-cross-check. Een OOM-dood arriveert bij Guardian als generieke `model_load_failed` met een rauw exitnummer. Guardian interpreteert het exitnummer óók niet.
+
+**Aanbeveling (concreet):** OOM-classificatie toevoegen aan `CrashRecord`: (1) exit-code-check (137/139 + `oom_score_adj`-context), (2) logscan-herkenning van CUDA-OOM ("CUDA out of memory" in de laatste N logregelen van het gestopte proces), (3) additieve velden `oom: bool` + `oom_source: "kernel"|"cuda"` in `CrashRecord.to_dict()` — protocol-additief, Guardian kan er direct mee leven (de rest van de shape blijft gelijk). Guardian-zijde kan dan de 503/capture verrijken ("vermoedelijk OOM-kill").
+
+**Prioriteit:** middel; nuttig zodra lokale OOM-restarts zichtbaar moeten zijn in het Guardian-dashboard/capture zonder log-klimwerk.
