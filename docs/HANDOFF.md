@@ -24,3 +24,15 @@
 **Aanbeveling (concreet):** OOM-classificatie toevoegen aan `CrashRecord`: (1) exit-code-check (137/139 + `oom_score_adj`-context), (2) logscan-herkenning van CUDA-OOM ("CUDA out of memory" in de laatste N logregelen van het gestopte proces), (3) additieve velden `oom: bool` + `oom_source: "kernel"|"cuda"` in `CrashRecord.to_dict()` — protocol-additief, Guardian kan er direct mee leven (de rest van de shape blijft gelijk). Guardian-zijde kan dan de 503/capture verrijken ("vermoedelijk OOM-kill").
 
 **Prioriteit:** middel; nuttig zodra lokale OOM-restarts zichtbaar moeten zijn in het Guardian-dashboard/capture zonder log-klimwerk.
+
+## 2026-09-11 — Handoff (guardian agent, inter-repo): backend-auth gap — llama-server met --api-key breekt de /props-verificatie
+
+**Context:** F6-deployment op teams-host (J:\LLMSTUFF, RTX 5060 Ti, NSSM-service `caretaker-llamacpp` — zie guardian journal "F6 gedeployed"). De plan-aanbeveling is `--api-key` op de Windows llama-server; live getest.
+
+**Gevonden (feit, live bewijs 2026-09-11):**
+- Met `--api-key <key>` in de args: de caretaker's health-wait komt wél door (llama-server exempt /health van auth), maar de strikte `GET /props` model-verificatie krijgt **401** → `/ensure` antwoordt 503 `model_mismatch`: "backend verification unavailable: GET http://127.0.0.1:11440/props failed" (expected gguf-pad, actual null). De probes sturen geen Authorization-header — de caretaker is gebouwd voor keyless backends (ai-kvm2 draait keyless).
+- Zonder --api-key: `/ensure` 200 in ~8,9s, alles gezond (huidige deployment = keyless backend + firewall 11440/11441 beperkt tot 192.168.1.0/24).
+
+**Aanbeveling:** een backend-auth-knop — bijv. `CARETAKER_BACKEND_KEY` env die de health/props-probes (en de context-save/restore-calls naar de backend) een `Authorization: Bearer <key>` meegeven wanneer gezet. Tot die tijd: Windows-backend keyless laten (firewall-dekking) óf de /props-verificatie-documentatie aanpassen.
+
+**Niet aangepast:** geen code gewijzigd in deze repo (jullie OOM-taak loopt — manager.py onaangetast gelaten).
