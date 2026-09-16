@@ -28,6 +28,7 @@ from .manager import Caretaker, ModelLoadError, ModelMismatchError
 from .tts import tts_status as _tts_status
 from .tts import ensure_tts as _tts_ensure
 from .tts import release_tts as _tts_release
+from .tts import init as _tts_init
 from .vram import VramLimitExceededError
 
 CARETAKER_KEY_ENV = "CARETAKER_KEY"
@@ -98,6 +99,11 @@ def _manager() -> Caretaker:
     if _manager_instance is None:
         _manager_instance = Caretaker()
     return _manager_instance
+
+
+# Give the TTS lifecycle lazy access to the manager singleton so its ensure
+# can coordinate VRAM with the caretaker's own llama-server (see tts.py).
+_tts_init(lambda: _manager())
 
 
 def _invalid_request(message: str) -> JSONResponse:

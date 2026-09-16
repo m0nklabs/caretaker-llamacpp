@@ -52,3 +52,11 @@ De eerste versie had een `sys.platform == "win32"`-gate en gebruikte `sc start/s
 **Live proof:** release → VRAM 5008 MiB baseline; guardian TTS-request → koude start ~6s → 200 WAV 184KB; release → engine 000 + VRAM vrij. Pins: `tests/test_tts_lifecycle.py` (9). Suite: 121 groen.
 
 **Manager.py niet aangeraakt** (jullie OOM-taak-terrein).
+
+## 2026-09-16 (avond) — TTS-ensure VRAM-bewust + UTF-8 spawn; Windows = TTS-primary in de guardian-config
+
+- **VRAM-gate in `ensure_tts` (configureerbaar, uniform):** vrije VRAM < `CARETAKER_TTS_MIN_FREE_MB` (default 2500) en `CARETAKER_TTS_STOP_LLAMA=1` → de caretaker stopt eerst z'n EIGEN llama-server (`_manager_getter().unload()`, geïnjecteerd via `tts.init()` van server.py) en her-checkt; met STOP_LLAMA=0 faalt hij eerlijk met "insufficient VRAM". Op ai-kvm2 (productie) staat STOP_LLAMA=0 — de 27b wordt NOOIT voor TTS weggestopt; op teams-host =1 — de TTS heeft daar voorrang op de llama. `CARETAKER_TTS_CUDA_DEVICE` (default 0) richt de check op de GPU waar de engine ook daadwerkelijk landt.
+- **UTF-8 spawn-env (crash-fix):** de engine-prints bevatten emoji; op Windows is een redirected-stdout standaard cp1252 → `UnicodeEncodeError` midden in de model-load → de load crashte stil ("engine not healthy"). De caretaker spawnt kinderen nu altijd met `PYTHONIOENCODING=utf-8` + `PYTHONUTF8=1` (no-op op Linux). Bewijs: teams-host `tts_engine.log` toont nu cleane "engine ready"-prints + een 200-POST.
+- **Engine-wrapper (Qwen3-TTS-GGUF, beide hosts):** bindt de HTTP-poort vóór de model-load → `/health` antwoordt 503 "loading" tijdens de koude start (observeerbaar i.p.v. connection-refused); `get_engine()` is nu thread-safe (lock) omdat een vroege POST kan racen met de startup-load.
+- **Pinnen:** 15 TTS-lifecycle-pinnen (incl. VRAM-gate ×3 en de UTF-8-env-pin); suite 128 groen.
+- **Rol in de gateway-config:** `tts.providers: [14700k-local, ai-kvm2-local]` — de Windows-host is TTS-primary (operator-besluit: ai-kvm2 is productie en blijft druk met de 27b; "wat waar primair is, is pure configuratie — de machinerie is overal gelijk").

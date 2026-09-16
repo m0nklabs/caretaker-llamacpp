@@ -32,6 +32,7 @@ def _patch_env(monkeypatch, **values):
     }
     base.update(values)
     monkeypatch.setattr(tts_mod, "_env", lambda name, default: base.get(name, default))
+    monkeypatch.setattr(tts_mod, "_gpu_free_mb", AsyncMock(return_value=8000))
 
 
 class _FakeProcess:
@@ -68,8 +69,8 @@ def _patch_health(monkeypatch, states):
 def _patch_spawn(monkeypatch, process):
     spawned = []
 
-    async def _spawn(*cmd, cwd=None, stdout=None, stderr=None):
-        spawned.append({"cmd": cmd, "cwd": cwd})
+    async def _spawn(*cmd, cwd=None, stdout=None, stderr=None, env=None):
+        spawned.append({"cmd": cmd, "cwd": cwd, "env": env})
         return process
 
     monkeypatch.setattr(tts_mod.asyncio, "create_subprocess_exec", _spawn)
@@ -215,3 +216,60 @@ async def test_shlex_splits_windows_command_with_backslashes(monkeypatch):
     )
     parts = tts_mod._spawn_command()
     assert parts == ["J:\\Qwen3-TTS-GGUF\\.venv\\Scripts\\python.exe", "tts_http_wrapper.py"]
+
+
+async def test_vram_gate_spawns_when_enough_free(monkeypatch):
+    _patch_env(monkeypatch, CARETAKER_TTS_MIN_FREE_MB="2500")
+    monkeypatch.setattr(tts_mod, "_gpu_free_mb", AsyncMock(return_value=8000))
+    _patch_health(monkeypatch, [False, False, True])
+    _patch_spawn(monkeypatch, _FakeProcess())
+    result = await tts_mod.ensure_tts()
+    assert result["ok"] is True and result["cold_start"] is True
+
+
+async def test_vram_gate_stops_llama_when_tight(monkeypatch):
+    """Tight VRAM + STOP_LLAMA=1: the caretaker's own llama is unloaded first,
+    then the free re-check passes and the engine spawns."""
+    _patch_env(monkeypatch, CARETAKER_TTS_MIN_FREE_MB="2500", CARETAKER_TTS_STOP_LLAMA="1")
+    free_states = iter([800, 9500])  # tight → after llama unload → enough
+
+    async def _free():
+        return next(free_states)
+
+    monkeypatch.setattr(tts_mod, "_gpu_free_mb", _free)
+    _patch_health(monkeypatch, [False, False, True])
+    _patch_spawn(monkeypatch, _FakeProcess())
+    unloaded = []
+
+    class _Mgr:
+        async def unload(self):
+            unloaded.append(True)
+
+    tts_mod.init(lambda: _Mgr())
+    result = await tts_mod.ensure_tts()
+    assert result["ok"] is True
+    assert unloaded == [1]
+
+
+async def test_vram_gate_fails_honestly_when_llama_stop_disabled(monkeypatch):
+    _patch_env(monkeypatch, CARETAKER_TTS_MIN_FREE_MB="2500", CARETAKER_TTS_STOP_LLAMA="0")
+    monkeypatch.setattr(tts_mod, "_gpu_free_mb", AsyncMock(return_value=800))
+    _patch_health(monkeypatch, [False])
+    result = await tts_mod.ensure_tts()
+    assert result["ok"] is False
+    assert "insufficient VRAM" in result["reason"]
+
+
+async def test_spawn_forces_utf8_io_env(monkeypatch):
+    """Engine prints carry emoji; a Windows file redirect defaults to cp1252
+    and a UnicodeEncodeError there kills the model load mid-flight.  The
+    caretaker therefore always spawns the engine with UTF-8 IO env vars —
+    a no-op on Linux, life-saving on Windows, uniform everywhere."""
+    _patch_env(monkeypatch)
+    _patch_health(monkeypatch, [False, False, True])
+    spawned = _patch_spawn(monkeypatch, _FakeProcess())
+    result = await tts_mod.ensure_tts()
+    assert result["ok"] is True
+    env = spawned[0]["env"]
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["PYTHONUTF8"] == "1"

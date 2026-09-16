@@ -47,6 +47,15 @@ logger = logging.getLogger("caretaker.tts")
 _last_use_monotonic: float | None = None
 _process: asyncio.subprocess.Process | None = None
 _watcher_task: asyncio.Task | None = None
+_manager_getter = None  # set by init(): lazy access to the Caretaker singleton
+
+
+def init(manager_getter) -> None:
+    """Inject the lazy manager accessor so the TTS ensure can coordinate VRAM
+    with the caretaker's own llama-server (stop it when the engine needs the
+    memory).  Called once from server.py with ``lambda: _manager()``."""
+    global _manager_getter
+    _manager_getter = manager_getter
 
 
 def _env(name: str, default: str) -> str:
@@ -77,6 +86,22 @@ def tts_status() -> dict:
         ),
         "child_pid": _process.pid if _process is not None and _process.returncode is None else None,
     }
+
+
+async def _gpu_free_mb() -> int | None:
+    """Free VRAM (MiB) on the engine's target GPU (CARETAKER_TTS_CUDA_DEVICE,
+    else device 0).  None when nvidia-smi is unavailable (non-NVIDIA hosts)."""
+    idx = _env("CARETAKER_TTS_CUDA_DEVICE", "0")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "nvidia-smi", "--id", idx, "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        return int(out.decode(errors="replace").strip().splitlines()[0].strip())
+    except Exception:  # noqa: BLE001 — best-effort; the gate degrades to off
+        return None
 
 
 async def _engine_healthy(timeout_s: float = 3.0) -> bool:
@@ -113,9 +138,16 @@ async def _start_engine() -> dict:
     cwd = _env("CARETAKER_TTS_CWD", "") or None
     log_path = _env("CARETAKER_TTS_LOG", "")
     log_fh = open(log_path, "ab") if log_path else subprocess.DEVNULL
+    # Force UTF-8 IO on the engine child: engine prints carry emoji, and on
+    # Windows a redirected file defaults to cp1252 — the print then raises
+    # UnicodeEncodeError and kills the model load mid-flight.  Linux defaults
+    # to UTF-8, so this is a no-op there; the same env works on every host.
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     try:
         _process = await asyncio.create_subprocess_exec(
-            *cmd, cwd=cwd, stdout=log_fh, stderr=subprocess.STDOUT
+            *cmd, cwd=cwd, stdout=log_fh, stderr=subprocess.STDOUT, env=env
         )
     except (OSError, ValueError) as exc:
         logger.warning("TTS engine spawn failed (%s): %r", cmd, exc)
@@ -156,6 +188,32 @@ async def ensure_tts() -> dict:
         # restart — all fine: the contract is the health endpoint, not the pid.
         _mark_used()
         return {"ok": True, "already_running": True}
+
+    # VRAM gate: the engine needs ~2 GB.  On hosts where the caretaker also
+    # runs llama-server, both processes compete for the same GPU — when free
+    # memory is below the budget and the operator enabled it, the caretaker
+    # stops ITS OWN llama-server first (it owns that lifecycle too) so the TTS
+    # cold start does not OOM.  With the coordination disabled the ensure
+    # fails with an honest reason instead of a silent GPU fight.
+    min_free = int(_env("CARETAKER_TTS_MIN_FREE_MB", "2500"))
+    free = await _gpu_free_mb()
+    if free is not None and free < min_free:
+        if _env("CARETAKER_TTS_STOP_LLAMA", "0") == "1" and _manager_getter is not None:
+            logger.info(
+                "TTS ensure: only %s MiB free (need %s) — unloading the caretaker's llama-server first",
+                free, min_free,
+            )
+            try:
+                await _manager_getter().unload()
+            except Exception as exc:  # noqa: BLE001 — fall through to the re-check
+                logger.warning("TTS ensure: llama unload failed: %r", exc)
+            await asyncio.sleep(4)  # let the driver reclaim the memory
+            free = await _gpu_free_mb()
+        if free is not None and free < min_free:
+            return {
+                "ok": False,
+                "reason": f"insufficient VRAM free ({free} MB < {min_free} MB) and llama-stop is disabled",
+            }
 
     result = await _start_engine()
     if result.get("ok"):
