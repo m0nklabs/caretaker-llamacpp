@@ -25,6 +25,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from .manager import Caretaker, ModelLoadError, ModelMismatchError
+from .tts import tts_status as _tts_status
+from .tts import ensure_tts as _tts_ensure
+from .tts import release_tts as _tts_release
 from .vram import VramLimitExceededError
 
 CARETAKER_KEY_ENV = "CARETAKER_KEY"
@@ -108,6 +111,25 @@ def _invalid_request(message: str) -> JSONResponse:
 async def get_status() -> dict:
     """Report loaded model + drift/"needs reload" status for discovery."""
     return _manager().health()
+
+
+# ── TTS engine lifecycle (Windows; on-demand VRAM) — see caretaker/tts.py ──
+@app.post("/tts/ensure", dependencies=[Depends(require_caretaker_key)])
+async def tts_ensure() -> dict:
+    """Idempotent: make sure the TTS engine is healthy and refresh its idle timer."""
+    return await _tts_ensure()
+
+
+@app.post("/tts/release", dependencies=[Depends(require_caretaker_key)])
+async def tts_release() -> dict:
+    """Stop the TTS engine service (frees its VRAM)."""
+    return await _tts_release()
+
+
+@app.get("/tts/status", dependencies=[Depends(require_caretaker_key)])
+async def tts_status_route() -> dict:
+    """TTS lifecycle state (service, idle timer, last use)."""
+    return _tts_status()
 
 
 @app.post("/ensure", dependencies=[Depends(require_caretaker_key)])

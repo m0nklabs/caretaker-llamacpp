@@ -36,3 +36,15 @@
 **Aanbeveling:** een backend-auth-knop — bijv. `CARETAKER_BACKEND_KEY` env die de health/props-probes (en de context-save/restore-calls naar de backend) een `Authorization: Bearer <key>` meegeven wanneer gezet. Tot die tijd: Windows-backend keyless laten (firewall-dekking) óf de /props-verificatie-documentatie aanpassen.
 
 **Niet aangepast:** geen code gewijzigd in deze repo (jullie OOM-taak loopt — manager.py onaangetast gelaten).
+
+## 2026-09-16 — Nieuw: on-demand TTS-engine-lifecycle (guardian-agent, operator-directed)
+
+**Wat:** de operator wilde de `qwen3tts-http`-engine (teams-host :11450, zie guardian journal 2026-09-16) on-demand draaien — VRAM vrij wanneer de audio-route ongebruikt is. Geïmplementeerd in **`caretaker/tts.py` (nieuw, dit repo)** + routes `/tts/ensure`, `/tts/release`, `/tts/status` in server.py (+ GET /status onveranderd gelaten).
+
+**Contract:** guardian roept `POST /tts/ensure` vóór élke forward (idempotent, health-first, ververst de idle-timer); de idle-watcher stopt de service na `CARETAKER_TTS_IDLE_SECONDS` (default 600, 0 = uit). Service-control via `sc start/stop` (LocalSystem; NSSM supervisie, een service-stop triggert géén NSSM-restart). Starttype van de NSSM-service `qwen3tts-http` is nu **manual** (demand) — de caretaker start hem.
+
+**Platform:** inert off-Windows ( dezelfde code draait ongewijzigd mee met de Linux-caretaker; geen gedragswijziging daar — een herstart van de Linux-service is niet nodig voor deze change).
+
+**Live proof:** release → VRAM 5008 MiB baseline; guardian TTS-request → koude start ~6s → 200 WAV 184KB; release → engine 000 + VRAM vrij. Pins: `tests/test_tts_lifecycle.py` (9). Suite: 121 groen.
+
+**Manager.py niet aangeraakt** (jullie OOM-taak-terrein).
