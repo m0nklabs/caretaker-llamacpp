@@ -60,3 +60,10 @@ De eerste versie had een `sys.platform == "win32"`-gate en gebruikte `sc start/s
 - **Engine-wrapper (Qwen3-TTS-GGUF, beide hosts):** bindt de HTTP-poort vóór de model-load → `/health` antwoordt 503 "loading" tijdens de koude start (observeerbaar i.p.v. connection-refused); `get_engine()` is nu thread-safe (lock) omdat een vroege POST kan racen met de startup-load.
 - **Pinnen:** 15 TTS-lifecycle-pinnen (incl. VRAM-gate ×3 en de UTF-8-env-pin); suite 128 groen.
 - **Rol in de gateway-config:** `tts.providers: [14700k-local, ai-kvm2-local]` — de Windows-host is TTS-primary (operator-besluit: ai-kvm2 is productie en blijft druk met de 27b; "wat waar primair is, is pure configuratie — de machinerie is overal gelijk").
+
+## 2026-09-16 (laat) — VRAM-gate: wachten óf opgeven, configureerbaar + ensure-lock
+
+- **`CARETAKER_TTS_VRAM_WAIT_SECONDS`** (default 0 = direct opgeven): als alle VRAM bezet is pollt de ensure elke `CARETAKER_TTS_VRAM_POLL_SECONDS` (default 5) tot er ruimte komt; daarna een eerlijke reden ("insufficient VRAM free (… MB < … MB) after Ns wait"). Per host: ai-kvm2 = 120 (drukke productiehost — wacht tot de 27b idle-unload, geef anders op → failover naar Windows); Windows = 0 (zijn gate stopt de llama zelf → directe ruimte).
+- **Ensure-lock (`asyncio.Lock` in tts.py):** een tweede TTS-request tijdens een koude start WACHT op de lock en pakt daarna de healthy fast-path — nooit twee engines naast elkaar op dezelfde GPU. Geconfigureerd gedrag: concurrente requests wachten (of geven op via de guardian's `ensure_timeout_seconds`).
+- **Timeout-aritmetiek (documenteerd in global.settings.yaml):** `ensure_timeout_seconds` ≥ `CARETAKER_TTS_START_TIMEOUT` + `CARETAKER_TTS_VRAM_WAIT_SECONDS` van de traagste host (ai-kvm2: 240 + 120 = 360 → guardian 420). Anders valt een werkende primary stil weg naar failover.
+- **Pinnen:** 19 TTS-lifecycle-pinnen (VRAM-wait ×2 + concurrency ×1 erbij); suite 128 groen. Live: de ensure op de drukke host kwam na ~2 min wachten met `cold_start: true` terug; de guardian-speech via Windows (koude start na idle-stop) 200 in 20,5s.

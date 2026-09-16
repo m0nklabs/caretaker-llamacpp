@@ -273,3 +273,49 @@ async def test_spawn_forces_utf8_io_env(monkeypatch):
     env = spawned[0]["env"]
     assert env["PYTHONIOENCODING"] == "utf-8"
     assert env["PYTHONUTF8"] == "1"
+
+
+async def test_vram_wait_frees_up_and_spawns(monkeypatch):
+    """Tight VRAM + WAIT>0: poll until the memory frees, then spawn."""
+    _patch_env(monkeypatch, CARETAKER_TTS_VRAM_WAIT_SECONDS="10", CARETAKER_TTS_VRAM_POLL_SECONDS="2")
+    free_states = iter([800, 800, 9000])
+
+    async def _free():
+        return next(free_states)
+
+    monkeypatch.setattr(tts_mod, "_gpu_free_mb", _free)
+    _patch_health(monkeypatch, [False, False, False, False, True])
+    _patch_spawn(monkeypatch, _FakeProcess())
+    result = await tts_mod.ensure_tts()
+    assert result["ok"] is True and result["cold_start"] is True
+
+
+async def test_vram_wait_times_out_and_gives_up(monkeypatch):
+    _patch_env(monkeypatch, CARETAKER_TTS_VRAM_WAIT_SECONDS="4", CARETAKER_TTS_VRAM_POLL_SECONDS="2")
+    monkeypatch.setattr(tts_mod, "_gpu_free_mb", AsyncMock(return_value=800))
+    _patch_health(monkeypatch, [False])
+    result = await tts_mod.ensure_tts()
+    assert result["ok"] is False
+    assert "after 4s wait" in result["reason"]
+
+
+async def test_concurrent_ensures_spawn_once(monkeypatch):
+    """A second request during a cold start waits on the ensure lock and takes
+    the healthy fast-path — never a second engine on the same GPU."""
+    _patch_env(monkeypatch)
+    healthy = {"flag": False}
+
+    async def _healthy(timeout_s=3.0):
+        return healthy["flag"]
+
+    monkeypatch.setattr(tts_mod, "_engine_healthy", _healthy)
+
+    async def _spawn(*cmd, cwd=None, stdout=None, stderr=None, env=None):
+        await asyncio.sleep(0.3)  # cold start in flight
+        healthy["flag"] = True
+        return _FakeProcess()
+
+    monkeypatch.setattr(tts_mod.asyncio, "create_subprocess_exec", _spawn)
+    one, two = await asyncio.gather(tts_mod.ensure_tts(), tts_mod.ensure_tts())
+    assert one["ok"] is True and two["ok"] is True
+    assert one.get("cold_start") is True and two.get("already_running") is True

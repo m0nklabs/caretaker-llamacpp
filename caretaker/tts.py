@@ -183,6 +183,17 @@ async def ensure_tts() -> dict:
     if _watcher_task is None:
         _watcher_task = asyncio.create_task(_idle_watcher_loop())
 
+    # Serialize concurrent ensures: a request arriving while a cold start is
+    # in flight WAITS on this lock and then takes the healthy fast-path.  Two
+    # engines must never spawn next to each other on the same GPU.
+    async with _ensure_lock:
+        return await _ensure_locked()
+
+
+_ensure_lock = asyncio.Lock()
+
+
+async def _ensure_locked() -> dict:
     if await _engine_healthy():
         # Could be our child, an engine started elsewhere, or an adopt-after-
         # restart — all fine: the contract is the health endpoint, not the pid.
@@ -210,10 +221,33 @@ async def ensure_tts() -> dict:
             await asyncio.sleep(4)  # let the driver reclaim the memory
             free = await _gpu_free_mb()
         if free is not None and free < min_free:
-            return {
-                "ok": False,
-                "reason": f"insufficient VRAM free ({free} MB < {min_free} MB) and llama-stop is disabled",
-            }
+            # All VRAM busy: WAIT for it to free up (CARETAKER_TTS_VRAM_WAIT_
+            # SECONDS, 0 = give up immediately) or fail with an honest reason.
+            # On a busy host the memory frees when the big model idle-unloads
+            # or another engine stops; the guardian's ensure_timeout_seconds
+            # must cover wait + cold start (see global.settings.yaml).
+            wait_s = int(_env("CARETAKER_TTS_VRAM_WAIT_SECONDS", "0"))
+            poll_s = max(2, int(_env("CARETAKER_TTS_VRAM_POLL_SECONDS", "5")))
+            deadline = time.monotonic() + wait_s
+            while free is not None and free < min_free and time.monotonic() < deadline:
+                logger.info(
+                    "TTS ensure: VRAM busy (%s/%s MB free) — waiting up to %ss",
+                    free, min_free, wait_s,
+                )
+                await asyncio.sleep(min(poll_s, max(1.0, deadline - time.monotonic())))
+                if await _engine_healthy():
+                    _mark_used()
+                    return {"ok": True, "already_running": True}
+                free = await _gpu_free_mb()
+            if free is not None and free < min_free:
+                waited = f" after {wait_s}s wait" if wait_s > 0 else ""
+                return {
+                    "ok": False,
+                    "reason": (
+                        f"insufficient VRAM free ({free} MB < {min_free} MB){waited} — "
+                        "configure CARETAKER_TTS_VRAM_WAIT_SECONDS to wait longer or rely on failover"
+                    ),
+                }
 
     result = await _start_engine()
     if result.get("ok"):
