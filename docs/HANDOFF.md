@@ -37,6 +37,10 @@
 
 **Niet aangepast:** geen code gewijzigd in deze repo (jullie OOM-taak loopt — manager.py onaangetast gelaten).
 
+## 2026-09-16 (UPDATE) — TTS-lifecycle nu platform-agnostisch (operator-principe: providers gedragen zich overal gelijk)
+
+De eerste versie had een `sys.platform == "win32"`-gate en gebruikte `sc start/stop` (NSSM) — dat was een onderscheid dat guardian niet meer maakt. **Herschreven (caretaker/tts.py):** de caretaker spawnt en stopt de engine op ELKE host via `CARETAKER_TTS_COMMAND` (+ `CARETAKER_TTS_CWD`), health-check op `CARETAKER_TTS_URL/health`, idle-watcher stopt het proces. Hetzelfde contract op Linux, Windows of een cloud-GPU-box (RunPod). Op Windows is de NSSM-service `qwen3tts-http` nu DISABLED — het proces is caretaker-eigendom. De engine zelf (HaujetZhao/Qwen3-TTS-GGUF) draait op ai-kvm2 met een lokale llama.cpp-b10621-CUDA-build (libllama.so's in `inference/bin/`) + een graceful-degrade-patch in workers/speaker.py (headless hosts hebben geen audio-device; de HTTP-route speelt nooit lokaal af). LD_LIBRARY_PATH voor cuDNN/cuBLAS uit de pip nvidia-wheels komt via `run_http_server.sh` (de CARETAKER_TTS_COMMAND op Linux).
+
 ## 2026-09-16 — Nieuw: on-demand TTS-engine-lifecycle (guardian-agent, operator-directed)
 
 **Wat:** de operator wilde de `qwen3tts-http`-engine (teams-host :11450, zie guardian journal 2026-09-16) on-demand draaien — VRAM vrij wanneer de audio-route ongebruikt is. Geïmplementeerd in **`caretaker/tts.py` (nieuw, dit repo)** + routes `/tts/ensure`, `/tts/release`, `/tts/status` in server.py (+ GET /status onveranderd gelaten).

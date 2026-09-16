@@ -1,28 +1,34 @@
-"""On-demand TTS engine lifecycle (Windows): start/stop the qwen3tts-http
-engine service so its VRAM is only held while the audio route is in use.
+"""On-demand TTS engine lifecycle — platform-agnostic.
 
-Design (2026-09-16, guardian F6 follow-up — operator request "ondemand, zodat
-mijn VRAM niet gebruikt wordt als de audio route niet gebruikt wordt"):
+The caretaker OWNS the TTS engine process on every host the same way it owns
+llama-server: it spawns it from ``CARETAKER_TTS_COMMAND`` (working dir
+``CARETAKER_TTS_CWD``), health-checks ``CARETAKER_TTS_URL/health``, and stops
+it when the route goes idle. There is deliberately NO platform gate: the same
+code runs on Linux, Windows, or a cloud GPU box (RunPod et al.) — the
+caretaker is a provider, and providers behave identically everywhere
+(operator principle, 2026-09-16).
 
-- The gateway calls ``POST /tts/ensure`` before every engine forward; the call
-  is idempotent (health-check first) and refreshes the idle timer.
-- A background watcher stops the service after ``CARETAKER_TTS_IDLE_SECONDS``
-  without an ensure (0 disables the watcher).
-- The engine truth is its ``/health`` endpoint, not the SCM state: a service
-  can be "running" while the engine is still loading.
-- Non-Windows hosts are inert: the routes report ``disabled`` so this module
-  ships unchanged with the Linux caretaker.
+Contract (identical on every host):
+- ``POST /tts/ensure``  — idempotent: health-check first; spawn when down;
+  refresh the idle timer. Never raises; returns ``{"ok": bool, ...}``.
+- ``POST /tts/release`` — stop the engine process (frees its VRAM); idempotent.
+- ``GET  /tts/status``  — lifecycle state for the gateway/operator.
+
+An idle watcher stops the engine after ``CARETAKER_TTS_IDLE_SECONDS`` without
+an ensure (0 disables). The engine is the truth: a healthy ``/health`` beats
+any bookkeeping state. When the caretaker itself restarts, its child dies with
+it (same semantics as llama-server) and the next ensure re-spawns.
 
 Configuration (env, read at call time):
-- ``CARETAKER_TTS_ENABLED``      (default "1"; also forced off off-Windows)
-- ``CARETAKER_TTS_SERVICE``      service name (default "qwen3tts-http")
-- ``CARETAKER_TTS_URL``          engine base URL (default http://127.0.0.1:11450)
-- ``CARETAKER_TTS_IDLE_SECONDS`` idle timer (default 600; 0 = never stop)
+- ``CARETAKER_TTS_ENABLED``       default "1"
+- ``CARETAKER_TTS_URL``           engine base URL (default http://127.0.0.1:11450)
+- ``CARETAKER_TTS_COMMAND``       command line to spawn the engine (REQUIRED
+                                  for cold start; without it ensure reports
+                                  "not configured" — the engine was meant to
+                                  be managed elsewhere)
+- ``CARETAKER_TTS_CWD``           working directory for the spawned command
+- ``CARETAKER_TTS_IDLE_SECONDS``  idle budget (default 600; 0 = never stop)
 - ``CARETAKER_TTS_START_TIMEOUT`` cold-start health wait (default 90 s)
-
-Service control uses ``sc start/stop`` (LocalSystem has SCM rights; NSSM
-performs the actual process supervision — a service stop is a clean stop and
-does NOT trigger the NSSM restart-on-exit path).
 """
 
 from __future__ import annotations
@@ -30,7 +36,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sys
+import shlex
+import subprocess
 import time
 
 import httpx
@@ -38,6 +45,7 @@ import httpx
 logger = logging.getLogger("caretaker.tts")
 
 _last_use_monotonic: float | None = None
+_process: asyncio.subprocess.Process | None = None
 _watcher_task: asyncio.Task | None = None
 
 
@@ -45,51 +53,89 @@ def _env(name: str, default: str) -> str:
     return os.getenv(name, default)
 
 
+def _engine_url() -> str:
+    return _env("CARETAKER_TTS_URL", "http://127.0.0.1:11450").rstrip("/")
+
+
 def tts_enabled() -> bool:
-    """TTS lifecycle is a Windows feature; off-Windows hosts report disabled."""
-    return sys.platform == "win32" and _env("CARETAKER_TTS_ENABLED", "1") == "1"
+    """TTS lifecycle is a plain provider capability: enabled by default on
+    every host (the command decides whether cold-start is possible)."""
+    return _env("CARETAKER_TTS_ENABLED", "1") == "1"
 
 
 def tts_status() -> dict:
     """Report the TTS lifecycle state (for GET /tts/status and GET /status)."""
-    idle_seconds = int(_env("CARETAKER_TTS_IDLE_SECONDS", "600"))
-    running: bool | None = None
-    if tts_enabled() and _last_use_monotonic is not None:
-        running = None  # unknown until probed; status stays cheap and sync
     return {
         "enabled": tts_enabled(),
-        "service": _env("CARETAKER_TTS_SERVICE", "qwen3tts-http"),
-        "url": _env("CARETAKER_TTS_URL", "http://127.0.0.1:11450"),
-        "idle_seconds": idle_seconds,
+        "url": _engine_url(),
+        "command_configured": bool(_env("CARETAKER_TTS_COMMAND", "").strip()),
+        "idle_seconds": int(_env("CARETAKER_TTS_IDLE_SECONDS", "600")),
         "last_use_epoch": (
             round(time.time() - (time.monotonic() - _last_use_monotonic), 1)
             if _last_use_monotonic is not None
             else None
         ),
-        "running": running,
+        "child_pid": _process.pid if _process is not None and _process.returncode is None else None,
     }
 
 
 async def _engine_healthy(timeout_s: float = 3.0) -> bool:
-    url = _env("CARETAKER_TTS_URL", "http://127.0.0.1:11450").rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.get(f"{url}/health")
+            resp = await client.get(f"{_engine_url()}/health")
             return resp.status_code == 200
     except httpx.HTTPError:
         return False
 
 
-async def _service_control(action: str) -> tuple[int, str]:
-    """Run ``sc <action> <service>``; returns (returncode, stdout)."""
-    service = _env("CARETAKER_TTS_SERVICE", "qwen3tts-http")
-    proc = await asyncio.create_subprocess_exec(
-        "sc", action, service,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    out, _ = await proc.communicate()
-    return proc.returncode or 0, out.decode(errors="replace").strip()
+def _spawn_command() -> list[str] | None:
+    cmd = _env("CARETAKER_TTS_COMMAND", "").strip()
+    if not cmd:
+        return None
+    return shlex.split(cmd, posix=os.name != "nt")
+
+
+async def _start_engine() -> dict:
+    """Spawn the engine process and wait for /health. Returns the result dict."""
+    global _process
+    cmd = _spawn_command()
+    if cmd is None:
+        return {"ok": False, "reason": "CARETAKER_TTS_COMMAND not configured"}
+
+    # A previous child may still be winding down; reap it so the port frees.
+    if _process is not None and _process.returncode is None:
+        try:
+            _process.terminate()
+            await asyncio.wait_for(_process.wait(), timeout=10)
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+
+    cwd = _env("CARETAKER_TTS_CWD", "") or None
+    log_path = _env("CARETAKER_TTS_LOG", "")
+    log_fh = open(log_path, "ab") if log_path else subprocess.DEVNULL
+    try:
+        _process = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd, stdout=log_fh, stderr=subprocess.STDOUT
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("TTS engine spawn failed (%s): %r", cmd, exc)
+        return {"ok": False, "reason": f"spawn failed: {exc}"}
+
+    start_timeout = float(_env("CARETAKER_TTS_START_TIMEOUT", "90"))
+    deadline = time.monotonic() + start_timeout
+    while time.monotonic() < deadline:
+        if _process.returncode is not None:
+            logger.warning(
+                "TTS engine exited during startup (rc=%s) — see CARETAKER_TTS_LOG",
+                _process.returncode,
+            )
+            return {"ok": False, "reason": f"engine exited during startup (rc={_process.returncode})"}
+        if await _engine_healthy():
+            logger.info("TTS engine started and healthy (pid %s)", _process.pid)
+            return {"ok": True, "already_running": False, "cold_start": True, "pid": _process.pid}
+        await asyncio.sleep(2)
+    logger.warning("TTS engine not healthy within %.0fs after spawn", start_timeout)
+    return {"ok": False, "reason": f"engine not healthy within {start_timeout:.0f}s"}
 
 
 def _mark_used() -> None:
@@ -98,57 +144,58 @@ def _mark_used() -> None:
 
 
 async def ensure_tts() -> dict:
-    """Idempotent: make sure the engine answers /health, refresh the idle timer.
-
-    Returns ``{"ok": bool, "already_running": bool, ...}``; never raises —
-    the gateway treats ok=False as a failed attempt.
-    """
+    """Idempotent: make sure the engine answers /health, refresh the idle timer."""
     global _watcher_task
     if not tts_enabled():
-        return {"ok": False, "reason": "tts lifecycle disabled (off-Windows or CARETAKER_TTS_ENABLED=0)"}
+        return {"ok": False, "reason": "CARETAKER_TTS_ENABLED=0"}
     if _watcher_task is None:
         _watcher_task = asyncio.create_task(_idle_watcher_loop())
 
     if await _engine_healthy():
+        # Could be our child, an engine started elsewhere, or an adopt-after-
+        # restart — all fine: the contract is the health endpoint, not the pid.
         _mark_used()
         return {"ok": True, "already_running": True}
 
-    start_timeout = float(_env("CARETAKER_TTS_START_TIMEOUT", "90"))
-    rc, out = await _service_control("start")
-    # A non-zero rc may mean "already starting"; the health poll decides.
-    if rc != 0 and "1056" not in out and "already running" not in out.lower():
-        logger.warning("TTS service start failed (rc=%s): %s", rc, out[:200])
-        return {"ok": False, "reason": f"service start failed (rc={rc})", "detail": out[:200]}
-
-    deadline = time.monotonic() + start_timeout
-    while time.monotonic() < deadline:
-        if await _engine_healthy():
-            _mark_used()
-            logger.info("TTS engine started and healthy (cold start <= %.0fs)", start_timeout)
-            return {"ok": True, "already_running": False, "cold_start": True}
-        await asyncio.sleep(2)
-    logger.warning("TTS engine not healthy within %.0fs after service start", start_timeout)
-    return {"ok": False, "reason": f"engine not healthy within {start_timeout:.0f}s"}
+    result = await _start_engine()
+    if result.get("ok"):
+        _mark_used()
+    return result
 
 
 async def release_tts() -> dict:
-    """Stop the engine service (VRAM freed); idempotent."""
+    """Stop the engine process (frees its VRAM); idempotent."""
+    global _process
     if not tts_enabled():
-        return {"ok": False, "reason": "tts lifecycle disabled"}
+        return {"ok": False, "reason": "CARETAKER_TTS_ENABLED=0"}
     if not await _engine_healthy():
         return {"ok": True, "already_stopped": True}
-    rc, out = await _service_control("stop")
-    if rc != 0 and "1062" not in out and "not started" not in out.lower():
-        logger.warning("TTS service stop failed (rc=%s): %s", rc, out[:200])
-        return {"ok": False, "reason": f"service stop failed (rc={rc})", "detail": out[:200]}
-    # Give the engine a moment to actually drop (health goes stale-fast).
-    deadline = time.monotonic() + 30
+
+    # An engine we did not spawn (e.g. started manually): still stop the
+    # process tree the same way — on this host the caretaker owns the port.
+    if _process is not None and _process.returncode is None:
+        try:
+            _process.terminate()
+            await asyncio.wait_for(_process.wait(), timeout=15)
+        except Exception:  # noqa: BLE001 — escalate to kill
+            try:
+                _process.kill()
+            except ProcessLookupError:
+                pass
+    else:
+        # Not our child (adopted): best-effort kill by port owner is out of
+        # scope — report what happened so the caller knows the engine may
+        # still be up under someone else's supervision.
+        logger.warning("TTS release: engine healthy but not a caretaker child — cannot stop")
+        return {"ok": False, "reason": "engine not spawned by this caretaker (no child handle)"}
+
+    deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if not await _engine_healthy():
             logger.info("TTS engine stopped (VRAM freed)")
             return {"ok": True, "stopped": True}
-        await asyncio.sleep(2)
-    return {"ok": False, "reason": "engine still healthy 30s after stop"}
+        await asyncio.sleep(1)
+    return {"ok": False, "reason": "engine still healthy 15s after stop"}
 
 
 async def _idle_watcher_loop() -> None:
