@@ -227,16 +227,12 @@ async def test_vram_gate_spawns_when_enough_free(monkeypatch):
     assert result["ok"] is True and result["cold_start"] is True
 
 
-async def test_vram_gate_stops_llama_when_tight(monkeypatch):
-    """Tight VRAM + STOP_LLAMA=1: the caretaker's own llama is unloaded first,
-    then the free re-check passes and the engine spawns."""
+async def test_tts_first_unloads_then_spawns(monkeypatch):
+    """STOP_LLAMA=1 unloads the caretaker's own llama BEFORE the VRAM check
+    (deterministic TTS-first); with the GPU freed the check passes and the
+    engine spawns."""
     _patch_env(monkeypatch, CARETAKER_TTS_MIN_FREE_MB="2500", CARETAKER_TTS_STOP_LLAMA="1")
-    free_states = iter([800, 9500])  # tight → after llama unload → enough
-
-    async def _free():
-        return next(free_states)
-
-    monkeypatch.setattr(tts_mod, "_gpu_free_mb", _free)
+    monkeypatch.setattr(tts_mod, "_gpu_free_mb", AsyncMock(return_value=9500))
     _patch_health(monkeypatch, [False, False, True])
     _patch_spawn(monkeypatch, _FakeProcess())
     unloaded = []
@@ -319,3 +315,24 @@ async def test_concurrent_ensures_spawn_once(monkeypatch):
     one, two = await asyncio.gather(tts_mod.ensure_tts(), tts_mod.ensure_tts())
     assert one["ok"] is True and two["ok"] is True
     assert one.get("cold_start") is True and two.get("already_running") is True
+
+
+async def test_tts_first_host_yields_llama_even_with_vram_plenty(monkeypatch):
+    """STOP_LLAMA=1 means deterministic TTS-first: the caretaker's llama-server
+    unloads whenever the engine must start — not only when VRAM happens to be
+    tight.  A borderline 2.3GB-free host must never squeeze the TTS next to a
+    9GB llama (fragile DML init)."""
+    _patch_env(monkeypatch, CARETAKER_TTS_STOP_LLAMA="1")
+    monkeypatch.setattr(tts_mod, "_gpu_free_mb", AsyncMock(return_value=9000))
+    _patch_health(monkeypatch, [False, False, True])
+    _patch_spawn(monkeypatch, _FakeProcess())
+    unloaded = []
+
+    class _Mgr:
+        async def unload(self):
+            unloaded.append(True)
+
+    tts_mod.init(lambda: _Mgr())
+    result = await tts_mod.ensure_tts()
+    assert result["ok"] is True, result
+    assert unloaded == [1]

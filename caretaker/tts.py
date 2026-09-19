@@ -201,25 +201,22 @@ async def _ensure_locked() -> dict:
         return {"ok": True, "already_running": True}
 
     # VRAM gate: the engine needs ~2 GB.  On hosts where the caretaker also
-    # runs llama-server, both processes compete for the same GPU — when free
-    # memory is below the budget and the operator enabled it, the caretaker
-    # stops ITS OWN llama-server first (it owns that lifecycle too) so the TTS
-    # cold start does not OOM.  With the coordination disabled the ensure
-    # fails with an honest reason instead of a silent GPU fight.
+    # runs llama-server, both processes compete for the same GPU.
+    # CARETAKER_TTS_STOP_LLAMA=1 means TTS-first, DETERMINISTICALLY: whenever
+    # the engine must start, the caretaker's own llama-server yields (unload
+    # is idempotent) — chat on such a host falls back via the failover group.
+    # With the coordination disabled the VRAM budget below still applies and
+    # the ensure fails with an honest reason instead of a silent GPU fight.
     min_free = int(_env("CARETAKER_TTS_MIN_FREE_MB", "2500"))
+    if _env("CARETAKER_TTS_STOP_LLAMA", "0") == "1" and _manager_getter is not None:
+        logger.info("TTS ensure: TTS-first host — unloading the caretaker's llama-server")
+        try:
+            await _manager_getter().unload()
+        except Exception as exc:  # noqa: BLE001 — fall through to the VRAM check
+            logger.warning("TTS ensure: llama unload failed: %r", exc)
+        await asyncio.sleep(4)  # let the driver reclaim the memory
     free = await _gpu_free_mb()
     if free is not None and free < min_free:
-        if _env("CARETAKER_TTS_STOP_LLAMA", "0") == "1" and _manager_getter is not None:
-            logger.info(
-                "TTS ensure: only %s MiB free (need %s) — unloading the caretaker's llama-server first",
-                free, min_free,
-            )
-            try:
-                await _manager_getter().unload()
-            except Exception as exc:  # noqa: BLE001 — fall through to the re-check
-                logger.warning("TTS ensure: llama unload failed: %r", exc)
-            await asyncio.sleep(4)  # let the driver reclaim the memory
-            free = await _gpu_free_mb()
         if free is not None and free < min_free:
             # All VRAM busy: WAIT for it to free up (CARETAKER_TTS_VRAM_WAIT_
             # SECONDS, 0 = give up immediately) or fail with an honest reason.
