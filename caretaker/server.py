@@ -29,6 +29,10 @@ from .tts import tts_status as _tts_status
 from .tts import ensure_tts as _tts_ensure
 from .tts import release_tts as _tts_release
 from .tts import init as _tts_init
+from .stt import stt_status as _stt_status
+from .stt import ensure_stt as _stt_ensure
+from .stt import release_stt as _stt_release
+from .stt import init as _stt_init
 from .vram import VramLimitExceededError
 
 CARETAKER_KEY_ENV = "CARETAKER_KEY"
@@ -101,9 +105,11 @@ def _manager() -> Caretaker:
     return _manager_instance
 
 
-# Give the TTS lifecycle lazy access to the manager singleton so its ensure
-# can coordinate VRAM with the caretaker's own llama-server (see tts.py).
+# Give the TTS and STT lifecycles lazy access to the manager singleton so
+# their ensures can coordinate VRAM with the caretaker's own llama-server
+# (see tts.py / stt.py).
 _tts_init(lambda: _manager())
+_stt_init(lambda: _manager())
 
 
 def _invalid_request(message: str) -> JSONResponse:
@@ -132,10 +138,29 @@ async def tts_release() -> dict:
     return await _tts_release()
 
 
+@app.post("/stt/ensure", dependencies=[Depends(require_caretaker_key)])
+async def tts_ensure() -> dict:
+    """Idempotent: make sure the TTS engine is healthy and refresh its idle timer."""
+    return await _stt_ensure()
+
+
+
+@app.post("/stt/release", dependencies=[Depends(require_caretaker_key)])
+async def tts_release() -> dict:
+    """Stop the TTS engine service (frees its VRAM)."""
+    return await _stt_release()
+
+
 @app.get("/tts/status", dependencies=[Depends(require_caretaker_key)])
 async def tts_status_route() -> dict:
     """TTS lifecycle state (service, idle timer, last use)."""
     return _tts_status()
+
+
+@app.get("/stt/status", dependencies=[Depends(require_caretaker_key)])
+async def tts_status_route() -> dict:
+    """TTS lifecycle state (service, idle timer, last use)."""
+    return _stt_status()
 
 
 @app.post("/ensure", dependencies=[Depends(require_caretaker_key)])
