@@ -45,6 +45,7 @@ import time
 from typing import Any
 
 import httpx
+from urllib.parse import urlparse
 
 from . import config as config_mod
 
@@ -156,19 +157,19 @@ def mark_used() -> None:
     _last_activity_monotonic = time.monotonic()
 
 
-def status() -> dict[str, Any]:
-    """Control-API status surface, mirroring the TTS/STT status shapes."""
-    queue = None
-    up = None
-    try:
-        # Best-effort synchronous probe for the status route (loop-independent).
-        import httpx as _httpx
+async def astatus() -> dict[str, Any]:
+    """Control-API status surface, mirroring the TTS/STT status shapes.
 
-        with _httpx.Client(timeout=3.0) as client:
-            resp = client.get(f"{comfy_url()}/queue")
-            up = resp.status_code == 200
-            if up and isinstance(resp.json(), dict):
-                queue = resp.json()
+    Fully async: the queue probe must never block the event loop (the wake
+    proxy and the idle watcher share it)."""
+    up = False
+    queue: dict[str, Any] | None = None
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{comfy_url()}/queue")
+        up = resp.status_code == 200
+        if up and isinstance(resp.json(), dict):
+            queue = resp.json()
     except Exception:  # noqa: BLE001 — down is a valid status
         up = False
     running = len((queue or {}).get("queue_running", []))
@@ -256,7 +257,9 @@ async def _handle_client(
 ) -> None:
     """Wake Comfy on an incoming connection, then pump bytes both ways."""
     mark_used()
-    internal_host, _, internal_port = comfy_url().partition("://")[2].partition(":")
+    parsed = urlparse(comfy_url())
+    internal_host = parsed.hostname or "127.0.0.1"
+    internal_port = parsed.port or 8188  # Comfy's documented default port
     if await _queue_snapshot() is None:
         logger.info("Comfy wake proxy: connection on the public port — starting Comfy")
         if not await start_comfy():

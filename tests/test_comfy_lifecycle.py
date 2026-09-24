@@ -154,10 +154,29 @@ async def test_proxy_wake_failure_closes_connection(monkeypatch):
 # --- status surface ---
 
 
-def test_status_reports_shape(monkeypatch):
+@pytest.mark.asyncio
+async def test_status_reports_shape(monkeypatch):
     _env(monkeypatch, CARETAKER_COMFY_PROXY_PORT="18125")
-    status = comfy_mod.status()
+
+    async def snap():
+        return None  # comfy down — the probe must still resolve
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+    status = await comfy_mod.astatus()
     assert status["idle_seconds"] == 300
     assert status["proxy_port"] == 18125
-    assert status["up"] is None or isinstance(status["up"], bool)
+    assert status["up"] is False
     assert "start_command" in status and "stop_command" in status
+
+
+@pytest.mark.asyncio
+async def test_proxy_parses_url_without_explicit_port(monkeypatch):
+    """A configured URL without a port must not crash the proxy handler —
+    it falls back to Comfy's documented default port."""
+    _env(monkeypatch)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", "http://comfy.internal")  # no port
+    from urllib.parse import urlparse
+
+    parsed = urlparse(comfy_mod.comfy_url())
+    assert parsed.port is None  # the handler applies the 8188 fallback
+    assert parsed.hostname == "comfy.internal"

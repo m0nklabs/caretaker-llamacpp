@@ -133,7 +133,7 @@ def _invalid_request(message: str) -> JSONResponse:
 @app.get("/comfy/status", dependencies=[Depends(require_caretaker_key)])
 async def comfy_status() -> dict:
     """Comfy lifecycle status (idle budget, queue, proxy, commands)."""
-    return _comfy.status()
+    return await _comfy.astatus()
 
 
 @app.post("/comfy/ensure", dependencies=[Depends(require_caretaker_key)])
@@ -142,7 +142,7 @@ async def comfy_ensure() -> dict:
     ok = await _comfy.start_comfy()
     if not ok:
         raise HTTPException(status_code=503, detail={"error": "comfy_start_failed"})
-    return {"ok": True, "status": _comfy.status()}
+    return {"ok": True, "status": await _comfy.astatus()}
 
 
 @app.post("/comfy/release", dependencies=[Depends(require_caretaker_key)])
@@ -151,7 +151,7 @@ async def comfy_release() -> dict:
     ok = await _comfy.stop_comfy()
     if not ok:
         raise HTTPException(status_code=503, detail={"error": "comfy_stop_failed"})
-    return {"ok": True, "status": _comfy.status()}
+    return {"ok": True, "status": await _comfy.astatus()}
 
 
 @app.get("/status", dependencies=[Depends(require_caretaker_key)])
