@@ -260,18 +260,26 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
             pass
 
 
+def upstream_target() -> tuple[str, int]:
+    """The TCP forward target for the wake proxy, as (host, port).
+
+    ``CARETAKER_COMFY_INTERNAL_URL`` (the documented "real Comfy URL behind
+    the proxy") wins when set; otherwise the probe URL is the upstream (the
+    default single-URL setup, where probe and upstream coincide). A port-less
+    URL falls back to the module default 8189 — never Comfy's stock 8188,
+    because this deployment moves Comfy off the public port."""
+    raw = _env("CARETAKER_COMFY_INTERNAL_URL", "").strip() or comfy_url()
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    return (parsed.hostname or "127.0.0.1", parsed.port or 8189)
+
+
 async def _handle_client(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
 ) -> None:
     """Wake Comfy on an incoming connection, then pump bytes both ways."""
     mark_used()
-    parsed = urlparse(comfy_url())
-    internal_host = parsed.hostname or "127.0.0.1"
-    # One internal-port default everywhere (see CARETAKER_COMFY_INTERNAL_URL):
-    # a port-less configured URL falls back to the module default, never to
-    # Comfy's stock 8188 — this deployment moves Comfy off the public port.
-    internal_port = parsed.port or 8189
+    internal_host, internal_port = upstream_target()
     if await _queue_snapshot() is None:
         logger.info("Comfy wake proxy: connection on the public port — starting Comfy")
         if not await start_comfy():

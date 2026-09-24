@@ -222,10 +222,18 @@ def test_portless_url_falls_back_to_module_default(monkeypatch):
     8189 (the module/deployment default), never Comfy's stock 8188."""
     _env(monkeypatch)
     monkeypatch.setenv("CARETAKER_COMFY_URL", "http://comfy.internal")  # no port
-    from urllib.parse import urlparse
+    assert comfy_mod.upstream_target() == ("comfy.internal", 8189)
 
-    parsed = urlparse(comfy_mod.comfy_url())
-    assert parsed.port is None
-    assert parsed.hostname == "comfy.internal"
-    # the handler applies the 8189 fallback (mirrors the handler's expression)
-    assert parsed.port or 8189 == 8189
+
+def test_probe_and_upstream_may_split(monkeypatch):
+    """CARETAKER_COMFY_INTERNAL_URL is the real forward target; the probe URL
+    only drives health/activity checks. Split configs forward to the internal
+    URL, not to the probe endpoint."""
+    _env(monkeypatch)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", "http://probe.internal:9000")
+    monkeypatch.setenv("CARETAKER_COMFY_INTERNAL_URL", "http://127.0.0.1:8189")
+    assert comfy_mod.upstream_target() == ("127.0.0.1", 8189)
+    assert comfy_mod.comfy_url() == "http://probe.internal:9000"
+    # default single-URL setup: the probe IS the upstream
+    monkeypatch.delenv("CARETAKER_COMFY_INTERNAL_URL")
+    assert comfy_mod.upstream_target() == ("probe.internal", 9000)
