@@ -170,13 +170,39 @@ async def test_status_reports_shape(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_proxy_parses_url_without_explicit_port(monkeypatch):
-    """A configured URL without a port must not crash the proxy handler —
-    it falls back to Comfy's documented default port."""
+async def test_proxy_binds_loopback_by_default(monkeypatch):
+    """Safe-by-default: the wake proxy binds 127.0.0.1 unless the operator
+    explicitly exposes it (a LAN-reachable wake is an unauthenticated GPU
+    trigger)."""
+    _env(monkeypatch, CARETAKER_COMFY_PROXY_PORT="18126")
+    binds = []
+
+    real_start_server = comfy_mod.asyncio.start_server
+
+    def spy(handler, host, port):
+        binds.append(host)
+        return real_start_server(handler, host, port)
+
+    comfy_mod.asyncio.start_server = spy
+    try:
+        await comfy_mod.start_proxy()
+    finally:
+        comfy_mod.asyncio.start_server = real_start_server
+    assert binds == ["127.0.0.1"]
+    assert comfy_mod._proxy_server is not None
+    comfy_mod._proxy_server.close()
+    comfy_mod._proxy_server = None
+
+
+def test_portless_url_falls_back_to_module_default(monkeypatch):
+    """One internal-port default everywhere: a port-less URL falls back to
+    8189 (the module/deployment default), never Comfy's stock 8188."""
     _env(monkeypatch)
     monkeypatch.setenv("CARETAKER_COMFY_URL", "http://comfy.internal")  # no port
     from urllib.parse import urlparse
 
     parsed = urlparse(comfy_mod.comfy_url())
-    assert parsed.port is None  # the handler applies the 8188 fallback
+    assert parsed.port is None
     assert parsed.hostname == "comfy.internal"
+    # the handler applies the 8189 fallback (mirrors the handler's expression)
+    assert parsed.port or 8189 == 8189

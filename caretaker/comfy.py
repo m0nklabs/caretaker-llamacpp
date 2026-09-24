@@ -29,6 +29,12 @@ Config (env, mirrors the TTS/STT module idiom):
 - ``CARETAKER_COMFY_START_COMMAND`` shell command that starts Comfy
 - ``CARETAKER_COMFY_STOP_COMMAND``  shell command that stops Comfy
 - ``CARETAKER_COMFY_PROXY_PORT``    public listen port (default 0 = proxy off)
+- ``CARETAKER_COMFY_PROXY_BIND``    listen interface (default 127.0.0.1 — the
+                                    on-demand wake is local-only unless the
+                                    operator explicitly exposes it; binding
+                                    0.0.0.0 makes GPU-wake reachable LAN-wide
+                                    without credentials, mirroring Comfy's own
+                                    unauthenticated surface)
 - ``CARETAKER_COMFY_INTERNAL_URL``  the real Comfy URL behind the proxy
 - ``CARETAKER_COMFY_WAKE_TIMEOUT``  max seconds to wait for a cold start
 
@@ -259,7 +265,10 @@ async def _handle_client(
     mark_used()
     parsed = urlparse(comfy_url())
     internal_host = parsed.hostname or "127.0.0.1"
-    internal_port = parsed.port or 8188  # Comfy's documented default port
+    # One internal-port default everywhere (see CARETAKER_COMFY_INTERNAL_URL):
+    # a port-less configured URL falls back to the module default, never to
+    # Comfy's stock 8188 — this deployment moves Comfy off the public port.
+    internal_port = parsed.port or 8189
     if await _queue_snapshot() is None:
         logger.info("Comfy wake proxy: connection on the public port — starting Comfy")
         if not await start_comfy():
@@ -284,8 +293,12 @@ async def start_proxy() -> None:
     port = int(_env("CARETAKER_COMFY_PROXY_PORT", "0") or 0)
     if not port or _proxy_server is not None:
         return
-    _proxy_server = await asyncio.start_server(_handle_client, "0.0.0.0", port)
-    logger.info("🎧 Comfy wake proxy listening on :%s -> %s", port, comfy_url())
+    # Safe-by-default bind: 127.0.0.1 unless the operator explicitly exposes
+    # the wake surface (a LAN-reachable proxy would let any host trigger the
+    # start command without credentials).
+    bind = _env("CARETAKER_COMFY_PROXY_BIND", "127.0.0.1")
+    _proxy_server = await asyncio.start_server(_handle_client, bind, port)
+    logger.info("🎧 Comfy wake proxy listening on %s:%s -> %s", bind, port, comfy_url())
 
 
 async def init_async() -> None:
