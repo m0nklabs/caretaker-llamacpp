@@ -175,7 +175,28 @@ async def test_proxy_wake_failure_closes_connection(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_malformed_env_falls_back_to_defaults(monkeypatch):
+async def test_open_connection_blocks_idle_stop(monkeypatch):
+    """A client holding an open proxied session (web UI / websocket) counts as
+    activity — the backend must not be stopped underneath it."""
+    _env(monkeypatch, CARETAKER_COMFY_IDLE_SECONDS="5")
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}  # queue empty
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+    stops = []
+
+    async def ok_stop():
+        stops.append(1)
+        return True
+
+    monkeypatch.setattr(comfy_mod, "stop_comfy", ok_stop)
+    comfy_mod._last_activity_monotonic = time.monotonic() - 999
+    comfy_mod._active_connections = 1  # a client is connected
+    assert await comfy_mod._idle_watcher_tick() == "busy"
+    assert stops == []
+
+
+def test_malformed_env_falls_back_to_defaults(monkeypatch):
     """A garbage env value must never abort boot or wedge the watcher —
     every integer env read falls back to its default."""
     _env(

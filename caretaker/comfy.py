@@ -62,6 +62,10 @@ _watcher_task: asyncio.Task | None = None
 _proxy_server: asyncio.AbstractServer | None = None
 _start_lock = asyncio.Lock()
 _enabled = False
+# Open proxied connections count as activity: a client holding a session
+# (Comfy web UI, a long-lived websocket) must not have its backend stopped
+# underneath it just because the queue happens to be empty.
+_active_connections = 0
 
 
 def _env(name: str, default: str) -> str:
@@ -227,7 +231,11 @@ async def _idle_watcher_tick() -> str:
         # Comfy down — nothing to release; keep the clock parked.
         _last_activity_monotonic = None
         return "down"
-    busy = bool(snapshot.get("queue_running") or snapshot.get("queue_pending"))
+    busy = bool(
+        snapshot.get("queue_running")
+        or snapshot.get("queue_pending")
+        or _active_connections > 0
+    )
     if busy:
         _last_activity_monotonic = time.monotonic()
         return "busy"
@@ -290,7 +298,19 @@ async def _handle_client(
     client_writer: asyncio.StreamWriter,
 ) -> None:
     """Wake Comfy on an incoming connection, then pump bytes both ways."""
+    global _active_connections
     mark_used()
+    _active_connections += 1
+    try:
+        await _handle_client_inner(client_reader, client_writer)
+    finally:
+        _active_connections -= 1
+
+
+async def _handle_client_inner(
+    client_reader: asyncio.StreamReader,
+    client_writer: asyncio.StreamWriter,
+) -> None:
     internal_host, internal_port = upstream_target()
     if await _queue_snapshot() is None:
         logger.info("Comfy wake proxy: connection on the public port — starting Comfy")
