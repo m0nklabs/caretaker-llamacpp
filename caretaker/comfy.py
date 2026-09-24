@@ -37,6 +37,10 @@ Config (env, mirrors the TTS/STT module idiom):
                                     unauthenticated surface)
 - ``CARETAKER_COMFY_INTERNAL_URL``  the real Comfy URL behind the proxy
 - ``CARETAKER_COMFY_WAKE_TIMEOUT``  max seconds to wait for a cold start
+- ``CARETAKER_COMFY_CONN_IDLE_TIMEOUT``  per-connection silence budget before
+                                    the proxy closes it (default 300; 0 =
+                                    never) — an abandoned client must not pin
+                                    the idle release forever
 
 Mirrors the TTS/STT module contract: ``init()`` from server.py, a 30 s
 exception-proof watcher loop, and a ``status()`` for the control API.
@@ -267,10 +271,26 @@ async def _idle_watcher_loop() -> None:
 
 
 async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Pump bytes one direction; give up after connection silence.
+
+    A peer that vanishes without a FIN (dropped websocket, hung tab) would
+    otherwise pin ``_active_connections`` up forever and defeat the idle
+    release — so a connection silent for
+    ``CARETAKER_COMFY_CONN_IDLE_TIMEOUT`` seconds (default 300; 0 = never) is
+    closed from our side. Comfy's own ws client reconnects transparently."""
+    conn_idle = _env_int("CARETAKER_COMFY_CONN_IDLE_TIMEOUT", 300)
     try:
-        while chunk := await reader.read(65536):
+        while True:
+            if conn_idle > 0:
+                chunk = await asyncio.wait_for(reader.read(65536), timeout=conn_idle)
+            else:
+                chunk = await reader.read(65536)
+            if not chunk:
+                break
             writer.write(chunk)
             await writer.drain()
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.info("Comfy proxy: connection silent for %ss — releasing", conn_idle)
     except Exception:  # noqa: BLE001 — a broken pipe on either side is normal
         pass
     finally:

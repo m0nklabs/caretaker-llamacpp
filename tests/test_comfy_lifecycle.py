@@ -175,6 +175,35 @@ async def test_proxy_wake_failure_closes_connection(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_silent_connection_times_out_and_releases(monkeypatch):
+    """An abandoned connection (no bytes, no FIN) must not pin the idle
+    release forever — the pipe closes after the silence budget."""
+    _env(monkeypatch)
+    monkeypatch.setenv("CARETAKER_COMFY_CONN_IDLE_TIMEOUT", "1")
+    comfy_mod._active_connections = 1
+    async def black_hole(reader, writer):
+        await asyncio.sleep(60)  # holds the connection open, never sends
+
+    server = await asyncio.start_server(black_hole, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client_reader, client_writer = await asyncio.open_connection("127.0.0.1", port)
+    upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", port)
+
+    async def dead_pipe():
+        await comfy_mod._pipe(upstream_reader, upstream_writer)
+
+    started = time.monotonic()
+    await asyncio.wait_for(dead_pipe(), timeout=5)  # must END, not hang
+    elapsed = time.monotonic() - started
+    assert 0.9 <= elapsed < 4.5  # released after the ~1s silence budget
+    assert upstream_writer.transport.is_closing()
+    client_writer.close()
+    server.close()
+    upstream_writer.close()
+    comfy_mod._active_connections = 0
+
+
+@pytest.mark.asyncio
 async def test_open_connection_blocks_idle_stop(monkeypatch):
     """A client holding an open proxied session (web UI / websocket) counts as
     activity — the backend must not be stopped underneath it."""
