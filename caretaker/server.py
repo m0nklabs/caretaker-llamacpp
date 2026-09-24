@@ -21,6 +21,8 @@ import hmac
 import os
 from typing import Annotated
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
@@ -34,10 +36,19 @@ from .stt import ensure_stt as _stt_ensure
 from .stt import release_stt as _stt_release
 from .stt import init as _stt_init
 from .vram import VramLimitExceededError
+from . import comfy as _comfy
 
 CARETAKER_KEY_ENV = "CARETAKER_KEY"
 
-app = FastAPI(title="caretaker", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Arm the Comfy idle watcher + wake proxy at startup (config-gated;
+    no-ops when the Comfy keys are unset)."""
+    await _comfy.init_async()
+    yield
+
+
+app = FastAPI(title="caretaker", version="0.1.0", lifespan=_lifespan)
 
 # Lazily-built manager singleton. Tests inject a manager (e.g. one backed by a
 # fake ServerProcess) via :func:`init` so route tests never build a real one.
@@ -117,6 +128,30 @@ def _invalid_request(message: str) -> JSONResponse:
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         content={"error": "invalid_request", "message": message},
     )
+
+
+@app.get("/comfy/status", dependencies=[Depends(require_caretaker_key)])
+async def comfy_status() -> dict:
+    """Comfy lifecycle status (idle budget, queue, proxy, commands)."""
+    return _comfy.status()
+
+
+@app.post("/comfy/ensure", dependencies=[Depends(require_caretaker_key)])
+async def comfy_ensure() -> dict:
+    """Start Comfy on demand (the wake proxy also does this transparently)."""
+    ok = await _comfy.start_comfy()
+    if not ok:
+        raise HTTPException(status_code=503, detail={"error": "comfy_start_failed"})
+    return {"ok": True, "status": _comfy.status()}
+
+
+@app.post("/comfy/release", dependencies=[Depends(require_caretaker_key)])
+async def comfy_release() -> dict:
+    """Stop Comfy on demand (VRAM release)."""
+    ok = await _comfy.stop_comfy()
+    if not ok:
+        raise HTTPException(status_code=503, detail={"error": "comfy_stop_failed"})
+    return {"ok": True, "status": _comfy.status()}
 
 
 @app.get("/status", dependencies=[Depends(require_caretaker_key)])
