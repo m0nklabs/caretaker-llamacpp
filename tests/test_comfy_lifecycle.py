@@ -166,7 +166,10 @@ async def test_status_reports_shape(monkeypatch):
     assert status["idle_seconds"] == 300
     assert status["proxy_port"] == 18125
     assert status["up"] is False
-    assert "start_command" in status and "stop_command" in status
+    # Commands never echo raw — only their configured-ness (info exposure).
+    assert status["start_configured"] is True
+    assert status["stop_configured"] is True
+    assert "start_command" not in status and "stop_command" not in status
 
 
 @pytest.mark.asyncio

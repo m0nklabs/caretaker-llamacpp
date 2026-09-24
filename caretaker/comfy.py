@@ -193,8 +193,11 @@ async def astatus() -> dict[str, Any]:
             else None
         ),
         "proxy_port": int(_env("CARETAKER_COMFY_PROXY_PORT", "0") or 0),
-        "start_command": _env("CARETAKER_COMFY_START_COMMAND", ""),
-        "stop_command": _env("CARETAKER_COMFY_STOP_COMMAND", ""),
+        "proxy_bind": _env("CARETAKER_COMFY_PROXY_BIND", "127.0.0.1"),
+        # Booleans only — the raw command lines may embed hosts, task names,
+        # tokens or internal paths and must not leak through the status API.
+        "start_configured": bool(_env("CARETAKER_COMFY_START_COMMAND", "").strip()),
+        "stop_configured": bool(_env("CARETAKER_COMFY_STOP_COMMAND", "").strip()),
     }
 
 

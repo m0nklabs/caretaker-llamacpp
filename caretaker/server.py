@@ -137,21 +137,28 @@ async def comfy_status() -> dict:
 
 
 @app.post("/comfy/ensure", dependencies=[Depends(require_caretaker_key)])
-async def comfy_ensure() -> dict:
+async def comfy_ensure() -> JSONResponse:
     """Start Comfy on demand (the wake proxy also does this transparently)."""
     ok = await _comfy.start_comfy()
     if not ok:
-        raise HTTPException(status_code=503, detail={"error": "comfy_start_failed"})
-    return {"ok": True, "status": await _comfy.astatus()}
+        # Flat machine-readable body — the repo contract, no "detail" wrapper.
+        return JSONResponse(
+            status_code=503,
+            content={"error": "comfy_start_failed", "message": "Comfy start command failed or the backend did not answer in time"},
+        )
+    return JSONResponse(content={"ok": True, "status": await _comfy.astatus()})
 
 
 @app.post("/comfy/release", dependencies=[Depends(require_caretaker_key)])
-async def comfy_release() -> dict:
+async def comfy_release() -> JSONResponse:
     """Stop Comfy on demand (VRAM release)."""
     ok = await _comfy.stop_comfy()
     if not ok:
-        raise HTTPException(status_code=503, detail={"error": "comfy_stop_failed"})
-    return {"ok": True, "status": await _comfy.astatus()}
+        return JSONResponse(
+            status_code=503,
+            content={"error": "comfy_stop_failed", "message": "Comfy stop command failed"},
+        )
+    return JSONResponse(content={"ok": True, "status": await _comfy.astatus()})
 
 
 @app.get("/status", dependencies=[Depends(require_caretaker_key)])
