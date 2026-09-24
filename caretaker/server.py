@@ -21,6 +21,8 @@ import hmac
 import os
 from typing import Annotated
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
@@ -34,10 +36,22 @@ from .stt import ensure_stt as _stt_ensure
 from .stt import release_stt as _stt_release
 from .stt import init as _stt_init
 from .vram import VramLimitExceededError
+from . import comfy as _comfy
 
 CARETAKER_KEY_ENV = "CARETAKER_KEY"
 
-app = FastAPI(title="caretaker", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Arm the Comfy idle watcher + wake proxy at startup (config-gated;
+    no-ops when the Comfy keys are unset) — and clean them up at shutdown."""
+    await _comfy.init_async()
+    try:
+        yield
+    finally:
+        await _comfy.shutdown_async()
+
+
+app = FastAPI(title="caretaker", version="0.1.0", lifespan=_lifespan)
 
 # Lazily-built manager singleton. Tests inject a manager (e.g. one backed by a
 # fake ServerProcess) via :func:`init` so route tests never build a real one.
@@ -119,6 +133,37 @@ def _invalid_request(message: str) -> JSONResponse:
     )
 
 
+@app.get("/comfy/status", dependencies=[Depends(require_caretaker_key)])
+async def comfy_status() -> dict:
+    """Comfy lifecycle status (idle budget, queue, proxy, commands)."""
+    return await _comfy.astatus()
+
+
+@app.post("/comfy/ensure", dependencies=[Depends(require_caretaker_key)])
+async def comfy_ensure() -> JSONResponse:
+    """Start Comfy on demand (the wake proxy also does this transparently)."""
+    ok = await _comfy.start_comfy()
+    if not ok:
+        # Flat machine-readable body — the repo contract, no "detail" wrapper.
+        return JSONResponse(
+            status_code=503,
+            content={"error": "comfy_start_failed", "message": "Comfy start command failed or the backend did not answer in time"},
+        )
+    return JSONResponse(content={"ok": True, "status": await _comfy.astatus()})
+
+
+@app.post("/comfy/release", dependencies=[Depends(require_caretaker_key)])
+async def comfy_release() -> JSONResponse:
+    """Stop Comfy on demand (VRAM release)."""
+    ok = await _comfy.stop_comfy()
+    if not ok:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "comfy_stop_failed", "message": "Comfy stop command failed"},
+        )
+    return JSONResponse(content={"ok": True, "status": await _comfy.astatus()})
+
+
 @app.get("/status", dependencies=[Depends(require_caretaker_key)])
 async def get_status() -> dict:
     """Report loaded model + drift/"needs reload" status for discovery."""
@@ -139,15 +184,15 @@ async def tts_release() -> dict:
 
 
 @app.post("/stt/ensure", dependencies=[Depends(require_caretaker_key)])
-async def tts_ensure() -> dict:
-    """Idempotent: make sure the TTS engine is healthy and refresh its idle timer."""
+async def stt_ensure() -> dict:
+    """Idempotent: make sure the STT engine is healthy and refresh its idle timer."""
     return await _stt_ensure()
 
 
 
 @app.post("/stt/release", dependencies=[Depends(require_caretaker_key)])
-async def tts_release() -> dict:
-    """Stop the TTS engine service (frees its VRAM)."""
+async def stt_release() -> dict:
+    """Stop the STT engine service (frees its VRAM)."""
     return await _stt_release()
 
 
@@ -158,7 +203,7 @@ async def tts_status_route() -> dict:
 
 
 @app.get("/stt/status", dependencies=[Depends(require_caretaker_key)])
-async def tts_status_route() -> dict:
+async def stt_status_route() -> dict:
     """TTS lifecycle state (service, idle timer, last use)."""
     return _stt_status()
 
