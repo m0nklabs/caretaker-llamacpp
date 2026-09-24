@@ -45,10 +45,30 @@ async def test_idle_tick_stops_comfy_after_budget(monkeypatch):
 
     monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
     stops = []
-    monkeypatch.setattr(comfy_mod, "stop_comfy", lambda: stops.append(1) or asyncio.sleep(0))
+
+    async def ok_stop():
+        stops.append(1)
+        return True
+
+    monkeypatch.setattr(comfy_mod, "stop_comfy", ok_stop)
     comfy_mod._last_activity_monotonic = time.monotonic() - 10  # idle past the budget
     assert await comfy_mod._idle_watcher_tick() == "stopped"
     assert stops == [1]
+
+
+@pytest.mark.asyncio
+async def test_idle_tick_reports_failed_stop(monkeypatch):
+    _env(monkeypatch, CARETAKER_COMFY_IDLE_SECONDS="5")
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+    async def failed_stop():
+        return False
+
+    monkeypatch.setattr(comfy_mod, "stop_comfy", failed_stop)
+    comfy_mod._last_activity_monotonic = time.monotonic() - 10
+    assert await comfy_mod._idle_watcher_tick() == "stop_failed"  # never "stopped"
 
 
 @pytest.mark.asyncio

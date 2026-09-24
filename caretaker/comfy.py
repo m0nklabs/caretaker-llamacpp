@@ -228,8 +228,8 @@ async def _idle_watcher_tick() -> str:
             time.monotonic() - _last_activity_monotonic,
             idle_seconds,
         )
-        await stop_comfy()
-        return "stopped"
+        stopped = await stop_comfy()
+        return "stopped" if stopped else "stop_failed"
     return "idle"
 
 
@@ -313,6 +313,27 @@ async def init_async() -> None:
     _watcher_task = asyncio.create_task(_idle_watcher_loop())
     await start_proxy()
     logger.info("Comfy lifecycle armed (idle %ss, proxy %s)", _idle_seconds(), _env("CARETAKER_COMFY_PROXY_PORT", "0"))
+
+
+async def shutdown_async() -> None:
+    """Cancel the watcher and release the proxy socket (lifespan shutdown)."""
+    global _watcher_task, _proxy_server, _enabled
+    if _watcher_task is not None:
+        _watcher_task.cancel()
+        try:
+            await _watcher_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001 — shutdown best-effort
+            pass
+        _watcher_task = None
+    if _proxy_server is not None:
+        _proxy_server.close()
+        try:
+            await _proxy_server.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+        _proxy_server = None
+    _enabled = False
+    logger.info("Comfy lifecycle disarmed")
 
 
 def init() -> None:

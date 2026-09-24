@@ -43,9 +43,12 @@ CARETAKER_KEY_ENV = "CARETAKER_KEY"
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Arm the Comfy idle watcher + wake proxy at startup (config-gated;
-    no-ops when the Comfy keys are unset)."""
+    no-ops when the Comfy keys are unset) — and clean them up at shutdown."""
     await _comfy.init_async()
-    yield
+    try:
+        yield
+    finally:
+        await _comfy.shutdown_async()
 
 
 app = FastAPI(title="caretaker", version="0.1.0", lifespan=_lifespan)
