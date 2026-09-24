@@ -184,14 +184,14 @@ async def tts_release() -> dict:
 
 
 @app.post("/stt/ensure", dependencies=[Depends(require_caretaker_key)])
-async def tts_ensure() -> dict:
+async def stt_ensure() -> dict:
     """Idempotent: make sure the TTS engine is healthy and refresh its idle timer."""
     return await _stt_ensure()
 
 
 
 @app.post("/stt/release", dependencies=[Depends(require_caretaker_key)])
-async def tts_release() -> dict:
+async def stt_release() -> dict:
     """Stop the TTS engine service (frees its VRAM)."""
     return await _stt_release()
 
@@ -203,7 +203,7 @@ async def tts_status_route() -> dict:
 
 
 @app.get("/stt/status", dependencies=[Depends(require_caretaker_key)])
-async def tts_status_route() -> dict:
+async def stt_status_route() -> dict:
     """TTS lifecycle state (service, idle timer, last use)."""
     return _stt_status()
 
