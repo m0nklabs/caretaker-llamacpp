@@ -360,7 +360,13 @@ async def start_proxy() -> None:
     # the wake surface (a LAN-reachable proxy would let any host trigger the
     # start command without credentials).
     bind = _env("CARETAKER_COMFY_PROXY_BIND", "127.0.0.1")
-    _proxy_server = await asyncio.start_server(_handle_client, bind, port)
+    try:
+        _proxy_server = await asyncio.start_server(_handle_client, bind, port)
+    except OSError as exc:
+        # Optional feature: an unbindable port (already taken, permissions)
+        # degrades to proxy-off — it must never abort the caretaker boot.
+        logger.warning("⚠️ Comfy wake proxy not started (%s:%s): %r", bind, port, exc)
+        return
     logger.info("🎧 Comfy wake proxy listening on %s:%s -> %s", bind, port, comfy_url())
 
 

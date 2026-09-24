@@ -175,6 +175,26 @@ async def test_proxy_wake_failure_closes_connection(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unbindable_port_degrades_instead_of_boot_failure(monkeypatch):
+    """A taken/unbindable proxy port must never abort the caretaker boot —
+    the feature degrades to proxy-off and init_async still completes."""
+    _env(monkeypatch, CARETAKER_COMFY_PROXY_PORT="18127")
+
+    async def boom(handler, host, port):
+        raise OSError(98, "address already in use")
+
+    real = comfy_mod.asyncio.start_server
+    comfy_mod.asyncio.start_server = boom
+    try:
+        await comfy_mod.init_async()  # must NOT raise
+    finally:
+        comfy_mod.asyncio.start_server = real
+    assert comfy_mod._proxy_server is None  # degraded, not bound
+    assert comfy_mod._watcher_task is not None  # watcher still armed
+    await comfy_mod.shutdown_async()
+
+
+@pytest.mark.asyncio
 async def test_silent_connection_times_out_and_releases(monkeypatch):
     """An abandoned connection (no bytes, no FIN) must not pin the idle
     release forever — the pipe closes after the silence budget."""
