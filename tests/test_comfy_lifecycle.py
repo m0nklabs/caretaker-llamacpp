@@ -175,6 +175,22 @@ async def test_proxy_wake_failure_closes_connection(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_malformed_env_falls_back_to_defaults(monkeypatch):
+    """A garbage env value must never abort boot or wedge the watcher —
+    every integer env read falls back to its default."""
+    _env(
+        monkeypatch,
+        CARETAKER_COMFY_IDLE_SECONDS="five minutes ",
+        CARETAKER_COMFY_PROXY_PORT="8188 ",
+        CARETAKER_COMFY_WAKE_TIMEOUT="soon",
+    )
+    assert comfy_mod._idle_seconds() == 300  # non-numeric -> default
+    # a benign trailing space is stripped and parses
+    assert comfy_mod._env_int("CARETAKER_COMFY_PROXY_PORT", 0) == 8188
+    assert comfy_mod._env_int("CARETAKER_COMFY_WAKE_TIMEOUT", 90) == 90
+
+
+@pytest.mark.asyncio
 async def test_status_reports_shape(monkeypatch):
     _env(monkeypatch, CARETAKER_COMFY_PROXY_PORT="18125")
 

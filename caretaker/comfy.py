@@ -68,6 +68,18 @@ def _env(name: str, default: str) -> str:
     return os.getenv(name, default)
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer env value; fall back to the default on garbage so a
+    misconfiguration can never abort the caretaker boot or wedge the watcher
+    (the TTS/STT modules accept the same laxity via their own env reads)."""
+    raw = _env(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("⚠️ %s=%r is not an integer — using %s", name, raw, default)
+        return default
+
+
 def comfy_url() -> str:
     """Internal probe URL: env override, else the settings-yaml comfyui_url."""
     override = _env("CARETAKER_COMFY_URL", "").strip()
@@ -88,7 +100,7 @@ def comfy_enabled() -> bool:
 
 
 def _idle_seconds() -> int:
-    return int(_env("CARETAKER_COMFY_IDLE_SECONDS", "300"))
+    return _env_int("CARETAKER_COMFY_IDLE_SECONDS", 300)
 
 
 async def _queue_snapshot(timeout_s: float = 5.0) -> dict[str, Any] | None:
@@ -134,7 +146,7 @@ async def start_comfy() -> bool:
         started = await _shell(_env("CARETAKER_COMFY_START_COMMAND", ""), label="start")
         if not started:
             return False
-        deadline = time.monotonic() + float(_env("CARETAKER_COMFY_WAKE_TIMEOUT", "90"))
+        deadline = time.monotonic() + float(_env_int("CARETAKER_COMFY_WAKE_TIMEOUT", 90))
         while time.monotonic() < deadline:
             if await _queue_snapshot(timeout_s=3.0) is not None:
                 logger.info("✅ Comfy up after wake — serving")
@@ -192,7 +204,7 @@ async def astatus() -> dict[str, Any]:
             if _last_activity_monotonic is not None
             else None
         ),
-        "proxy_port": int(_env("CARETAKER_COMFY_PROXY_PORT", "0") or 0),
+        "proxy_port": _env_int("CARETAKER_COMFY_PROXY_PORT", 0),
         "proxy_bind": _env("CARETAKER_COMFY_PROXY_BIND", "127.0.0.1"),
         # Booleans only — the raw command lines may embed hosts, task names,
         # tokens or internal paths and must not leak through the status API.
@@ -301,7 +313,7 @@ async def _handle_client(
 async def start_proxy() -> None:
     """Bind the public Comfy port (idempotent)."""
     global _proxy_server
-    port = int(_env("CARETAKER_COMFY_PROXY_PORT", "0") or 0)
+    port = _env_int("CARETAKER_COMFY_PROXY_PORT", 0)
     if not port or _proxy_server is not None:
         return
     # Safe-by-default bind: 127.0.0.1 unless the operator explicitly exposes

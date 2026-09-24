@@ -185,14 +185,14 @@ async def tts_release() -> dict:
 
 @app.post("/stt/ensure", dependencies=[Depends(require_caretaker_key)])
 async def stt_ensure() -> dict:
-    """Idempotent: make sure the TTS engine is healthy and refresh its idle timer."""
+    """Idempotent: make sure the STT engine is healthy and refresh its idle timer."""
     return await _stt_ensure()
 
 
 
 @app.post("/stt/release", dependencies=[Depends(require_caretaker_key)])
 async def stt_release() -> dict:
-    """Stop the TTS engine service (frees its VRAM)."""
+    """Stop the STT engine service (frees its VRAM)."""
     return await _stt_release()
 
 
