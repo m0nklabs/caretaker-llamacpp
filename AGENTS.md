@@ -71,7 +71,7 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   (`is_sleeping: true`) en wordt alléén gewekt door een generatie-request
   (upstream `tools/server/tests/unit/test_sleep.py`) — de health-probe kan een
   slapende, gezonde server dus nooit foutief herstarten en wekt hem niet.
-  8 pins in `tests/test_watchdog_wiring.py`; **175 tests groen** (143 s lokaal,
+  9 pins in `tests/test_watchdog_wiring.py`; **176 tests groen** (143 s lokaal,
   py3.14-venv), ruff clean op de aangeraakte files.
   **Ruff-debt vastgesteld (out of scope gelaten):** lokaal ruff 0.16.5
   default-select flagt 21 pre-existing bevindingen in comfy/tts/stt + hun tests
@@ -440,7 +440,7 @@ tests/
   test_latent_items.py         alias-resolutie + failed-switch bookkeeping (PR #10)
   test_tts/test_stt/test_comfy_lifecycle.py  engine-lifecycles (TTS/STT/Comfy, 2026-09;
                     details in docs/HANDOFF.md — de kaart hier is niet volledig)
-  test_watchdog_wiring.py      8 pins: watchdog-startup-wiring (env-knobs, fail-open beide kanten)
+  test_watchdog_wiring.py      9 pins: watchdog-startup-wiring (env-knobs, fail-open beide kanten)
 .github/workflows/
   pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
   python-ci.yml     Org-reusable python-ci (python 3.12, src caretaker)

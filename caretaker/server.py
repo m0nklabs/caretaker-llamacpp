@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -84,10 +85,18 @@ def _watchdog_settings() -> dict[str, float] | None:
             settings[key] = default
             continue
         try:
-            settings[key] = float(raw)
+            value = float(raw)
         except ValueError:
             logger.warning("invalid %s=%r; using default %s", env_name, raw, default)
             settings[key] = default
+            continue
+        # float() also parses "inf"/"nan" — a non-finite or non-positive
+        # timing would silently defeat the watchdog's sleep/backoff loop.
+        if not math.isfinite(value) or value <= 0:
+            logger.warning("invalid %s=%r; using default %s", env_name, raw, default)
+            settings[key] = default
+            continue
+        settings[key] = value
     return settings
 
 

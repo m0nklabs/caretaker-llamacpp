@@ -102,6 +102,23 @@ def test_lifespan_falls_back_to_default_on_invalid_value(
     assert fake_manager.started["interval"] == DEFAULT_WATCHDOG_INTERVAL
 
 
+def test_lifespan_falls_back_to_default_on_non_finite_or_non_positive(
+    fake_manager: RecordingManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """float() parses 'inf'/'nan' — such knobs must not reach the watchdog
+    (they would silently defeat its sleep/backoff arithmetic; PR #12 ronde 3)."""
+    monkeypatch.setenv("CARETAKER_WATCHDOG_INTERVAL", "inf")
+    monkeypatch.setenv("CARETAKER_WATCHDOG_INITIAL_BACKOFF", "nan")
+    monkeypatch.setenv("CARETAKER_WATCHDOG_MAX_BACKOFF", "-5")
+    _run_lifespan()
+    assert fake_manager.started is not None
+    assert fake_manager.started == {
+        "interval": DEFAULT_WATCHDOG_INTERVAL,
+        "initial_backoff": DEFAULT_WATCHDOG_INITIAL_BACKOFF,
+        "max_backoff": DEFAULT_WATCHDOG_MAX_BACKOFF,
+    }
+
+
 def test_lifespan_survives_manager_build_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
