@@ -142,3 +142,21 @@ def test_lifespan_survives_raising_start_watchdog(
     assert mgr.started is None
     assert mgr.stopped == 0
     server_mod.init(None)
+
+
+def test_lifespan_survives_raising_stop_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Symmetric fail-open at shutdown: a raising stop_watchdog must not skip
+    the Comfy cleanup (PR #12 review round 2)."""
+
+    class StickyManager(RecordingManager):
+        def stop_watchdog(self) -> None:
+            self.stopped += 1
+            raise RuntimeError("cancel failed")
+
+    mgr = StickyManager()
+    server_mod.init(mgr)
+    _run_lifespan()  # must not raise
+    assert mgr.stopped == 1
+    server_mod.init(None)

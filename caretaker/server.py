@@ -127,7 +127,11 @@ async def _lifespan(app: FastAPI):
         yield
     finally:
         if armed is not None:
-            armed.stop_watchdog()
+            try:
+                armed.stop_watchdog()
+            except Exception:
+                # failing watchdog-stop must not skip the Comfy cleanup below.
+                logger.exception("watchdog stop failed at shutdown")
         await _comfy.shutdown_async()
 
 
