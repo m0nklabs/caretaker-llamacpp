@@ -3,6 +3,16 @@
 > Cold file (niet in de prompt-cache): actuele status + sessie-overdracht. Nieuwe blokken **bovenaan** appen.
 > Werkwijze → `~/.dsh/AGENTS.md` ("AGENTS.md maintenance discipline") + repo `AGENTS.md`.
 
+## 2026-09-25 — Watchdog-wiring (de 2026-09-16-handoff) + repo-audit — DSH agent (glm-5.3-flash)
+
+- **Wat:** de 2026-09-16-handoff ("watchdog draait op GEEN van beide hosts") is geïmplementeerd op branch `f-watchdog-wiring` → PR open. `_lifespan` in `caretaker/server.py` armt `start_watchdog()` bij startup met env-knobs `CARETAKER_WATCHDOG_{ENABLED,INTERVAL,INITIAL_BACKOFF,MAX_BACKOFF}` (defaults: aan, 15 s, backoff 5→60 s; invalid values → warning + default, nooit stil) en stopt hem in de shutdown-finally. Fail-open bij een kapotte models-config (boot blijft staan, routes tonen de fout per request); managers zónder watchdog-surface (test-doubles) worden overgeslagen.
+- **Slaap-veiligheid (bewezen, niet aangenomen):** een slapende llama-server (`--sleep-idle-seconds`, windows b10964) antwoordt /health 200 + /props 200 (`is_sleeping: true`) en wordt alléén gewekt door een generatie-request — upstream `~/llama_cpp_official/tools/server/tests/unit/test_sleep.py`. De watchdog-probe kan een slapende, gezonde server nooit foutief herstarten en wekt hem niet.
+- **Verificatie:** 6 pins in `tests/test_watchdog_wiring.py` (arm+stop, disable, env-overrides, invalid→default, build-failure fail-open, hasattr-miss); **173 tests groen** (143 s, lokaal py3.14-venv; CI = py3.12), ruff clean op beide aangeraakte files (I001-importsort meegenomen — bleek pre-existing op HEAD).
+- **Ruff-debt (out of scope gelaten, volg-item):** lokale ruff 0.16.5 default-select flagt 21 pre-existing bevindingen in comfy/tts/stt + hun tests (I001/S110/ASYNC230/SIM115/SIM102/PLW0602/UP041/RET501/RUF059); CI is groen met een oudere/laxere ruff → ruff-versie pinnen of opkuisen.
+- **Audit (operator-vraag "is er al iets gedaan, agents knutselen zelf?"):** watchdog-, backend-key- (`CARETAKER_BACKEND_KEY`) en OOM-classificatie-handoffs zijn **nergens geïmplementeerd**; géén ongeautoriseerd knutselwerk — lokaal (ai-kvm2) draait de service uit de repo (tree clean == HEAD `563133f`); teams-host clone op `063d419` (1 docs-commit achter) met alléén geautoriseerde host-config-drift (F6 Windows-lijst), een mode-only `start_llama.sh`-wijziging en een **stale `--api-key`-comment** in de config (niet in de echte args → de 2026-09-11-gap is niet live); GitHub: #1–#11 allemaal gemerged, alleen bot-PR #2 open.
+- **Open:** human merge van de PR; daarna **activatie per host**: ai-kvm2 `systemctl restart caretaker-llamacpp` (service draait uit de repo); teams-host: clone ff-updaten + NSSM-restart (env-discipline: volledige var-lijst expliciet, zie journal 2026-09-25). Knobs hoeven niet gezet te worden (defaults = aan).
+- **Volgende items uit de handoff-stapel:** backend-auth-key (`CARETAKER_BACKEND_KEY`) en OOM-classificatie in `CrashRecord` — beide nog open.
+
 ## 2026-08-30 avond (sessie-overdracht) — PR #8 (F6 Phase E, Windows ServerProcess) merge-klaar
 
 - **Eindstatus PR #8**: OPEN op head `d6ff3e2` (branch `f6-phase-e-windows-process`), base `main` @ `6925207`. **6/6 review-threads resolved, 0 open** — mergeStateStatus `CLEAN` / `MERGEABLE`. **Merge blijft HUMAN.**
