@@ -108,10 +108,6 @@ async def _lifespan(app: FastAPI):
         # does not wake it either.
         try:
             mgr = _manager()
-        except Exception as exc:  # noqa: BLE001 — fail-open: a broken models
-            # config must not block API boot; routes surface the error per-request.
-            logger.warning("watchdog not armed: manager unavailable (%s)", exc)
-        else:
             if hasattr(mgr, "start_watchdog"):
                 mgr.start_watchdog(
                     interval=watchdog_settings["interval"],
@@ -123,6 +119,10 @@ async def _lifespan(app: FastAPI):
                 # Manager doubles injected via init() may not implement the
                 # watchdog surface; the real Caretaker always does.
                 logger.warning("watchdog not armed: manager lacks start_watchdog")
+        except Exception as exc:  # noqa: BLE001 — fail-open: neither a broken
+            # models config nor a failing arming may block the API boot; the
+            # routes surface the error per-request as before.
+            logger.warning("watchdog not armed: %s", exc)
     try:
         yield
     finally:

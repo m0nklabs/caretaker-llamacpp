@@ -63,14 +63,15 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   `CARETAKER_WATCHDOG_{ENABLED,INTERVAL,INITIAL_BACKOFF,MAX_BACKOFF}` (defaults:
   aan, interval 15 s, backoff 5→60 s) en stopt hem in de shutdown-finally.
   **Fail-open:** een kapotte models-config blokkeert de API-boot niet (warning +
-  verder zonder watchdog; routes blijven de config-fout per request tonen).
-  Managers zónder watchdog-surface (test-doubles) worden met een warning
-  overgeslagen. **Slaap-veiligheid bewezen:** een slapende llama-server
+  verder zonder watchdog; routes blijven de config-fout per request tonen) — én
+  de arming zelf: een raisende `start_watchdog()` valt onder dezelfde dekking
+  (PR-#12-review-fix, gepind). Managers zónder watchdog-surface (test-doubles)
+  worden met een warning overgeslagen. **Slaap-veiligheid bewezen:** een slapende llama-server
   (`--sleep-idle-seconds`, windows b10964) antwoordt /health 200 + /props 200
   (`is_sleeping: true`) en wordt alléén gewekt door een generatie-request
   (upstream `tools/server/tests/unit/test_sleep.py`) — de health-probe kan een
   slapende, gezonde server dus nooit foutief herstarten en wekt hem niet.
-  6 pins in `tests/test_watchdog_wiring.py`; **173 tests groen** (143 s lokaal,
+  7 pins in `tests/test_watchdog_wiring.py`; **174 tests groen** (143 s lokaal,
   py3.14-venv), ruff clean op de aangeraakte files.
   **Ruff-debt vastgesteld (out of scope gelaten):** lokaal ruff 0.16.5
   default-select flagt 21 pre-existing bevindingen in comfy/tts/stt + hun tests
@@ -439,7 +440,7 @@ tests/
   test_latent_items.py         alias-resolutie + failed-switch bookkeeping (PR #10)
   test_tts/test_stt/test_comfy_lifecycle.py  engine-lifecycles (TTS/STT/Comfy, 2026-09;
                     details in docs/HANDOFF.md — de kaart hier is niet volledig)
-  test_watchdog_wiring.py      6 pins: watchdog-startup-wiring (env-knobs, fail-open)
+  test_watchdog_wiring.py      7 pins: watchdog-startup-wiring (env-knobs, fail-open)
 .github/workflows/
   pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
   python-ci.yml     Org-reusable python-ci (python 3.12, src caretaker)

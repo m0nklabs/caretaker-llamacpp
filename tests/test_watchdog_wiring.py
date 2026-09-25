@@ -123,3 +123,22 @@ def test_lifespan_skips_arming_for_manager_without_watchdog(
     server_mod.init(object())  # type: ignore[arg-type]
     _run_lifespan()  # must not raise
     server_mod.init(None)
+
+
+def test_lifespan_survives_raising_start_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail-open covers arming itself: a raising start_watchdog must not
+    block the API boot (review finding on PR #12)."""
+
+    class ExplodingManager(RecordingManager):
+        def start_watchdog(self, **kwargs: float) -> None:
+            raise RuntimeError("cannot schedule watchdog")
+
+    mgr = ExplodingManager()
+    server_mod.init(mgr)
+    _run_lifespan()  # must not raise
+    # Never armed → never stopped either.
+    assert mgr.started is None
+    assert mgr.stopped == 0
+    server_mod.init(None)
