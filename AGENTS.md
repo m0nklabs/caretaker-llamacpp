@@ -2,7 +2,7 @@
 
 > Canonical AI-agent context voor dit repo. **Eerst lezen.**
 > Claude Code: `CLAUDE.md` → hier. Goose: `.goosehints` → hier.
-> Status: **Phase A–D GEMERGED (2026-08-29); fase E (multi-host/Windows) + gateway-wiring open — zie `./PLAN.md`.**
+> Status: **Phase A–E GEMERGED; TTS/STT/Comfy-lifecycles live (2026-09); watchdog-wiring in review (2026-09-25) — zie `./PLAN.md` + `./docs/HANDOFF.md`.**
 
 ## Wat is dit project
 
@@ -56,6 +56,32 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
 
 ## Status (2026-08-28)
 
+- **Watchdog-wiring (2026-09-25, branch `f-watchdog-wiring`, PR open):**
+  de 2026-09-16-handoff ("`start_watchdog()` wordt nergens aangeroepen — de
+  watchdog draait op geen enkele host") is geïmplementeerd: `_lifespan` armt
+  `start_watchdog()` bij startup met env-knobs
+  `CARETAKER_WATCHDOG_{ENABLED,INTERVAL,INITIAL_BACKOFF,MAX_BACKOFF}` (defaults:
+  aan, interval 15 s, backoff 5→60 s) en stopt hem in de shutdown-finally.
+  **Fail-open:** een kapotte models-config blokkeert de API-boot niet (warning +
+  verder zonder watchdog; routes blijven de config-fout per request tonen) — én
+  de arming zelf: een raisende `start_watchdog()` valt onder dezelfde dekking
+  (PR-#12-review-fix, gepind). Managers zónder watchdog-surface (test-doubles)
+  worden met een warning overgeslagen. **Slaap-veiligheid bewezen:** een slapende llama-server
+  (`--sleep-idle-seconds`, windows b10964) antwoordt /health 200 + /props 200
+  (`is_sleeping: true`) en wordt alléén gewekt door een generatie-request
+  (upstream `tools/server/tests/unit/test_sleep.py`) — de health-probe kan een
+  slapende, gezonde server dus nooit foutief herstarten en wekt hem niet.
+  9 pins in `tests/test_watchdog_wiring.py`; **176 tests groen** (143 s lokaal,
+  py3.14-venv), ruff clean op de aangeraakte files.
+  **Ruff-debt vastgesteld (out of scope gelaten):** lokaal ruff 0.16.5
+  default-select flagt 21 pre-existing bevindingen in comfy/tts/stt + hun tests
+  (I001/S110/ASYNC230/SIM115/SIM102/PLW0602/UP041/RET501/RUF059); CI is groen
+  met een oudere/laxere ruff — volg-item: ruff-versie pinnen óf opkuisen.
+  **Audit 2026-09-25 (operator-vraag "is er al iets gedaan?"):** watchdog-,
+  backend-key- en OOM-handoffs zijn nergens geïmplementeerd; géén
+  ongeautoriseerd knutselwerk (lokaal = draaiende service == HEAD; teams-host
+  clone heeft alléén geautoriseerde host-config-drift + een stale
+  `--api-key`-comment; GitHub: alle feature-PR's gemerged, #1–#11).
 - **Bootstrap-fase GEDAAN (2026-08-28, PR #1 `f5-bootstrap` — review-loop
   actief).** Skeleton van PLAN.md §1: `pyproject.toml` (package `caretaker`,
   Python >=3.12), `caretaker/` (`__main__.py` uvicorn-runner,
@@ -410,6 +436,11 @@ tests/
                     watchdog (tick healthy/crash/backoff/retry/loop), /unload + /ensure-503-API
   test_phase_d.py   5 tests: idle-contract (loaded_at/idle_since), /status-API,
                     ensure-recovery na unload (echte restart), unload→ensure-cycli + VRAM
+  test_ensure_verification.py  strikte /props-verificatie (incident 2026-09-01)
+  test_latent_items.py         alias-resolutie + failed-switch bookkeeping (PR #10)
+  test_tts/test_stt/test_comfy_lifecycle.py  engine-lifecycles (TTS/STT/Comfy, 2026-09;
+                    details in docs/HANDOFF.md — de kaart hier is niet volledig)
+  test_watchdog_wiring.py      9 pins: watchdog-startup-wiring (env-knobs, fail-open beide kanten)
 .github/workflows/
   pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
   python-ci.yml     Org-reusable python-ci (python 3.12, src caretaker)
