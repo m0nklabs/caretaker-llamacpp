@@ -3,6 +3,15 @@
 > Cold file (niet in de prompt-cache): actuele status + sessie-overdracht. Nieuwe blokken **bovenaan** appen.
 > Werkwijze → `~/.dsh/AGENTS.md` ("AGENTS.md maintenance discipline") + repo `AGENTS.md`.
 
+## 2026-10-03 (slot) — PR #12 gemerged + beide hosts gedeployed — DSH (glm-5.3)
+
+- **Merge:** PR #12 squash-merged naar `main` als **`71bce35`** na volledig groene review-loop: nieuwe geïsoleerde Python CI groen op GitHub (3.12 in 1m43s ÉN 3.14 — de 3.14-runner-beschikbaarheid is hiermee bewezen), alle 3 review-threads beantwoord+resolved (fixes `2535a7c`/`5d96314`/`5721550`), tier-1 PR-Piet op de nieuwe head: **`key_issues_to_review: []`**.
+- **Commits voor de merge (branch `f-watchdog-wiring`):** `3ae64cc` (test-isolatie + gepinde tooling/CI), `0eacf5e` (manager: lifecycle-race + backend-auth + OOM), `0b4f1ba` (docs).
+- **Deploy ai-kvm2 (2026-10-03 14:07 UTC):** `main` ff naar `71bce35`, `systemctl restart caretaker-llamacpp` → active/running. `GET /status` 200 met verse manager-state (`loaded_model: null`, `needs_reload: true` — llama-server stond bewust gestopt; watchdog idle tot de eerstvolgende /ensure). **Let op:** `start_watchdog()` logt bewust niets (silent `create_task`) — geen journal-regel is verwacht gedrag, arming is gedekt door de 9 lifespan-pins.
+- **Deploy teams-host (2026-10-03 ~14:10 UTC):** clone `J:\LLMSTUFF\caretaker-llamacpp` ff naar `71bce35`, NSSM `caretaker-llamacpp` stop+start → STATE 4 RUNNING; `curl :11441/status` → 401 (API up, auth-gate actief). SSH-user is `onyou` (BatchMode); gebruik `sc.exe` (plain `sc` is de Set-Content-alias).
+- **Configuratie:** geen env-wijzigingen nodig — `CARETAKER_BACKEND_KEY` blijft unset op beide hosts (keyless backends = correct gedrag; de knop is er voor toekomstige `--api-key`-deployments). Watchdog-knobs staan op defaults (aan).
+- **Open (volgende sessie):** guardian-gateway kan de nieuwe `oom`/`oom_source`-velden in `crash_details` consumeren (cross-repo handoff, guardian-agent); lokaal draait de dienst nu met de watchdog gewapend — eerstvolgende /ensure activeert het crash-herstel volledig.
+
 ## 2026-10-03 — Backend-auth (`CARETAKER_BACKEND_KEY`) + text-evidenced OOM classification — DSH (glm-5.3)
 
 - **Goal:** operator authorized finishing all open items (commit, review, merge, deploy). This block implements the two remaining inter-repo handoffs (2026-09-09 OOM, 2026-09-11 backend-auth).
