@@ -53,9 +53,9 @@ import logging
 import os
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
-from urllib.parse import urlparse
 
 from . import config as config_mod
 
@@ -289,15 +289,15 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
                 break
             writer.write(chunk)
             await writer.drain()
-    except (asyncio.TimeoutError, TimeoutError):
+    except TimeoutError:
         logger.info("Comfy proxy: connection silent for %ss — releasing", conn_idle)
-    except Exception:  # noqa: BLE001 — a broken pipe on either side is normal
-        pass
+    except Exception:  # A broken pipe on either side is normal.
+        logger.debug("Comfy proxy pipe closed after an error", exc_info=True)
     finally:
         try:
             writer.close()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            logger.debug("Comfy proxy writer close failed", exc_info=True)
 
 
 def upstream_target() -> tuple[str, int]:
@@ -388,15 +388,15 @@ async def shutdown_async() -> None:
         _watcher_task.cancel()
         try:
             await _watcher_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001 — shutdown best-effort
-            pass
+        except (asyncio.CancelledError, Exception):  # Shutdown is best-effort.
+            logger.debug("Comfy idle watcher stopped during shutdown", exc_info=True)
         _watcher_task = None
     if _proxy_server is not None:
         _proxy_server.close()
         try:
             await _proxy_server.wait_closed()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            logger.debug("Comfy proxy wait_closed failed during shutdown", exc_info=True)
         _proxy_server = None
     _enabled = False
     logger.info("Comfy lifecycle disarmed")
@@ -405,4 +405,3 @@ async def shutdown_async() -> None:
 def init() -> None:
     """Module init hook for server.py import-time wiring (mirrors tts.init)."""
     # The actual tasks start on the FastAPI startup event (they need a loop).
-    return None

@@ -69,6 +69,30 @@ DEFAULT_WATCHDOG_INITIAL_BACKOFF = 5.0
 DEFAULT_WATCHDOG_MAX_BACKOFF = 60.0
 
 
+def backend_headers() -> dict[str, str]:
+    """Read the optional backend credential per call; never reuse the control key."""
+    key = os.environ.get("CARETAKER_BACKEND_KEY", "")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def classify_oom(error_text: str) -> tuple[bool, str | None]:
+    """Classify memory failures from text, never from ambiguous exit codes.
+
+    Source labels describe the log evidence, not a verified kernel OOM kill.
+    CUDA markers take precedence for mixed allocator messages.
+    """
+    text = error_text.lower()
+    if any(pattern in text for pattern in (
+        "cuda out of memory", "cudamalloc failed", "failed to fit params to free device memory",
+    )):
+        return True, "cuda"
+    if any(pattern in text for pattern in (
+        "out of memory", "failed to allocate", "cannot meet free memory targets",
+    )):
+        return True, "cuda" if "cuda" in text else "kernel"
+    return False, None
+
+
 @dataclass
 class CrashRecord:
     """Record of a llama-server crash event."""
@@ -78,6 +102,8 @@ class CrashRecord:
     error_message: str
     exit_code: int | None = None
     config_snapshot: dict | None = None
+    oom: bool = False
+    oom_source: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +112,8 @@ class CrashRecord:
             "error_message": self.error_message,
             "exit_code": self.exit_code,
             "config_snapshot": self.config_snapshot,
+            "oom": self.oom,
+            "oom_source": self.oom_source,
         }
 
 
@@ -493,6 +521,11 @@ class Caretaker:
         # True while a switch/load/unload/stop is running, so the watchdog does
         # not race an in-flight lifecycle transition.
         self._switch_in_progress: bool = False
+        # Serialize every lifecycle mutation, including no-op verification and
+        # watchdog crash handling (which itself stops the backend). Generation
+        # invalidates observations across awaits, including same-model reloads.
+        self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_generation = 0
 
         # Set when the no-op fast-path refuses because the backend serves a
         # DIFFERENT model than the active-model bookkeeping claims (heal
@@ -738,6 +771,7 @@ class Caretaker:
                 resp = await client.post(
                     f"{self.server_url}/slots/0?action=save",
                     json={"filename": filename},
+                    headers=backend_headers(),
                     timeout=30.0,
                 )
                 if resp.status_code == 200:
@@ -750,6 +784,7 @@ class Caretaker:
             resp = await client.post(
                 f"{self.server_url}/slots/0?action=restore",
                 json={"filename": filename},
+                headers=backend_headers(),
                 timeout=60.0,
             )
             if resp.status_code == 200:
@@ -962,6 +997,7 @@ class Caretaker:
     ) -> CrashRecord:
         """Extract error details from the ServerProcess's crash log source and record the crash."""
         error_msg = await self.server_process.crash_error()
+        oom, oom_source = classify_oom(error_msg)
         config_snap = copy.deepcopy(config_snapshot) if config_snapshot is not None else self.models.get(model_name, {}).copy()
 
         crash = CrashRecord(
@@ -970,6 +1006,8 @@ class Caretaker:
             error_message=error_msg,
             exit_code=await self.server_process.service_exit_code(),
             config_snapshot=config_snap,
+            oom=oom,
+            oom_source=oom_source,
         )
 
         self.last_crash = crash
@@ -1006,7 +1044,7 @@ class Caretaker:
         """
         try:
             async with httpx.AsyncClient(timeout=DEFAULT_PROPS_TIMEOUT) as client:
-                resp = await client.get(f"{self.server_url}/props")
+                resp = await client.get(f"{self.server_url}/props", headers=backend_headers())
         except Exception:  # noqa: BLE001 - any transport failure means "unverified"
             return None
         if resp.status_code != 200:
@@ -1164,6 +1202,26 @@ class Caretaker:
         /ensure confirmed a model while llama-server still served the previous
         one).
         """
+        async with self._lifecycle_lock:
+            # Invalidate even same-model/no-op observations: the foreground
+            # request is authoritative over a previously scheduled restart.
+            self._lifecycle_generation += 1
+            if self.resolve_model_alias(model_name) in self.models:
+                self._watchdog_retry_model = None
+            return await self._switch_model_locked(
+                model_name, enable_vision=enable_vision,
+                context_hint=context_hint, force=force,
+            )
+
+    async def _switch_model_locked(
+        self,
+        model_name: str,
+        *,
+        enable_vision: bool | None = None,
+        context_hint: int | None = None,
+        force: bool = False,
+    ) -> bool:
+        """Execute a switch with the lifecycle lock already held by the caller."""
         model_name = self.resolve_model_alias(model_name)
         if model_name not in self.models:
             raise ValueError(f"Model {model_name} not found in configuration")
@@ -1435,6 +1493,13 @@ class Caretaker:
 
     async def unload(self) -> None:
         """Stop llama-server to free all VRAM. Guard against double-unload."""
+        async with self._lifecycle_lock:
+            self._lifecycle_generation += 1
+            self._watchdog_retry_model = None
+            await self._unload_locked()
+
+    async def _unload_locked(self) -> None:
+        """Execute unload with the lifecycle lock already held."""
         if self.is_unloaded:
             logger.info("⚡ Already unloaded — nothing to do")
             return
@@ -1467,6 +1532,13 @@ class Caretaker:
         Phase C health-check route) never sees a stale 'model active' state
         while the backend is stopped.
         """
+        async with self._lifecycle_lock:
+            self._lifecycle_generation += 1
+            self._watchdog_retry_model = None
+            await self._stop_locked()
+
+    async def _stop_locked(self) -> None:
+        """Execute stop with the lifecycle lock already held."""
         self._switch_in_progress = True
         previous_model = self.current_model
         try:
@@ -1571,45 +1643,69 @@ class Caretaker:
         This is the testable core: tests call it directly with a small/zero
         backoff instead of running the infinite :meth:`_watchdog_loop`.
         """
-        if self.is_unloaded or self._switch_in_progress:
+        if self._lifecycle_lock.locked():
             return False
-        if self.current_model is not None:
-            model = self.current_model
-        elif self._watchdog_retry_model is not None:
-            # A previous restart attempt failed and switch_model cleared
-            # current_model — keep retrying the same target with backoff
-            # instead of abandoning a crash-looping model after one attempt.
-            model = self._watchdog_retry_model
-        else:
-            return False
-        if await self.server_process.health_ok(self.server_url):
-            # Healthy — a fresh crash later starts again from the initial backoff.
+        async with self._lifecycle_lock:
+            if self.is_unloaded or self._switch_in_progress:
+                return False
+            # A failed forced restart clears current_model: keep retrying its
+            # target, unless a foreground lifecycle request supersedes it.
+            model = self.current_model or self._watchdog_retry_model
+            if model is None:
+                return False
+            generation = self._lifecycle_generation
+
+        # Do not block foreground work on an observational probe. Its result
+        # only applies if the same lifecycle still owns the backend afterward.
+        healthy = await self.server_process.health_ok(self.server_url)
+        async with self._lifecycle_lock:
+            if not self._watchdog_observation_current(generation):
+                return False
+            if healthy:
+                self._watchdog_backoff = self._watchdog_initial_backoff
+                self._watchdog_retry_model = None
+                return False
+
+            # _detect_crash awaits introspection AND stops the backend. Both
+            # must be protected, not just the eventual restart after backoff.
+            self._lifecycle_generation += 1
+            generation = self._lifecycle_generation
+            self._switch_in_progress = True
+            try:
+                logger.warning("Watchdog: backend unhealthy for '%s' — recording crash", model)
+                await self._detect_crash(model)
+            finally:
+                self._switch_in_progress = False
+            backoff = self._watchdog_backoff
+
+        logger.warning("Watchdog: restarting '%s' after %.1fs backoff", model, backoff)
+        # Foreground unload/stop/switch must remain able to supersede recovery.
+        if backoff > 0:
+            await asyncio.sleep(backoff)
+        async with self._lifecycle_lock:
+            if not self._watchdog_observation_current(generation):
+                return False
+            self._lifecycle_generation += 1
+            try:
+                self._watchdog_retry_model = model
+                # Already locked: calling the public wrapper would deadlock.
+                await self._switch_model_locked(model, force=True)
+            except ModelLoadError:
+                self._watchdog_backoff = min(
+                    self._watchdog_backoff * 2, self._watchdog_max_backoff
+                )
+                raise
             self._watchdog_backoff = self._watchdog_initial_backoff
             self._watchdog_retry_model = None
-            return False
+            return True
 
-        logger.warning("Watchdog: backend unhealthy for '%s' — recording crash", model)
-        await self._detect_crash(model)
-        logger.warning(
-            "Watchdog: restarting '%s' after %.1fs backoff",
-            model,
-            self._watchdog_backoff,
+    def _watchdog_observation_current(self, generation: int) -> bool:
+        """Validate a captured observation while holding the lifecycle lock."""
+        return (
+            generation == self._lifecycle_generation
+            and not self.is_unloaded
+            and not self._switch_in_progress
         )
-        if self._watchdog_backoff > 0:
-            await asyncio.sleep(self._watchdog_backoff)
-        try:
-            self._watchdog_retry_model = model
-            # force=True: the no-op fast-path in switch_model (same model +
-            # no drift) must NOT skip the restart — the backend is known dead.
-            await self.switch_model(model, force=True)
-        except ModelLoadError:
-            self._watchdog_backoff = min(
-                self._watchdog_backoff * 2, self._watchdog_max_backoff
-            )
-            raise
-        self._watchdog_backoff = self._watchdog_initial_backoff
-        self._watchdog_retry_model = None
-        return True
 
     async def _watchdog_loop(self) -> None:
         """The watchdog background loop: poll health every ``interval``.

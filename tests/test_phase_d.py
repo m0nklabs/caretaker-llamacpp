@@ -46,7 +46,7 @@ def isolated_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def injection_reset():
+def injection_reset(isolated_api_lifespan):
     yield
     init(None)
 

@@ -18,36 +18,129 @@ and never reports success (2026-09-01 false-positive incident).
 from __future__ import annotations
 
 import hmac
+import logging
+import math
 import os
-from typing import Annotated
-
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from .manager import Caretaker, ModelLoadError, ModelMismatchError
-from .tts import tts_status as _tts_status
-from .tts import ensure_tts as _tts_ensure
-from .tts import release_tts as _tts_release
-from .tts import init as _tts_init
-from .stt import stt_status as _stt_status
-from .stt import ensure_stt as _stt_ensure
-from .stt import release_stt as _stt_release
-from .stt import init as _stt_init
-from .vram import VramLimitExceededError
 from . import comfy as _comfy
+from .manager import (
+    DEFAULT_WATCHDOG_INITIAL_BACKOFF,
+    DEFAULT_WATCHDOG_INTERVAL,
+    DEFAULT_WATCHDOG_MAX_BACKOFF,
+    Caretaker,
+    ModelLoadError,
+    ModelMismatchError,
+)
+from .stt import ensure_stt as _stt_ensure
+from .stt import init as _stt_init
+from .stt import release_stt as _stt_release
+from .stt import stt_status as _stt_status
+from .tts import ensure_tts as _tts_ensure
+from .tts import init as _tts_init
+from .tts import release_tts as _tts_release
+from .tts import tts_status as _tts_status
+from .vram import VramLimitExceededError
 
 CARETAKER_KEY_ENV = "CARETAKER_KEY"
 
+logger = logging.getLogger(__name__)
+
+# Watchdog startup knobs (env name, settings key, manager default). Read at
+# CALL time (not import time) so tests can monkeypatch the environment — same
+# idiom as the TTS/STT/Comfy knobs.
+_WATCHDOG_ENV_DEFAULTS: tuple[tuple[str, str, float], ...] = (
+    ("CARETAKER_WATCHDOG_INTERVAL", "interval", DEFAULT_WATCHDOG_INTERVAL),
+    (
+        "CARETAKER_WATCHDOG_INITIAL_BACKOFF",
+        "initial_backoff",
+        DEFAULT_WATCHDOG_INITIAL_BACKOFF,
+    ),
+    ("CARETAKER_WATCHDOG_MAX_BACKOFF", "max_backoff", DEFAULT_WATCHDOG_MAX_BACKOFF),
+)
+
+
+def _watchdog_settings() -> dict[str, float] | None:
+    """Return the watchdog timing settings from the environment, or ``None``
+    when the watchdog is disabled (``CARETAKER_WATCHDOG_ENABLED=0``/``false``).
+
+    Invalid numeric overrides fall back to the manager defaults with a logged
+    warning — never silently. Unset/empty values use the defaults.
+    """
+    raw_enabled = os.environ.get("CARETAKER_WATCHDOG_ENABLED", "1").strip().lower()
+    if raw_enabled in {"0", "false"}:
+        return None
+    if raw_enabled not in {"", "1", "true"}:
+        logger.warning(
+            "invalid CARETAKER_WATCHDOG_ENABLED=%r; treating as enabled", raw_enabled
+        )
+    settings: dict[str, float] = {}
+    for env_name, key, default in _WATCHDOG_ENV_DEFAULTS:
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            settings[key] = default
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning("invalid %s=%r; using default %s", env_name, raw, default)
+            settings[key] = default
+            continue
+        # float() also parses "inf"/"nan" — a non-finite or non-positive
+        # timing would silently defeat the watchdog's sleep/backoff loop.
+        if not math.isfinite(value) or value <= 0:
+            logger.warning("invalid %s=%r; using default %s", env_name, raw, default)
+            settings[key] = default
+            continue
+        settings[key] = value
+    return settings
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Arm the Comfy idle watcher + wake proxy at startup (config-gated;
-    no-ops when the Comfy keys are unset) — and clean them up at shutdown."""
+    """Arm the Comfy idle watcher + wake proxy and the llama-server crash
+    watchdog at startup (both config-gated; no-ops when disabled/unset) — and
+    clean them up at shutdown."""
     await _comfy.init_async()
+    armed: Caretaker | None = None
+    watchdog_settings = _watchdog_settings()
+    if watchdog_settings is not None:
+        # Sleep-safety (llama.cpp --sleep-idle-seconds): a sleeping backend
+        # still answers GET /health with 200 (and /props reports is_sleeping)
+        # and only a generation request wakes it — upstream
+        # tools/server/tests/unit/test_sleep.py. The watchdog's health probe
+        # therefore never falsely restarts a sleeping-but-healthy server, and
+        # does not wake it either.
+        try:
+            mgr = _manager()
+            if hasattr(mgr, "start_watchdog"):
+                mgr.start_watchdog(
+                    interval=watchdog_settings["interval"],
+                    initial_backoff=watchdog_settings["initial_backoff"],
+                    max_backoff=watchdog_settings["max_backoff"],
+                )
+                armed = mgr
+            else:
+                # Manager doubles injected via init() may not implement the
+                # watchdog surface; the real Caretaker always does.
+                logger.warning("watchdog not armed: manager lacks start_watchdog")
+        except Exception as exc:  # noqa: BLE001 — fail-open: neither a broken
+            # models config nor a failing arming may block the API boot; the
+            # routes surface the error per-request as before.
+            logger.warning("watchdog not armed: %s", exc)
     try:
         yield
     finally:
+        if armed is not None:
+            try:
+                armed.stop_watchdog()
+            except Exception:
+                # failing watchdog-stop must not skip the Comfy cleanup below.
+                logger.exception("watchdog stop failed at shutdown")
         await _comfy.shutdown_async()
 
 

@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -78,7 +78,15 @@ def _make_manager(tmp_path: Path, process: ServerProcess | None = None, **kwargs
     cfg = _write_models_yaml(tmp_path, models)
     mgr = Caretaker(config_path=str(cfg), server_process=process, **kwargs)
     _stub_props_ok(mgr)
+    _stub_lifecycle_io(mgr)
     return mgr
+
+
+def _stub_lifecycle_io(mgr: Caretaker) -> None:
+    """Explicit boundary mocks shared by lifecycle tests, not HTTP outage fallbacks."""
+    mgr._save_context = AsyncMock(return_value=None)
+    mgr._load_context = AsyncMock(return_value=None)
+    mgr._free_gpu_memory = AsyncMock(return_value=None)
 
 
 def _stub_props_ok(mgr: Caretaker) -> None:
@@ -267,6 +275,8 @@ print(json.dumps(out, sort_keys=True))
 """
 
 
+@pytest.mark.integration
+@pytest.mark.guardian_parity
 @pytest.mark.skipif(
     not os.path.exists(GUARDIAN_MANAGER_PATH),
     reason=f"guardian manager not present at {GUARDIAN_MANAGER_PATH}",
@@ -276,7 +286,7 @@ print(json.dumps(out, sort_keys=True))
     reason=f"guardian venv python not present at {GUARDIAN_VENV}",
 )
 def test_args_crosscheck_guardian_byte_equal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, full_model: dict
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, full_model: dict, guardian_parity_bridge
 ) -> None:
     """Apples-to-apples: caretaker and guardian ``_build_args_string`` match bytes.
 
@@ -292,20 +302,8 @@ def test_args_crosscheck_guardian_byte_equal(
     cfg = _write_models_yaml(tmp_path, models)
     caretaker = _make_manager(tmp_path, models=models)
 
-    bridge_env = {
-        **os.environ,
-        "GG_ROOT": GUARDIAN_ROOT,
-        "GG_CFG": str(cfg),
-    }
     try:
-        proc = subprocess.run(
-            [GUARDIAN_VENV, "-c", _GUARDIAN_BRIDGE_SCRIPT],
-            capture_output=True,
-            text=True,
-            env=bridge_env,
-            timeout=60,
-            check=False,
-        )
+        proc = guardian_parity_bridge(cfg)
     except Exception as exc:  # noqa: BLE001 - bridge availability guard
         pytest.skip(f"guardian bridge subprocess could not run: {exc}")
     if proc.returncode != 0:

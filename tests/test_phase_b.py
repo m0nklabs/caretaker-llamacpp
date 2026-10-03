@@ -86,19 +86,11 @@ def _fast_manager(
     process = process or FakeServerProcess()
     kwargs.setdefault("health_polls", 3)
     kwargs.setdefault("health_interval", 0.0)
-    mgr = _make_manager(tmp_path, process=process, models=models, **kwargs)
-
-    async def _noop(*_a: Any, **_k: Any) -> None:
-        pass
-
-    mgr._save_context = _noop  # type: ignore[method-assign]
-    mgr._load_context = _noop  # type: ignore[method-assign]
-    mgr._free_gpu_memory = _noop  # type: ignore[method-assign]
-    return mgr
+    return _make_manager(tmp_path, process=process, models=models, **kwargs)
 
 
 @pytest.fixture
-def injection_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+def injection_reset(monkeypatch: pytest.MonkeyPatch, isolated_api_lifespan) -> None:
     """Configure the control key + reset the server singleton after each API test."""
     monkeypatch.setenv("CARETAKER_KEY", "test-secret")
     yield

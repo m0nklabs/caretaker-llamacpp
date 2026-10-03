@@ -45,7 +45,7 @@ def isolated_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def injection_reset():
+def injection_reset(isolated_api_lifespan):
     """Guarantee the server singleton is reset even if a test fails mid-way."""
     yield
     init(None)
