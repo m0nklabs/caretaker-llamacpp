@@ -10,14 +10,41 @@ permissions:
   contents: read
 
 jobs:
-  python-ci:
-    uses: m0nklabs/github-action-runners/.github/workflows/python-ci.yml@main
-    with:
-      # Deze self-hosted pool heeft de deps al pre-geïnstalleerd onder python 3.12
-      # (~/.local/lib/python3.12/site-packages); de org-reusable doet --no-deps.
-      # Python 3.14 (lokaal, pyproject) heeft geen pre-installed deps op de runners.
-      python-version: "3.12"
-      src-dir: caretaker
-      test-dir: tests
-      lint-path: "caretaker tests"
-    secrets: inherit
+  checks:
+    name: Python ${{ matrix.python-version }} checks
+    runs-on: [self-hosted, Linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - name: Prepare run-local environment path
+        env:
+          CHECK_PYTHON: ${{ matrix.python-version }}
+        run: |
+          # Resolve runner paths in a step: runner context is unavailable in job env.
+          echo "CHECK_VENV=$RUNNER_TEMP/caretaker-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CHECK_PYTHON" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install project and pinned development tools
+        run: |
+          python -m venv "$CHECK_VENV"
+          "$CHECK_VENV/bin/python" -m pip install -e '.[dev]'
+      - name: Check dependency consistency
+        run: '"$CHECK_VENV/bin/python" -m pip check'
+      - name: Lint
+        run: '"$CHECK_VENV/bin/python" -m ruff check caretaker tests'
+      - name: Compile
+        run: '"$CHECK_VENV/bin/python" -m compileall -q caretaker tests'
+      - name: Test
+        run: '"$CHECK_VENV/bin/python" -m pytest tests/ -q -p no:cacheprovider'
+      - name: Remove run-local environment
+        if: always()
+        run: |
+          if [ -z "${CHECK_VENV:-}" ]; then exit 0; fi
+          case "$CHECK_VENV" in
+            "$RUNNER_TEMP"/caretaker-*) rm -rf -- "$CHECK_VENV" ;;
+            *) echo "Refusing unexpected environment path" >&2; exit 1 ;;
+          esac

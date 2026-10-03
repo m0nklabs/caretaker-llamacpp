@@ -24,7 +24,7 @@ from caretaker.server import app, init
 from fastapi.testclient import TestClient
 
 from test_ensure_verification import AUTH_HEADER
-from test_phase_a import FakeServerProcess, _stub_props_ok
+from test_phase_a import FakeServerProcess, _stub_lifecycle_io, _stub_props_ok
 
 MINIMAL = "/home/flip/models/minimal.gguf"
 OTHER = "/home/flip/models/other.gguf"
@@ -49,6 +49,7 @@ def _make_manager_with_aliases(
         **kwargs,
     )
     _stub_props_ok(mgr)
+    _stub_lifecycle_io(mgr)
     return mgr
 
 
@@ -57,7 +58,7 @@ def _client() -> TestClient:
 
 
 @pytest.fixture
-def injection_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+def injection_reset(monkeypatch: pytest.MonkeyPatch, isolated_api_lifespan) -> None:
     monkeypatch.setenv("CARETAKER_KEY", "test-secret")
     yield
     init(None)

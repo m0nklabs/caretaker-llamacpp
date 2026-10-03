@@ -40,6 +40,15 @@ class RecordingManager:
         self.stopped += 1
 
 
+@pytest.fixture(autouse=True)
+def isolated_comfy(monkeypatch):
+    """Watchdog wiring tests do not run Comfy's independent HTTP poller."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(server_mod._comfy, "init_async", AsyncMock(return_value=None))
+    monkeypatch.setattr(server_mod._comfy, "shutdown_async", AsyncMock(return_value=None))
+
+
 @pytest.fixture()
 def fake_manager(monkeypatch: pytest.MonkeyPatch) -> RecordingManager:
     """Inject a recording manager; reset the singleton and env afterwards."""

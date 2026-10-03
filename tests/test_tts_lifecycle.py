@@ -9,7 +9,6 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
-
 from caretaker import tts as tts_mod
 
 
@@ -75,6 +74,47 @@ def _patch_spawn(monkeypatch, process):
 
     monkeypatch.setattr(tts_mod.asyncio, "create_subprocess_exec", _spawn)
     return spawned
+
+
+@pytest.mark.parametrize("outcome", ["success", "oserror", "valueerror", "cancelled"])
+async def test_spawn_closes_parent_log_handle(monkeypatch, tmp_path, outcome):
+    """Keep stdout open during spawn, then close it before polling or returning."""
+    log_path = tmp_path / "engine.log"
+    _patch_env(monkeypatch, CARETAKER_TTS_LOG=str(log_path))
+    handles = []
+
+    async def spawn(*cmd, stdout=None, **kwargs):
+        handles.append(stdout)
+        assert not stdout.closed
+        assert stdout.name == str(log_path)
+        stdout.write(b"spawn reached\n")
+        if outcome == "oserror":
+            raise OSError("Synthetic spawn failure")
+        if outcome == "valueerror":
+            raise ValueError("Synthetic spawn failure")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+        return _FakeProcess()
+
+    async def healthy():
+        assert handles[0].closed, "Parent log must close before health polling"
+        return True
+
+    monkeypatch.setattr(tts_mod.asyncio, "create_subprocess_exec", spawn)
+    health_mock = AsyncMock(side_effect=healthy)
+    monkeypatch.setattr(tts_mod, "_engine_healthy", health_mock)
+    if outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await tts_mod._start_engine()
+    else:
+        result = await tts_mod._start_engine()
+        assert result["ok"] is (outcome == "success")
+        if outcome != "success":
+            assert "spawn failed: Synthetic spawn failure" in result["reason"]
+    assert len(handles) == 1
+    assert handles[0].closed
+    assert log_path.read_bytes() == b"spawn reached\n"
+    assert health_mock.await_count == (1 if outcome == "success" else 0)
 
 
 async def test_disabled_reports_reason(monkeypatch):

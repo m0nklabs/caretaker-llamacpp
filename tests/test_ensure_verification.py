@@ -60,7 +60,7 @@ def isolated_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def injection_reset(monkeypatch: pytest.MonkeyPatch) -> Any:
+def injection_reset(monkeypatch: pytest.MonkeyPatch, isolated_api_lifespan) -> Any:
     """Configure the control key + reset the server singleton after each API test."""
     monkeypatch.setenv("CARETAKER_KEY", "test-secret")
     yield

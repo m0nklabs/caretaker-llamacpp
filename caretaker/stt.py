@@ -39,6 +39,7 @@ import os
 import shlex
 import subprocess
 import time
+from contextlib import nullcontext
 
 import httpx
 
@@ -132,12 +133,11 @@ async def _start_engine() -> dict:
         try:
             _process.terminate()
             await asyncio.wait_for(_process.wait(), timeout=10)
-        except Exception:  # noqa: BLE001 — best-effort cleanup
-            pass
+        except Exception:  # Best-effort cleanup.
+            logger.debug("STT previous child cleanup failed", exc_info=True)
 
     cwd = _env("CARETAKER_STT_CWD", "") or None
     log_path = _env("CARETAKER_STT_LOG", "")
-    log_fh = open(log_path, "ab") if log_path else subprocess.DEVNULL
     # Force UTF-8 IO on the engine child: engine prints carry emoji, and on
     # Windows a redirected file defaults to cp1252 — the print then raises
     # UnicodeEncodeError and kills the model load mid-flight.  Linux defaults
@@ -145,13 +145,19 @@ async def _start_engine() -> dict:
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-    try:
-        _process = await asyncio.create_subprocess_exec(
-            *cmd, cwd=cwd, stdout=log_fh, stderr=subprocess.STDOUT, env=env
-        )
-    except (OSError, ValueError) as exc:
-        logger.warning("STT engine spawn failed (%s): %r", cmd, exc)
-        return {"ok": False, "reason": f"spawn failed: {exc}"}
+    # Open only the local log descriptor synchronously; the child does all writes.
+    # Keeping acquisition on-loop avoids an orphaned thread-open on cancellation.
+    # Close the parent's copy after spawn (also on failure/cancellation), before health polling.
+    with (
+        open(log_path, "ab") if log_path else nullcontext(subprocess.DEVNULL)  # noqa: ASYNC230
+    ) as log_fh:
+        try:
+            _process = await asyncio.create_subprocess_exec(
+                *cmd, cwd=cwd, stdout=log_fh, stderr=subprocess.STDOUT, env=env
+            )
+        except (OSError, ValueError) as exc:
+            logger.warning("STT engine spawn failed (%s): %r", cmd, exc)
+            return {"ok": False, "reason": f"spawn failed: {exc}"}
 
     start_timeout = float(_env("CARETAKER_STT_START_TIMEOUT", "90"))
     deadline = time.monotonic() + start_timeout
@@ -217,34 +223,33 @@ async def _ensure_locked() -> dict:
         await asyncio.sleep(4)  # let the driver reclaim the memory
     free = await _gpu_free_mb()
     if free is not None and free < min_free:
+        # All VRAM busy: WAIT for it to free up (CARETAKER_STT_VRAM_WAIT_
+        # SECONDS, 0 = give up immediately) or fail with an honest reason.
+        # On a busy host the memory frees when the big model idle-unloads
+        # or another engine stops; the guardian's ensure_timeout_seconds
+        # must cover wait + cold start (see global.settings.yaml).
+        wait_s = int(_env("CARETAKER_STT_VRAM_WAIT_SECONDS", "0"))
+        poll_s = max(2, int(_env("CARETAKER_STT_VRAM_POLL_SECONDS", "5")))
+        deadline = time.monotonic() + wait_s
+        while free is not None and free < min_free and time.monotonic() < deadline:
+            logger.info(
+                "STT ensure: VRAM busy (%s/%s MB free) — waiting up to %ss",
+                free, min_free, wait_s,
+            )
+            await asyncio.sleep(min(poll_s, max(1.0, deadline - time.monotonic())))
+            if await _engine_healthy():
+                _mark_used()
+                return {"ok": True, "already_running": True}
+            free = await _gpu_free_mb()
         if free is not None and free < min_free:
-            # All VRAM busy: WAIT for it to free up (CARETAKER_STT_VRAM_WAIT_
-            # SECONDS, 0 = give up immediately) or fail with an honest reason.
-            # On a busy host the memory frees when the big model idle-unloads
-            # or another engine stops; the guardian's ensure_timeout_seconds
-            # must cover wait + cold start (see global.settings.yaml).
-            wait_s = int(_env("CARETAKER_STT_VRAM_WAIT_SECONDS", "0"))
-            poll_s = max(2, int(_env("CARETAKER_STT_VRAM_POLL_SECONDS", "5")))
-            deadline = time.monotonic() + wait_s
-            while free is not None and free < min_free and time.monotonic() < deadline:
-                logger.info(
-                    "STT ensure: VRAM busy (%s/%s MB free) — waiting up to %ss",
-                    free, min_free, wait_s,
-                )
-                await asyncio.sleep(min(poll_s, max(1.0, deadline - time.monotonic())))
-                if await _engine_healthy():
-                    _mark_used()
-                    return {"ok": True, "already_running": True}
-                free = await _gpu_free_mb()
-            if free is not None and free < min_free:
-                waited = f" after {wait_s}s wait" if wait_s > 0 else ""
-                return {
-                    "ok": False,
-                    "reason": (
-                        f"insufficient VRAM free ({free} MB < {min_free} MB){waited} — "
-                        "configure CARETAKER_STT_VRAM_WAIT_SECONDS to wait longer or rely on failover"
-                    ),
-                }
+            waited = f" after {wait_s}s wait" if wait_s > 0 else ""
+            return {
+                "ok": False,
+                "reason": (
+                    f"insufficient VRAM free ({free} MB < {min_free} MB){waited} — "
+                    "configure CARETAKER_STT_VRAM_WAIT_SECONDS to wait longer or rely on failover"
+                ),
+            }
 
     result = await _start_engine()
     if result.get("ok"):
@@ -254,7 +259,6 @@ async def _ensure_locked() -> dict:
 
 async def release_stt() -> dict:
     """Stop the engine process (frees its VRAM); idempotent."""
-    global _process
     if not stt_enabled():
         return {"ok": False, "reason": "CARETAKER_STT_ENABLED=0"}
     if not await _engine_healthy():

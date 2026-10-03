@@ -3,10 +3,11 @@ GPU services stop after 5 min of non-use and the caretaker restarts them on
 the next request)."""
 
 import asyncio
+import socket
 import time
 
+import httpx
 import pytest
-
 from caretaker import comfy as comfy_mod
 
 
@@ -32,6 +33,34 @@ def _env(monkeypatch, **overrides):
     base.update(overrides)
     for key, value in base.items():
         monkeypatch.setenv(key, value)
+
+
+@pytest.fixture
+def proxy_listener(monkeypatch, allow_test_listener):
+    """Reserve an ephemeral socket; start_proxy's port=0 means disabled."""
+    async def start_proxy():
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        real_start_server = asyncio.start_server
+
+        async def start_server(handler, host, requested_port):
+            assert (host, requested_port) == ("127.0.0.1", port)
+            server = await real_start_server(handler, sock=sock)
+            allow_test_listener(server)
+            return server
+
+        monkeypatch.setenv("CARETAKER_COMFY_PROXY_PORT", str(port))
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(asyncio, "start_server", start_server)
+                await comfy_mod.start_proxy()
+        except BaseException:
+            sock.close()
+            raise
+        return port
+
+    return start_proxy
 
 
 # --- watcher tick ---
@@ -107,7 +136,7 @@ async def test_zero_idle_budget_disables_watch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_proxy_pumps_when_comfy_already_up(monkeypatch):
+async def test_proxy_pumps_when_comfy_already_up(monkeypatch, proxy_listener, allow_test_listener):
     _env(monkeypatch)
     wake_calls = []
 
@@ -129,13 +158,13 @@ async def test_proxy_pumps_when_comfy_already_up(monkeypatch):
         writer.close()
 
     upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
     port_up = upstream.sockets[0].getsockname()[1]
     # comfy_url() prefers CARETAKER_COMFY_URL — point it at the fake upstream
     monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{port_up}")
-    monkeypatch.setenv("CARETAKER_COMFY_PROXY_PORT", "18123")
-    await comfy_mod.start_proxy()
+    port = await proxy_listener()
 
-    reader, writer = await asyncio.open_connection("127.0.0.1", 18123)
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
     writer.write(b"ping")
     await writer.drain()
     assert await reader.read(100) == b"PING"
@@ -145,7 +174,7 @@ async def test_proxy_pumps_when_comfy_already_up(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_proxy_wake_failure_closes_connection(monkeypatch):
+async def test_proxy_wake_failure_closes_connection(monkeypatch, proxy_listener):
     _env(monkeypatch)
 
     async def snap():
@@ -157,11 +186,9 @@ async def test_proxy_wake_failure_closes_connection(monkeypatch):
         return False  # the start command failed
 
     monkeypatch.setattr(comfy_mod, "start_comfy", fake_start)
-    monkeypatch.setenv("CARETAKER_COMFY_PROXY_PORT", "18124")
-    monkeypatch.setenv("CARETAKER_COMFY_URL", "http://127.0.0.1:8189")
-    await comfy_mod.start_proxy()
+    port = await proxy_listener()
 
-    reader, writer = await asyncio.open_connection("127.0.0.1", 18124)
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
     writer.write(b"GET / HTTP/1.0\r\n\r\n")
     await writer.drain()
     # Contract: a failed wake drops the connection WITHOUT response data —
@@ -195,7 +222,7 @@ async def test_unbindable_port_degrades_instead_of_boot_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_silent_connection_times_out_and_releases(monkeypatch):
+async def test_silent_connection_times_out_and_releases(monkeypatch, allow_test_listener):
     """An abandoned connection (no bytes, no FIN) must not pin the idle
     release forever — the pipe closes after the silence budget."""
     _env(monkeypatch)
@@ -205,8 +232,9 @@ async def test_silent_connection_times_out_and_releases(monkeypatch):
         await asyncio.sleep(60)  # holds the connection open, never sends
 
     server = await asyncio.start_server(black_hole, "127.0.0.1", 0)
+    allow_test_listener(server)
     port = server.sockets[0].getsockname()[1]
-    client_reader, client_writer = await asyncio.open_connection("127.0.0.1", port)
+    _client_reader, client_writer = await asyncio.open_connection("127.0.0.1", port)
     upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", port)
 
     async def dead_pipe():
@@ -264,11 +292,20 @@ def test_malformed_env_falls_back_to_defaults(monkeypatch):
 async def test_status_reports_shape(monkeypatch):
     _env(monkeypatch, CARETAKER_COMFY_PROXY_PORT="18125")
 
-    async def snap():
-        return None  # comfy down — the probe must still resolve
+    requests = []
 
-    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+    def offline(request):
+        requests.append(request)
+        raise httpx.ConnectError("Synthetic offline backend", request=request)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(offline), **kwargs),
+    )
     status = await comfy_mod.astatus()
+    assert len(requests) == 1
+    assert requests[0].url.path == "/queue"
     assert status["idle_seconds"] == 300
     assert status["proxy_port"] == 18125
     assert status["up"] is False
@@ -286,11 +323,13 @@ async def test_proxy_binds_loopback_by_default(monkeypatch):
     _env(monkeypatch, CARETAKER_COMFY_PROXY_PORT="18126")
     binds = []
 
+    from unittest.mock import Mock
+
     real_start_server = comfy_mod.asyncio.start_server
 
-    def spy(handler, host, port):
+    async def spy(handler, host, port):
         binds.append(host)
-        return real_start_server(handler, host, port)
+        return Mock()
 
     comfy_mod.asyncio.start_server = spy
     try:
