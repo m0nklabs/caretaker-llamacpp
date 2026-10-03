@@ -2,7 +2,7 @@
 
 > Canonical AI-agent context voor dit repo. **Eerst lezen.**
 > Claude Code: `CLAUDE.md` → hier. Goose: `.goosehints` → hier.
-> Status: **Phase A–E GEMERGED; TTS/STT/Comfy-lifecycles live (2026-09); watchdog-wiring in review (2026-09-25) — zie `./PLAN.md` + `./docs/HANDOFF.md`.**
+> Current state, verified findings, checks and open review conditions: `./docs/HANDOFF.md`. Implementation plan: `./PLAN.md`. Historical status entries below are not proof of the current checkout or deployment.
 
 ## Wat is dit project
 
@@ -378,10 +378,33 @@ ai-kvm-2 (Linux, GPU #1)              14700K (Windows, GPU #2)
 
 ## Critical rules / conventies
 
-- **Testen vóór claimen:** zodra er code is: `py_compile` + pytest, nooit
-  "fixed" claimen zonder verifieerbare run. Tests groen houden: huidige suite
-  12 tests — bij elke wijziging volledig draaien (`./venv/bin/python -m pytest
-  tests/ -q -p no:cacheprovider`).
+- **Lifecycle concurrency:** public `switch_model`, `unload` and `stop` serialize
+  through the manager's lifecycle lock. Private `*_locked` helpers require that
+  lock; never call a public locking wrapper while holding it. Watchdog observations
+  must be generation-validated under the lock after probes/backoff, before crash
+  handling (which stops the backend) or restart. Keep backoff outside the lock so
+  foreground operations can supersede recovery. Regression coverage:
+  `tests/test_lifecycle_concurrency.py`; current evidence: `docs/HANDOFF.md`.
+- **Verification:** run compilation, full pytest and Ruff before claiming a fix.
+  Install `.[dev]` in an isolated virtual environment; development-tool versions
+  and the minimum supported Ruff Python target are defined in `pyproject.toml`.
+  Local commands are in `README.md`; CI uses the same checks on Python 3.12/3.14.
+  Ordinary tests must mock production I/O, not depend on live services or turn
+  blocked connections into simulated outages. Test-owned loopback listeners need
+  explicit scoped permission in the test I/O guard.
+- **Backend credentials:** `CARETAKER_BACKEND_KEY` (env, read per call via
+  `backend_headers()`) supplies a Bearer header to the backend-protected calls
+  only (`GET /props`, slots save/restore context calls). The health probe stays
+  keyless (llama-server exempts /health). Never reuse the control `CARETAKER_KEY`
+  as backend credential; unset means keyless backend (current ai-kvm2/teams-host
+  deployments). Fixes the 2026-09-11 inter-repo gap (`--api-key` broke /props
+  verification). Regression coverage: `tests/test_backend_auth.py`.
+- **OOM classification is text-evidence only:** `classify_oom()` inspects the
+  crash log text (CUDA phrases take precedence; `"cuda"` in text → cuda source,
+  else kernel). Exit codes prove nothing — 137 alone is not OOM, 139 is not OOM.
+  `CrashRecord` gained additive fields `oom: bool` + `oom_source: "kernel"|"cuda"`,
+  passed through unchanged in the 503 `crash_details` (server.py untouched).
+  Regression coverage: `tests/test_oom_classification.py`.
 - **Geen hardcoded variabelen.** Paden/poorten/namen/timeouts komen in
   config-YAML (`${VAR}`-expandable) of een paths-module; nooit literals
   "voor het gemak" kopiëren. Een hardcoded waarde die config omzeilt is een
@@ -414,7 +437,7 @@ ai-kvm-2 (Linux, GPU #1)              14700K (Windows, GPU #2)
 PLAN.md             Gefaseerd implementatieplan (fases A–E + gateway-wiring)
 AGENTS.md           Dit bestand
 pyproject.toml      Package `caretaker` (Python >=3.12; dev: pytest/ruff)
-requirements.txt    Runtime-deps voor de org-reusable python-ci (--no-deps)
+requirements.txt    Runtime dependency list; isolated CI installs the project with .[dev]
 caretaker/
   __main__.py       uvicorn entrypoint (CARETAKER_HOST/PORT, default :11441)
   config.py         load_models_config(config_path?) → ModelsConfig (models/aliases)
@@ -441,9 +464,14 @@ tests/
   test_tts/test_stt/test_comfy_lifecycle.py  engine-lifecycles (TTS/STT/Comfy, 2026-09;
                     details in docs/HANDOFF.md — de kaart hier is niet volledig)
   test_watchdog_wiring.py      9 pins: watchdog-startup-wiring (env-knobs, fail-open beide kanten)
+  conftest.py / io_guard.py    Autouse test I/O guard (sockets/DNS/subprocess), scoped listener permissions
+  test_io_isolation.py         Guard-behavior pins (violations fail teardown even when swallowed)
+  test_lifecycle_concurrency.py 19 race regressions for the lifecycle lock/generation repair
+  test_backend_auth.py         4 pins: call-time CARETAKER_BACKEND_KEY on /props + slots, keyless health
+  test_oom_classification.py   Text-only OOM pins (137/139 ≠ OOM), additive serialization, 503 passthrough
 .github/workflows/
   pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
-  python-ci.yml     Org-reusable python-ci (python 3.12, src caretaker)
+  python-ci.yml     Isolated Python 3.12/3.14 checks using project-pinned development tools
 ```
 
 ## Handoff
