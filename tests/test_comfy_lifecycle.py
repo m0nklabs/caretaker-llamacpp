@@ -22,6 +22,7 @@ def _fresh_state():
     comfy_mod._slot_waiting = 0
     comfy_mod._last_free_mb = None
     comfy_mod._vram_policy_warned = False
+    comfy_mod._vram_gate_lock = asyncio.Lock()
     yield
     if comfy_mod._proxy_server is not None:
         comfy_mod._proxy_server.close()
@@ -655,3 +656,130 @@ async def test_status_reports_gate_keys(monkeypatch):
     assert status["slot_active"] == 0
     assert status["slot_waiting"] == 0
     assert status["last_free_mb"] is None
+
+
+@pytest.mark.asyncio
+async def test_gate_runs_inside_slot_not_per_waiter(monkeypatch, proxy_listener, allow_test_listener):
+    """The gate probes only after a connection HOLDS its slot: a queued client
+    must not spin probe/nudge loops while waiting (finding: the /free herd)."""
+    _env(monkeypatch, CARETAKER_COMFY_MAX_CONCURRENT="1", CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000")
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def fake_probe():
+        return 5000  # sufficient — the gate passes immediately when it runs
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+
+    hold = asyncio.Event()
+
+    async def hold_echo(reader, writer):
+        data = await reader.read(100)
+        await hold.wait()
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(hold_echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    a_reader, a_writer = await asyncio.open_connection("127.0.0.1", port)
+    a_writer.write(b"aa")
+    await a_writer.drain()
+    await asyncio.sleep(0.3)  # A owns the slot and reaches the held upstream
+
+    b_reader, b_writer = await asyncio.open_connection("127.0.0.1", port)
+    b_writer.write(b"bb")
+    await b_writer.drain()
+    await asyncio.sleep(0.3)
+    assert comfy_mod._slot_waiting == 1  # B is queued on the slot...
+
+    hold.set()
+    assert await asyncio.wait_for(a_reader.read(100), timeout=3) == b"AA"
+    a_writer.close()
+    # Only after A releases may B enter the gate at all.
+    assert await asyncio.wait_for(b_reader.read(100), timeout=5) == b"BB"
+    b_writer.close()
+    upstream.close()
+    await asyncio.sleep(0.1)  # let the handler's finally run before asserting
+    assert comfy_mod._slot_active == 0  # released, no permit leak
+
+
+@pytest.mark.asyncio
+async def test_gate_lock_serializes_probe_loops(monkeypatch, proxy_listener, allow_test_listener):
+    """Two concurrent gate entrants share ONE serialized probe sequence: the
+    second waits for the lock instead of running its own loop (3 probes, not
+    4 — the exact /free-herd shape PR-Piet flagged)."""
+    _env(
+        monkeypatch,
+        CARETAKER_COMFY_MAX_CONCURRENT="2",
+        CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000",
+        CARETAKER_COMFY_VRAM_WAIT_SECONDS="30",
+    )
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    # Serialized with the gate lock: conn A consumes [500 (fail), 5000 (pass)],
+    # conn B then gets 5000 (pass). Without the lock both would interleave and
+    # drain 4 probes.
+    probe_results = [500, 5000, 5000]
+    probe_calls = []
+
+    async def fake_probe():
+        probe_calls.append(1)
+        return probe_results.pop(0) if probe_results else 5000
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+    real_sleep = asyncio.sleep
+
+    async def instant_sleep(delay):
+        return None
+
+    comfy_mod.asyncio.sleep = instant_sleep
+    try:
+        async def echo(reader, writer):
+            data = await reader.read(100)
+            writer.write(data.upper())
+            await writer.drain()
+            writer.close()
+
+        upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+        allow_test_listener(upstream)
+        monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+        port = await proxy_listener()
+
+        readers = []
+        for _ in range(2):
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            readers.append((r, w))
+            w.write(b"ping")
+            await w.drain()
+        for r, w in readers:
+            assert await asyncio.wait_for(r.read(100), timeout=5) == b"PING"
+            w.close()
+        upstream.close()
+    finally:
+        comfy_mod.asyncio.sleep = real_sleep
+    assert len(probe_calls) == 3  # serialized sequence, no interleave inflation
+    assert free_posts == ["/free"]  # exactly one nudge
