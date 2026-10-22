@@ -418,11 +418,15 @@ async def _probe_free_vram_mb() -> int | None:
     return _last_free_mb
 
 
-async def _synthetic_503(writer: asyncio.StreamWriter, body: dict[str, Any]) -> None:
+async def _synthetic_503(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, body: dict[str, Any]
+) -> None:
     """Answer a not-yet-piped connection with a minimal HTTP 503 + JSON body.
 
     The proxy speaks raw bytes; this is only ever sent BEFORE forwarding
-    starts, so no HTTP parsing is involved."""
+    starts, so no HTTP parsing is involved. Inbound bytes are drained first
+    (bounded): closing a socket with unread client data makes the TCP stack
+    emit RST, which can discard the 503 before the client ever reads it."""
     payload = json.dumps(body).encode()
     head = (
         "HTTP/1.1 503 Service Unavailable\r\n"
@@ -431,12 +435,21 @@ async def _synthetic_503(writer: asyncio.StreamWriter, body: dict[str, Any]) -> 
         "Connection: close\r\n\r\n"
     ).encode()
     try:
+        drain_deadline = time.monotonic() + 2.0
+        while time.monotonic() < drain_deadline:
+            try:
+                if not await asyncio.wait_for(reader.read(65536), timeout=0.25):
+                    break  # EOF — the client is already gone
+            except TimeoutError:
+                break  # nothing more inbound within the read budget
         writer.write(head + payload)
         await writer.drain()
     except Exception:
         logger.debug("Comfy proxy: 503 write failed", exc_info=True)
     finally:
-        writer.close()
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
 
 
 async def _vram_gate() -> dict[str, Any] | None:
@@ -565,6 +578,7 @@ async def _handle_client_inner(
     ok, sem = await _acquire_slot(_slot_wait_timeout())
     if not ok:
         await _synthetic_503(
+            client_reader,
             client_writer,
             {"error": "comfy_slot_timeout", "message": "Comfy proxy slot wait timed out"},
         )
@@ -575,7 +589,7 @@ async def _handle_client_inner(
         # out per waiting client.
         gate_error = await _vram_gate()
         if gate_error is not None:
-            await _synthetic_503(client_writer, gate_error)
+            await _synthetic_503(client_reader, client_writer, gate_error)
             return
         try:
             upstream_reader, upstream_writer = await asyncio.open_connection(

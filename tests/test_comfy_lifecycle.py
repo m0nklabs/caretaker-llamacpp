@@ -859,3 +859,30 @@ async def test_gate_never_frees_while_job_running(monkeypatch, proxy_listener, a
     finally:
         comfy_mod.asyncio.sleep = real_sleep
     assert free_posts == []  # busy queue -> the nudge never fires
+
+
+@pytest.mark.asyncio
+async def test_503_delivered_despite_pipelined_request(monkeypatch, proxy_listener, allow_test_listener):
+    """A client that pipelines its HTTP request right after connect must still
+    receive the 503: the proxy drains inbound bytes before closing, otherwise
+    the TCP RST discards the response (PR-Piet ronde 4)."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="fail")
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def fake_probe():
+        return 100
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+    port = await proxy_listener()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"POST /prompt HTTP/1.1\r\nHost: proxy\r\nContent-Length: 2\r\n\r\n{}")
+    await writer.drain()
+    body = await asyncio.wait_for(reader.read(4096), timeout=6)
+    assert b"503 Service Unavailable" in body
+    assert b"comfy_vram_unavailable" in body
+    writer.close()
