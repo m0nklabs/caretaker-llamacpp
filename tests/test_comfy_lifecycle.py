@@ -783,3 +783,19 @@ async def test_gate_lock_serializes_probe_loops(monkeypatch, proxy_listener, all
         comfy_mod.asyncio.sleep = real_sleep
     assert len(probe_calls) == 3  # serialized sequence, no interleave inflation
     assert free_posts == ["/free"]  # exactly one nudge
+
+
+@pytest.mark.asyncio
+async def test_semaphore_not_rebuilt_while_waiters_pending(monkeypatch):
+    """Rebuild waits for BOTH zero active and zero waiting: queued clients
+    must never be stranded on a stale semaphore instance."""
+    _env(monkeypatch, CARETAKER_COMFY_MAX_CONCURRENT="2")
+    sem = comfy_mod._get_slot_semaphore()
+    comfy_mod._slot_active = 1
+    comfy_mod._slot_waiting = 1
+    monkeypatch.setenv("CARETAKER_COMFY_MAX_CONCURRENT", "5")
+    assert comfy_mod._get_slot_semaphore() is sem  # unchanged while occupied
+    comfy_mod._slot_active = 0
+    assert comfy_mod._get_slot_semaphore() is sem  # still: waiter pending
+    comfy_mod._slot_waiting = 0
+    assert comfy_mod._get_slot_semaphore() is not sem  # idle now: rebuilt at 5

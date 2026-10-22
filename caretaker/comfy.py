@@ -367,11 +367,14 @@ def _vram_wait_seconds() -> int:
 
 def _get_slot_semaphore() -> asyncio.Semaphore:
     """Loop-created, shared across proxied connections; rebuilt only while NO
-    slots are held (env is read per call, tests monkeypatch it), so a permit
-    is never credited to a semaphore a live connection did not consume."""
+    slots are held or waited on (env is read per call, tests monkeypatch it),
+    so a permit is never credited to a semaphore a live connection did not
+    consume and queued waiters are never stranded on a stale instance."""
     global _slot_semaphore, _slot_semaphore_size
     want = _max_concurrent()
-    if _slot_semaphore is None or (_slot_semaphore_size != want and _slot_active == 0):
+    if _slot_semaphore is None or (
+        _slot_semaphore_size != want and _slot_active == 0 and _slot_waiting == 0
+    ):
         _slot_semaphore = asyncio.Semaphore(want)
         _slot_semaphore_size = want
     return _slot_semaphore
