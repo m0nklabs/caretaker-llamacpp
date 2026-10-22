@@ -483,7 +483,14 @@ async def _vram_gate() -> dict[str, Any] | None:
                     "free_mb": free,
                     "required_mb": min_free,
                 }
-            # Nudge Comfy to release cached models, then re-probe.
+            # Nudge Comfy to release cached models, then re-probe — but never
+            # while a job is running: /free can unload models mid-generation.
+            # Low VRAM with a running job simply keeps waiting until the
+            # budget runs out (the job owns the VRAM; we must not steal it).
+            snap = await _queue_snapshot()
+            if not snap or snap.get("queue_running"):
+                await asyncio.sleep(2.0)
+                continue
             host, port = upstream_target()
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:

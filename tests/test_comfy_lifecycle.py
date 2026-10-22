@@ -799,3 +799,63 @@ async def test_semaphore_not_rebuilt_while_waiters_pending(monkeypatch):
     assert comfy_mod._get_slot_semaphore() is sem  # still: waiter pending
     comfy_mod._slot_waiting = 0
     assert comfy_mod._get_slot_semaphore() is not sem  # idle now: rebuilt at 5
+
+
+@pytest.mark.asyncio
+async def test_gate_never_frees_while_job_running(monkeypatch, proxy_listener, allow_test_listener):
+    """The /free nudge is skipped while Comfy reports a running job: /free can
+    unload models mid-generation (PR-Piet ronde 3). The gate just keeps
+    waiting/re-probing until the budget runs out instead."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_WAIT_SECONDS="30")
+
+    async def busy_snap():
+        return {"queue_running": [1], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", busy_snap)
+
+    probe_results = [500, 5000]  # low -> (guard skips nudge) -> re-probe passes
+
+    async def fake_probe():
+        return probe_results.pop(0) if probe_results else 5000
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+    real_sleep = asyncio.sleep
+
+    async def instant_sleep(delay):
+        return None
+
+    comfy_mod.asyncio.sleep = instant_sleep
+    try:
+        async def echo(reader, writer):
+            data = await reader.read(100)
+            writer.write(data.upper())
+            await writer.drain()
+            writer.close()
+
+        upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+        allow_test_listener(upstream)
+        monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+        port = await proxy_listener()
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"ping")
+        await writer.drain()
+        assert await asyncio.wait_for(reader.read(100), timeout=3) == b"PING"
+        writer.close()
+        upstream.close()
+    finally:
+        comfy_mod.asyncio.sleep = real_sleep
+    assert free_posts == []  # busy queue -> the nudge never fires
