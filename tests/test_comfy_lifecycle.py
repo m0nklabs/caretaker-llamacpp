@@ -960,3 +960,31 @@ async def test_idle_permit_drift_rebuilds_semaphore(monkeypatch):
     assert comfy_mod._slot_semaphore is None  # drift -> dropped for rebuild
     fresh = comfy_mod._get_slot_semaphore()
     assert fresh is not sem
+
+
+@pytest.mark.asyncio
+async def test_drift_check_degrades_without_private_value(monkeypatch):
+    """`sem._value` is private asyncio state: if a future CPython drops it,
+    the drift check degrades to disabled — the release path must never crash
+    on a missing private attribute."""
+    _env(monkeypatch, CARETAKER_COMFY_MAX_CONCURRENT="1")
+
+    class ValuelessSemaphore:
+        def __init__(self):
+            self._permits = 1
+
+        async def acquire(self):
+            assert self._permits > 0
+            self._permits -= 1
+
+        def release(self):
+            self._permits += 1
+
+    comfy_mod._slot_semaphore_size = 1
+    sem = ValuelessSemaphore()
+    comfy_mod._slot_semaphore = sem  # installed as the live instance
+    await sem.acquire()
+    comfy_mod._slot_active = 1
+    comfy_mod._release_slot(sem)  # no _value attribute -> no crash, no rebuild
+    assert comfy_mod._slot_active == 0
+    assert comfy_mod._slot_semaphore is sem  # kept as-is (check degraded off)
