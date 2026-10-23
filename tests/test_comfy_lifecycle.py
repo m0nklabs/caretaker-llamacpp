@@ -886,3 +886,82 @@ async def test_503_delivered_despite_pipelined_request(monkeypatch, proxy_listen
     assert b"503 Service Unavailable" in body
     assert b"comfy_vram_unavailable" in body
     writer.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_connection_not_closed_by_conn_idle(monkeypatch, proxy_listener, allow_test_listener):
+    """The per-connection silence budget lives in _pipe, which exists only
+    after the permit: a QUEUED connection is untouched by conn_idle, so with
+    SLOT_WAIT=0 (indefinite) and CONN_IDLE=1 — the racing config PR-Piet
+    named — the queued client is neither stranded nor silently closed; it is
+    served when a permit frees (refutation pinned with code)."""
+    _env(
+        monkeypatch,
+        CARETAKER_COMFY_MAX_CONCURRENT="1",
+        CARETAKER_COMFY_SLOT_WAIT_TIMEOUT="0",
+        CARETAKER_COMFY_CONN_IDLE_TIMEOUT="1",
+    )
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+    hold = asyncio.Event()
+
+    async def hold_echo(reader, writer):
+        data = await reader.read(100)
+        # Like a live Comfy job: stream progress bytes while the work runs,
+        # or conn_idle would rightly close the (half-)silent connection — the
+        # interaction under test is B's queued window, not A's.
+        while not hold.is_set():
+            writer.write(b".")
+            await writer.drain()
+            await asyncio.sleep(0.4)
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(hold_echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    a_reader, a_writer = await asyncio.open_connection("127.0.0.1", port)
+    a_writer.write(b"aa")
+    await a_writer.drain()
+    await asyncio.sleep(0.3)  # A owns the slot, upstream held
+
+    # A behaves like a live websocket job: it keeps sending input bytes,
+    # otherwise conn_idle would rightly close ITS half-silent connection
+    # (and free the slot) — under test is B's queued window, not A's.
+    stop = asyncio.Event()
+
+    async def keepalive(writer: asyncio.StreamWriter):
+        while not stop.is_set():
+            try:
+                writer.write(b"x")
+                await writer.drain()
+            except Exception:  # noqa: BLE001 — any transport error ends the job
+                return
+            await asyncio.sleep(0.4)
+
+    ka = asyncio.create_task(keepalive(a_writer))
+
+    b_reader, b_writer = await asyncio.open_connection("127.0.0.1", port)
+    b_writer.write(b"bb")
+    await b_writer.drain()
+    await asyncio.sleep(2.5)  # 2.5x conn_idle — the named silent close window
+    assert comfy_mod._slot_waiting == 1  # B is STILL queued, not silently closed
+    assert not b_writer.is_closing()
+
+    stop.set()
+    await asyncio.gather(ka, return_exceptions=True)
+    hold.set()
+    a_buf = b""
+    while b"AA" not in a_buf:  # progress dots may arrive before the reply
+        a_buf += await asyncio.wait_for(a_reader.read(100), timeout=3)
+    a_writer.close()
+    await asyncio.sleep(0.1)  # let A's handler finally release the permit
+    assert await asyncio.wait_for(b_reader.read(100), timeout=5) == b"BB"
+    b_writer.close()
+    upstream.close()
