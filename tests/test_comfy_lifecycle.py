@@ -517,32 +517,23 @@ async def test_vram_gate_waits_frees_then_forwards(monkeypatch, proxy_listener, 
         "AsyncClient",
         lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
     )
-    real_sleep = asyncio.sleep
-
-    async def instant_sleep(delay):
-        return None
-
-    comfy_mod.asyncio.sleep = instant_sleep
-    try:
-        async def echo(reader, writer):
-            data = await reader.read(100)
-            writer.write(data.upper())
-            await writer.drain()
-            writer.close()
-
-        upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
-        allow_test_listener(upstream)
-        monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
-        port = await proxy_listener()
-
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(b"ping")
+    async def echo(reader, writer):
+        data = await reader.read(100)
+        writer.write(data.upper())
         await writer.drain()
-        assert await asyncio.wait_for(reader.read(100), timeout=3) == b"PING"
         writer.close()
-        upstream.close()
-    finally:
-        comfy_mod.asyncio.sleep = real_sleep
+
+    upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"ping")
+    await writer.drain()
+    assert await asyncio.wait_for(reader.read(100), timeout=10) == b"PING"
+    writer.close()
+    upstream.close()
     assert free_posts == ["/free"]  # exactly one nudge before the re-probe passed
     assert len(probe_results) == 0  # both probes ran
 
@@ -751,36 +742,27 @@ async def test_gate_lock_serializes_probe_loops(monkeypatch, proxy_listener, all
         "AsyncClient",
         lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
     )
-    real_sleep = asyncio.sleep
+    async def echo(reader, writer):
+        data = await reader.read(100)
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
 
-    async def instant_sleep(delay):
-        return None
+    upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
 
-    comfy_mod.asyncio.sleep = instant_sleep
-    try:
-        async def echo(reader, writer):
-            data = await reader.read(100)
-            writer.write(data.upper())
-            await writer.drain()
-            writer.close()
-
-        upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
-        allow_test_listener(upstream)
-        monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
-        port = await proxy_listener()
-
-        readers = []
-        for _ in range(2):
-            r, w = await asyncio.open_connection("127.0.0.1", port)
-            readers.append((r, w))
-            w.write(b"ping")
-            await w.drain()
-        for r, w in readers:
-            assert await asyncio.wait_for(r.read(100), timeout=5) == b"PING"
-            w.close()
-        upstream.close()
-    finally:
-        comfy_mod.asyncio.sleep = real_sleep
+    readers = []
+    for _ in range(2):
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        readers.append((r, w))
+        w.write(b"ping")
+        await w.drain()
+    for r, w in readers:
+        assert await asyncio.wait_for(r.read(100), timeout=10) == b"PING"
+        w.close()
+    upstream.close()
     assert len(probe_calls) == 3  # serialized sequence, no interleave inflation
     assert free_posts == ["/free"]  # exactly one nudge
 
@@ -832,32 +814,23 @@ async def test_gate_never_frees_while_job_running(monkeypatch, proxy_listener, a
         "AsyncClient",
         lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
     )
-    real_sleep = asyncio.sleep
-
-    async def instant_sleep(delay):
-        return None
-
-    comfy_mod.asyncio.sleep = instant_sleep
-    try:
-        async def echo(reader, writer):
-            data = await reader.read(100)
-            writer.write(data.upper())
-            await writer.drain()
-            writer.close()
-
-        upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
-        allow_test_listener(upstream)
-        monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
-        port = await proxy_listener()
-
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(b"ping")
+    async def echo(reader, writer):
+        data = await reader.read(100)
+        writer.write(data.upper())
         await writer.drain()
-        assert await asyncio.wait_for(reader.read(100), timeout=3) == b"PING"
         writer.close()
-        upstream.close()
-    finally:
-        comfy_mod.asyncio.sleep = real_sleep
+
+    upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"ping")
+    await writer.drain()
+    assert await asyncio.wait_for(reader.read(100), timeout=3) == b"PING"
+    writer.close()
+    upstream.close()
     assert free_posts == []  # busy queue -> the nudge never fires
 
 
