@@ -16,6 +16,13 @@ def _fresh_state():
     comfy_mod._last_activity_monotonic = None
     comfy_mod._proxy_server = None
     comfy_mod._enabled = False
+    comfy_mod._slot_semaphore = None
+    comfy_mod._slot_semaphore_size = 0
+    comfy_mod._slot_active = 0
+    comfy_mod._slot_waiting = 0
+    comfy_mod._last_free_mb = None
+    comfy_mod._vram_policy_warned = False
+    comfy_mod._vram_gate_lock = asyncio.Lock()
     yield
     if comfy_mod._proxy_server is not None:
         comfy_mod._proxy_server.close()
@@ -362,3 +369,594 @@ def test_probe_and_upstream_may_split(monkeypatch):
     # default single-URL setup: the probe IS the upstream
     monkeypatch.delenv("CARETAKER_COMFY_INTERNAL_URL")
     assert comfy_mod.upstream_target() == ("probe.internal", 9000)
+
+
+# --- VRAM gate + connection slots (the cross-workload GPU arbiter, fase 1) ---
+
+
+@pytest.mark.asyncio
+async def test_gate_off_by_default_never_probes(monkeypatch, proxy_listener, allow_test_listener):
+    """Gate-off is zero-change behavior: no VRAM probing, pure wake+forward."""
+    _env(monkeypatch)  # no VRAM keys -> gate off
+    probes = []
+
+    async def bomb():
+        probes.append(1)
+        return 999999
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", bomb)
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def echo(reader, writer):
+        data = await reader.read(100)
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"ping")
+    await writer.drain()
+    assert await asyncio.wait_for(reader.read(100), timeout=3) == b"PING"
+    writer.close()
+    upstream.close()
+    assert probes == []  # the gate never even looked at VRAM
+
+
+@pytest.mark.asyncio
+async def test_slot_serializes_concurrent_connections(monkeypatch, proxy_listener, allow_test_listener):
+    """MAX_CONCURRENT=1: the second client waits for the slot until the first
+    connection closes — requests wait on each other by design."""
+    _env(monkeypatch, CARETAKER_COMFY_MAX_CONCURRENT="1")
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+    hold = asyncio.Event()
+
+    async def hold_echo(reader, writer):
+        data = await reader.read(100)
+        await hold.wait()
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(hold_echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    a_reader, a_writer = await asyncio.open_connection("127.0.0.1", port)
+    a_writer.write(b"aa")
+    await a_writer.drain()
+    await asyncio.sleep(0.3)  # let A take the slot and reach the held upstream
+
+    b_reader, b_writer = await asyncio.open_connection("127.0.0.1", port)
+    b_writer.write(b"bb")
+    await b_writer.drain()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(b_reader.read(100), timeout=0.5)  # B is queued, not served
+
+    hold.set()  # upstream releases A
+    assert await asyncio.wait_for(a_reader.read(100), timeout=3) == b"AA"
+    a_writer.close()
+    assert await asyncio.wait_for(b_reader.read(100), timeout=5) == b"BB"  # B proceeds after release
+    b_writer.close()
+    upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_slot_timeout_closes_with_503(monkeypatch, proxy_listener, allow_test_listener):
+    """A client that waits past CARETAKER_COMFY_SLOT_WAIT_TIMEOUT gets a
+    synthetic 503 with a JSON error body, never a hang or fake success."""
+    _env(monkeypatch, CARETAKER_COMFY_MAX_CONCURRENT="1", CARETAKER_COMFY_SLOT_WAIT_TIMEOUT="1")
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def black_hole(reader, writer):
+        await asyncio.sleep(60)
+
+    upstream = await asyncio.start_server(black_hole, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    _a_reader, a_writer = await asyncio.open_connection("127.0.0.1", port)
+    a_writer.write(b"aa")
+    await a_writer.drain()
+    await asyncio.sleep(0.3)  # A owns the only slot, upstream never answers
+
+    b_reader, b_writer = await asyncio.open_connection("127.0.0.1", port)
+    body = await asyncio.wait_for(b_reader.read(4096), timeout=6)
+    assert b"503 Service Unavailable" in body
+    assert b"comfy_slot_timeout" in body
+    b_writer.close()
+    a_writer.close()
+    upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_vram_gate_waits_frees_then_forwards(monkeypatch, proxy_listener, allow_test_listener):
+    """wait-policy: below-threshold probe -> /free nudge -> re-probe passes ->
+    connection forwarded. Both probes and the nudge are asserted."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_WAIT_SECONDS="30")
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    probe_results = [500, 5000]  # first below threshold, then sufficient
+
+    async def fake_probe():
+        return probe_results.pop(0) if probe_results else 5000
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+    async def echo(reader, writer):
+        data = await reader.read(100)
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"ping")
+    await writer.drain()
+    assert await asyncio.wait_for(reader.read(100), timeout=10) == b"PING"
+    writer.close()
+    upstream.close()
+    assert free_posts == ["/free"]  # exactly one nudge before the re-probe passed
+    assert len(probe_results) == 0  # both probes ran
+
+
+@pytest.mark.asyncio
+async def test_vram_gate_fail_policy_rejects_without_free(monkeypatch, proxy_listener, allow_test_listener):
+    """fail-policy: below-threshold probe rejects immediately with the VRAM 503
+    body; Comfy's /free is never nudged."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="fail")
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def fake_probe():
+        return 100
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+    port = await proxy_listener()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    body = await asyncio.wait_for(reader.read(4096), timeout=5)
+    assert b"comfy_vram_unavailable" in body
+    assert b'"free_mb": 100' in body
+    assert b'"required_mb": 1000' in body
+    writer.close()
+    assert free_posts == []  # fail-policy never nudges
+
+
+@pytest.mark.asyncio
+async def test_vram_probe_failure_fails_open(monkeypatch, proxy_listener, allow_test_listener):
+    """A broken nvidia-smi must never brick the proxy: probe raises -> the
+    connection passes (fail-open) with a warning."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000")
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+    probes = []
+
+    async def broken_probe():
+        probes.append(1)
+        raise RuntimeError("nvidia-smi exploded")
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", broken_probe)
+
+    async def echo(reader, writer):
+        data = await reader.read(100)
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"ping")
+    await writer.drain()
+    assert await asyncio.wait_for(reader.read(100), timeout=3) == b"PING"
+    writer.close()
+    upstream.close()
+    assert probes == [1]  # probed exactly once, then failed open
+
+
+def test_invalid_concurrency_and_budgets_clamp(monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setenv("CARETAKER_COMFY_MAX_CONCURRENT", "0")
+    monkeypatch.setenv("CARETAKER_COMFY_SLOT_WAIT_TIMEOUT", "soon")
+    monkeypatch.setenv("CARETAKER_COMFY_VRAM_MIN_FREE_MB", "-5")
+    monkeypatch.setenv("CARETAKER_COMFY_VRAM_WAIT_SECONDS", "later")
+    assert comfy_mod._max_concurrent() == 1  # 0 clamps to 1
+    assert comfy_mod._slot_wait_timeout() == 300  # garbage -> default
+    assert comfy_mod._vram_min_free_mb() == -5  # negative reads as gate-off (<= 0)
+    assert comfy_mod._vram_wait_seconds() == 120
+
+
+@pytest.mark.asyncio
+async def test_status_reports_gate_keys(monkeypatch):
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="2500", CARETAKER_COMFY_VRAM_POLICY="fail",
+         CARETAKER_COMFY_MAX_CONCURRENT="2")
+
+    def offline(request):
+        raise httpx.ConnectError("offline", request=request)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(offline), **kwargs),
+    )
+    status = await comfy_mod.astatus()
+    assert status["vram_gate_enabled"] is True
+    assert status["vram_policy"] == "fail"
+    assert status["max_concurrent"] == 2
+    assert status["slot_active"] == 0
+    assert status["slot_waiting"] == 0
+    assert status["last_free_mb"] is None
+
+
+@pytest.mark.asyncio
+async def test_gate_runs_inside_slot_not_per_waiter(monkeypatch, proxy_listener, allow_test_listener):
+    """The gate probes only after a connection HOLDS its slot: a queued client
+    must not spin probe/nudge loops while waiting (finding: the /free herd)."""
+    _env(monkeypatch, CARETAKER_COMFY_MAX_CONCURRENT="1", CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000")
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def fake_probe():
+        return 5000  # sufficient — the gate passes immediately when it runs
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+
+    hold = asyncio.Event()
+
+    async def hold_echo(reader, writer):
+        data = await reader.read(100)
+        await hold.wait()
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(hold_echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    a_reader, a_writer = await asyncio.open_connection("127.0.0.1", port)
+    a_writer.write(b"aa")
+    await a_writer.drain()
+    await asyncio.sleep(0.3)  # A owns the slot and reaches the held upstream
+
+    b_reader, b_writer = await asyncio.open_connection("127.0.0.1", port)
+    b_writer.write(b"bb")
+    await b_writer.drain()
+    await asyncio.sleep(0.3)
+    assert comfy_mod._slot_waiting == 1  # B is queued on the slot...
+
+    hold.set()
+    assert await asyncio.wait_for(a_reader.read(100), timeout=3) == b"AA"
+    a_writer.close()
+    # Only after A releases may B enter the gate at all.
+    assert await asyncio.wait_for(b_reader.read(100), timeout=5) == b"BB"
+    b_writer.close()
+    upstream.close()
+    await asyncio.sleep(0.1)  # let the handler's finally run before asserting
+    assert comfy_mod._slot_active == 0  # released, no permit leak
+
+
+@pytest.mark.asyncio
+async def test_gate_lock_serializes_probe_loops(monkeypatch, proxy_listener, allow_test_listener):
+    """Two concurrent gate entrants share ONE serialized probe sequence: the
+    second waits for the lock instead of running its own loop (3 probes, not
+    4 — the exact /free-herd shape PR-Piet flagged)."""
+    _env(
+        monkeypatch,
+        CARETAKER_COMFY_MAX_CONCURRENT="2",
+        CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000",
+        CARETAKER_COMFY_VRAM_WAIT_SECONDS="30",
+    )
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    # Serialized with the gate lock: conn A consumes [500 (fail), 5000 (pass)],
+    # conn B then gets 5000 (pass). Without the lock both would interleave and
+    # drain 4 probes.
+    probe_results = [500, 5000, 5000]
+    probe_calls = []
+
+    async def fake_probe():
+        probe_calls.append(1)
+        return probe_results.pop(0) if probe_results else 5000
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+    async def echo(reader, writer):
+        data = await reader.read(100)
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    readers = []
+    for _ in range(2):
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        readers.append((r, w))
+        w.write(b"ping")
+        await w.drain()
+    for r, w in readers:
+        assert await asyncio.wait_for(r.read(100), timeout=10) == b"PING"
+        w.close()
+    upstream.close()
+    assert len(probe_calls) == 3  # serialized sequence, no interleave inflation
+    assert free_posts == ["/free"]  # exactly one nudge
+
+
+@pytest.mark.asyncio
+async def test_semaphore_not_rebuilt_while_waiters_pending(monkeypatch):
+    """Rebuild waits for BOTH zero active and zero waiting: queued clients
+    must never be stranded on a stale semaphore instance."""
+    _env(monkeypatch, CARETAKER_COMFY_MAX_CONCURRENT="2")
+    sem = comfy_mod._get_slot_semaphore()
+    comfy_mod._slot_active = 1
+    comfy_mod._slot_waiting = 1
+    monkeypatch.setenv("CARETAKER_COMFY_MAX_CONCURRENT", "5")
+    assert comfy_mod._get_slot_semaphore() is sem  # unchanged while occupied
+    comfy_mod._slot_active = 0
+    assert comfy_mod._get_slot_semaphore() is sem  # still: waiter pending
+    comfy_mod._slot_waiting = 0
+    assert comfy_mod._get_slot_semaphore() is not sem  # idle now: rebuilt at 5
+
+
+@pytest.mark.asyncio
+async def test_gate_never_frees_while_job_running(monkeypatch, proxy_listener, allow_test_listener):
+    """The /free nudge is skipped while Comfy reports a running job: /free can
+    unload models mid-generation (PR-Piet ronde 3). The gate just keeps
+    waiting/re-probing until the budget runs out instead."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_WAIT_SECONDS="30")
+
+    async def busy_snap():
+        return {"queue_running": [1], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", busy_snap)
+
+    probe_results = [500, 5000]  # low -> (guard skips nudge) -> re-probe passes
+
+    async def fake_probe():
+        return probe_results.pop(0) if probe_results else 5000
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+    async def echo(reader, writer):
+        data = await reader.read(100)
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"ping")
+    await writer.drain()
+    assert await asyncio.wait_for(reader.read(100), timeout=3) == b"PING"
+    writer.close()
+    upstream.close()
+    assert free_posts == []  # busy queue -> the nudge never fires
+
+
+@pytest.mark.asyncio
+async def test_503_delivered_despite_pipelined_request(monkeypatch, proxy_listener, allow_test_listener):
+    """A client that pipelines its HTTP request right after connect must still
+    receive the 503: the proxy drains inbound bytes before closing, otherwise
+    the TCP RST discards the response (PR-Piet ronde 4)."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="fail")
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def fake_probe():
+        return 100
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+    port = await proxy_listener()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"POST /prompt HTTP/1.1\r\nHost: proxy\r\nContent-Length: 2\r\n\r\n{}")
+    await writer.drain()
+    body = await asyncio.wait_for(reader.read(4096), timeout=6)
+    assert b"503 Service Unavailable" in body
+    assert b"comfy_vram_unavailable" in body
+    writer.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_connection_not_closed_by_conn_idle(monkeypatch, proxy_listener, allow_test_listener):
+    """The per-connection silence budget lives in _pipe, which exists only
+    after the permit: a QUEUED connection is untouched by conn_idle, so with
+    SLOT_WAIT=0 (indefinite) and CONN_IDLE=1 — the racing config PR-Piet
+    named — the queued client is neither stranded nor silently closed; it is
+    served when a permit frees (refutation pinned with code)."""
+    _env(
+        monkeypatch,
+        CARETAKER_COMFY_MAX_CONCURRENT="1",
+        CARETAKER_COMFY_SLOT_WAIT_TIMEOUT="0",
+        CARETAKER_COMFY_CONN_IDLE_TIMEOUT="1",
+    )
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+    hold = asyncio.Event()
+
+    async def hold_echo(reader, writer):
+        data = await reader.read(100)
+        # Like a live Comfy job: stream progress bytes while the work runs,
+        # or conn_idle would rightly close the (half-)silent connection — the
+        # interaction under test is B's queued window, not A's.
+        while not hold.is_set():
+            writer.write(b".")
+            await writer.drain()
+            await asyncio.sleep(0.4)
+        writer.write(data.upper())
+        await writer.drain()
+        writer.close()
+
+    upstream = await asyncio.start_server(hold_echo, "127.0.0.1", 0)
+    allow_test_listener(upstream)
+    monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+    port = await proxy_listener()
+
+    a_reader, a_writer = await asyncio.open_connection("127.0.0.1", port)
+    a_writer.write(b"aa")
+    await a_writer.drain()
+    await asyncio.sleep(0.3)  # A owns the slot, upstream held
+
+    # A behaves like a live websocket job: it keeps sending input bytes,
+    # otherwise conn_idle would rightly close ITS half-silent connection
+    # (and free the slot) — under test is B's queued window, not A's.
+    stop = asyncio.Event()
+
+    async def keepalive(writer: asyncio.StreamWriter):
+        while not stop.is_set():
+            try:
+                writer.write(b"x")
+                await writer.drain()
+            except Exception:  # noqa: BLE001 — any transport error ends the job
+                return
+            await asyncio.sleep(0.4)
+
+    ka = asyncio.create_task(keepalive(a_writer))
+
+    b_reader, b_writer = await asyncio.open_connection("127.0.0.1", port)
+    b_writer.write(b"bb")
+    await b_writer.drain()
+    await asyncio.sleep(2.5)  # 2.5x conn_idle — the named silent close window
+    assert comfy_mod._slot_waiting == 1  # B is STILL queued, not silently closed
+    assert not b_writer.is_closing()
+
+    stop.set()
+    await asyncio.gather(ka, return_exceptions=True)
+    hold.set()
+    a_buf = b""
+    while b"AA" not in a_buf:  # progress dots may arrive before the reply
+        a_buf += await asyncio.wait_for(a_reader.read(100), timeout=3)
+    a_writer.close()
+    await asyncio.sleep(0.1)  # let A's handler finally release the permit
+    assert await asyncio.wait_for(b_reader.read(100), timeout=5) == b"BB"
+    b_writer.close()
+    upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_permit_drift_rebuilds_semaphore(monkeypatch):
+    """Permit accounting is verified at the idle boundary: a normal release
+    keeps the semaphore, but free-permit drift at zero holders (phantom
+    consumption on pre-3.12.4 asyncio, or an over-release) drops it for a
+    clean rebuild. asyncio.Semaphore never raises on over-release, so this
+    check — not a ValueError guard — is what can actually detect the race."""
+    _env(monkeypatch, CARETAKER_COMFY_MAX_CONCURRENT="1")
+    sem = comfy_mod._get_slot_semaphore()
+    await sem.acquire()  # a real holder, so the release below is a normal one
+    comfy_mod._slot_active = 1
+    comfy_mod._release_slot(sem)  # normal release: value == size, kept
+    assert comfy_mod._slot_active == 0
+    assert comfy_mod._slot_semaphore is sem
+    sem.release()  # simulate the phantom-permit shape (value inflates)
+    comfy_mod._slot_active = 1
+    comfy_mod._release_slot(sem)  # idle boundary: value != size
+    assert comfy_mod._slot_semaphore is None  # drift -> dropped for rebuild
+    fresh = comfy_mod._get_slot_semaphore()
+    assert fresh is not sem
