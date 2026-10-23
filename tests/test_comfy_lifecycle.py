@@ -938,3 +938,25 @@ async def test_queued_connection_not_closed_by_conn_idle(monkeypatch, proxy_list
     assert await asyncio.wait_for(b_reader.read(100), timeout=5) == b"BB"
     b_writer.close()
     upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_permit_drift_rebuilds_semaphore(monkeypatch):
+    """Permit accounting is verified at the idle boundary: a normal release
+    keeps the semaphore, but free-permit drift at zero holders (phantom
+    consumption on pre-3.12.4 asyncio, or an over-release) drops it for a
+    clean rebuild. asyncio.Semaphore never raises on over-release, so this
+    check — not a ValueError guard — is what can actually detect the race."""
+    _env(monkeypatch, CARETAKER_COMFY_MAX_CONCURRENT="1")
+    sem = comfy_mod._get_slot_semaphore()
+    await sem.acquire()  # a real holder, so the release below is a normal one
+    comfy_mod._slot_active = 1
+    comfy_mod._release_slot(sem)  # normal release: value == size, kept
+    assert comfy_mod._slot_active == 0
+    assert comfy_mod._slot_semaphore is sem
+    sem.release()  # simulate the phantom-permit shape (value inflates)
+    comfy_mod._slot_active = 1
+    comfy_mod._release_slot(sem)  # idle boundary: value != size
+    assert comfy_mod._slot_semaphore is None  # drift -> dropped for rebuild
+    fresh = comfy_mod._get_slot_semaphore()
+    assert fresh is not sem

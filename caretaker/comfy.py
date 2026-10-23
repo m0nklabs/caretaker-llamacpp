@@ -540,15 +540,23 @@ async def _acquire_slot(timeout_s: int) -> tuple[bool, asyncio.Semaphore | None]
 
 def _release_slot(sem: asyncio.Semaphore) -> None:
     """Release the semaphore this connection actually acquired."""
-    global _slot_active
+    global _slot_active, _slot_semaphore
     _slot_active = max(0, _slot_active - 1)
-    try:
-        sem.release()
-    except ValueError:
-        # Should be unreachable on the supported Pythons (the 3.12+ semaphore
-        # rework makes a timed-out acquire never take the permit); degrade to
-        # a warning instead of crashing the connection handler.
-        logger.warning("⚠️ Comfy slot release race — permit not restored")
+    sem.release()
+    # asyncio.Semaphore never raises on over-release (unbounded, unlike
+    # threading.BoundedSemaphore), so a lost-permit race cannot be caught as
+    # ValueError. Instead the permit accounting is verified at the idle
+    # boundary — with no slots held AND no waiters (a waiting client receives
+    # the permit directly: value stays 0) every permit must be free, anything
+    # else is drift (phantom consumption on pre-3.12.4 asyncio, or a double
+    # release) and the semaphore is dropped for a clean rebuild.
+    if _slot_active == 0 and _slot_waiting == 0 and sem._value != _slot_semaphore_size:
+        logger.warning(
+            "⚠️ Comfy slot accounting drift (value=%s size=%s) — rebuilding semaphore",
+            sem._value,
+            _slot_semaphore_size,
+        )
+        _slot_semaphore = None
 
 
 async def _handle_client(
