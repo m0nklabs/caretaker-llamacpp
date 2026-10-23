@@ -549,11 +549,14 @@ def _release_slot(sem: asyncio.Semaphore) -> None:
     # boundary — with no slots held AND no waiters (a waiting client receives
     # the permit directly: value stays 0) every permit must be free, anything
     # else is drift (phantom consumption on pre-3.12.4 asyncio, or a double
-    # release) and the semaphore is dropped for a clean rebuild.
-    if _slot_active == 0 and _slot_waiting == 0 and sem._value != _slot_semaphore_size:
+    # release) and the semaphore is dropped for a clean rebuild. `_value` is
+    # private asyncio state; if a future CPython removes it, the check
+    # degrades to disabled instead of crashing the release path.
+    value = getattr(sem, "_value", None)
+    if value is not None and _slot_active == 0 and _slot_waiting == 0 and value != _slot_semaphore_size:
         logger.warning(
             "⚠️ Comfy slot accounting drift (value=%s size=%s) — rebuilding semaphore",
-            sem._value,
+            value,
             _slot_semaphore_size,
         )
         _slot_semaphore = None
