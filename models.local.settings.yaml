@@ -160,9 +160,9 @@ models:
     context: 145000
     ngl: 99
     kv_type: turbo4
-    tensor_split: 0.42,0.58
+    tensor_split: 0.43,0.57
     mmproj: /home/flip/models/qwen3.8-27b/mmproj-F16.gguf
-    vision_context: 155000
+    vision_context: 120000
     vision_ngl: 99
     vision_tensor_split: 0.37,0.63
     default_enable_thinking: true
@@ -315,6 +315,20 @@ models:
     default_enable_thinking: false
     extra_args: --jinja --reasoning off --temp 1.0 --top-p 0.95 --top-k 20 --min-p
       0.0 --presence-penalty 1.5 --repeat-penalty 1.0
+  # Adopted from the guardian registry on 2026-10-25 (registry-parity pass):
+  # guardian carried this entry, the caretaker did not — it was unloadable.
+  Huihui-Qwen3.5-9B-abliterated:
+    path: /home/flip/models/qwen3.5-9b-abliterated/Huihui-Qwen3.5-9B-abliterated.Q4_K_M.gguf
+    total_layers: 32
+    benchmark_context_limit: 262144
+    context: 262144
+    ngl: 99
+    kv_type: turbo4
+    tensor_split: 0.45,0.55
+    mmproj: /home/flip/models/qwen3.5-9b-abliterated/mmproj-F16.gguf
+    default_enable_thinking: true
+    extra_args: --jinja --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty
+      1.5 --repeat-penalty 1.0 --alias Huihui-Qwen3.5-9B-abliterated
 aliases:
   phi4: Phi-4-reasoning-plus
   gemma4: Huihui-gemma-4-26B-A4B-it-abliterated-Q8KV
@@ -332,3 +346,5 @@ aliases:
   qwen3.5-coder: qwen3.5-9b-coder
   qwen3.5-instruct: qwen3.5-9b-instruct
   qwen3.5-reasoner: qwen3.5-9b-reasoner
+  huihui-qwen3.5-9b: Huihui-Qwen3.5-9B-abliterated
+  qwen3.5-9b-abliterated: Huihui-Qwen3.5-9B-abliterated
