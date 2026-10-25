@@ -3,6 +3,11 @@
 # Review, adjust engine-relevant fields (context/ngl per launch), then either
 # rename to models.local.settings.yaml in this repo dir, or point
 # CARETAKER_MODELS_FILE (in /etc/caretaker/caretaker.env) at the reviewed copy.
+# health_polls: seconds the /ensure health-wait may run before aborting and
+# stopping the unit. The Flash-Next 125B MoE needs ~210 s to reach /health,
+# which exceeds the built-in 120 s default (ensure aborted twice on
+# 2026-10-21, see guardian docs/FLASH_NEXT_INTEGRATION_SPEC.md).
+health_polls: 400
 models:
   llama3.2-3b:
     path: /home/flip/models/llama3.2-3b.gguf
@@ -152,7 +157,7 @@ models:
     path: /home/flip/models/qwen3.8-27b-uncensored-ymq/Qwen3.8-27B-Uncensored-YMQ-XL.gguf
     total_layers: 65
     benchmark_context_limit: 262144
-    context: 150000
+    context: 145000
     ngl: 99
     kv_type: turbo4
     tensor_split: 0.42,0.58
@@ -208,6 +213,60 @@ models:
     spec_type: draft-mtp
     extra_args: --jinja --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty
       0.0 --repeat-penalty 1.0
+  # Qwen3.8-Flash-Next (Qwen/Qwen3.8-Flash-Next, Apache 2.0): 125B-A6B MoE +
+  # 51B n-gram PLE + QSA; experts offloaded to RAM via -ot exps=CPU. Requires
+  # the qwen4exp build pin (30-flashnext-backend.conf); turbo4 KV is NOT
+  # accepted by that binary. Spec: docs/FLASH_NEXT_INTEGRATION_SPEC.md.
+  # Added 2026-10-21.
+  qwen3.8-flash-next:
+    path: /home/flip/models/qwen3.8-flash-next/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
+    total_layers: 49
+    benchmark_context_limit: 262144
+    context: 150000
+    ngl: 99
+    kv_type: q8_0
+    tensor_split: 0.42,0.58
+    default_enable_thinking: true
+    spec_type: draft-mtp
+    spec_draft_n_max: 3
+    spec_draft_n_min: 1
+    draft_model_path: /home/flip/models/qwen3.8-flash-next/mtp-Qwen3.8-Flash-Next-Q4_0.gguf
+    draft_cache_type_k: f16
+    draft_cache_type_v: f16
+    extra_args: --jinja --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty
+      0.0 --repeat-penalty 1.0 -t 8 -tb 8 -ot exps=CPU
+  # VIEScore2 (Allenda/VIEScore2, Apache 2.0): unified image-evaluation judge
+  # on a Qwen3-VL-8B-Instruct base (SFT + GRPO): dual-axis quality scores
+  # (pq:/sc:), a 16x16 defect grid with grounded explanation. Greedy sampling
+  # (temp 0) for deterministic scoring; the qwen3vl arch is supported by the
+  # active b11790-tq4 build. Added 2026-10-21.
+  viescore2:
+    path: /home/flip/models/viescore2-q8_0.gguf
+    total_layers: 36
+    benchmark_context_limit: 262144
+    context: 131072
+    ngl: 99
+    kv_type: q8_0
+    tensor_split: 0.45,0.55
+    mmproj: /home/flip/models/viescore2-mmproj-f16.gguf
+    default_enable_thinking: false
+    extra_args: --jinja --reasoning off --temp 0.0 --min-p 0.0 --presence-penalty
+      0.0 --repeat-penalty 1.0
+  # Fallback insurance: q8_0 KV launches on BOTH the b2111 production binary
+  # and the qwen4exp build-latest binary, so this entry stays usable while
+  # the 30-flashnext pin is active. Added 2026-10-21.
+  qwen3.5-9b-q8kv:
+    path: /home/flip/models/qwen3.5-9b/Qwen3.5-9B-UD-Q8_K_XL.gguf
+    total_layers: 32
+    benchmark_context_limit: 262144
+    context: 262144
+    ngl: 99
+    kv_type: q8_0
+    tensor_split: 0.45,0.55
+    mmproj: /home/flip/models/qwen3.5-9b/mmproj-F16.gguf
+    default_enable_thinking: true
+    extra_args: --jinja --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty
+      1.5 --repeat-penalty 1.0
   qwen3.5-9b:
     path: /home/flip/models/qwen3.5-9b/Qwen3.5-9B-UD-Q8_K_XL.gguf
     total_layers: 32
@@ -269,6 +328,7 @@ aliases:
   qwen3.8-ymq: qwen3.8-27b-uncensored-ymq
   qwen3.8-pi: qwen3.8-27b-pi
   qwen3.8-swift: qwen3.8-27b-swift15
+  qwen3.8-flash: qwen3.8-flash-next
   qwen3.5-coder: qwen3.5-9b-coder
   qwen3.5-instruct: qwen3.5-9b-instruct
   qwen3.5-reasoner: qwen3.5-9b-reasoner

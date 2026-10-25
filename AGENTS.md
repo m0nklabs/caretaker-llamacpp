@@ -358,16 +358,24 @@ ai-kvm-2 (Linux, GPU #1)              14700K (Windows, GPU #2)
 
 ## Omgeving (feitelijk, geverifieerd)
 
-- **llama-server binary:** `~/llama_cpp_official/build/bin/llama-server`
-  (build uit de officiële clone `~/llama_cpp_official`).
+- **llama-server binary (sinds 2026-10-21):** `~/llama_cpp_official/worktrees/b11790-tq4/build/bin/llama-server`
+  — unified TurboQuant+ merge (`1837d005f` = upstream b11790 `0efe8e4c6` + fork
+  turbo2/3/4-KV CUDA + DFlash/eagle3-era entries; merge-verliezen hersteld:
+  DSV4_HC CPU-dispatch + Q2_0 CPU-traits voor GSQ-RCO quants). Ondersteunt
+  zówel `qwen4exp` (Flash-Next + draft-mtp) als `kv_type: turbo4` — de 15
+  turbo4-registry-entries zijn weer launchable. Rollback: vanilla b11790 =
+  `worktrees/qwen4exp-latest/build-latest`.
 - **Huidige lokale llama-server:** systemd-unit `llama-server.service`
-  (feitelijk nog legacy-pad tot F7 cut-over:
-  `WorkingDirectory=/home/flip/llama_cpp_guardian/scripts`,
+  (ExecStart = caretaker-launcher
+  `WorkingDirectory=/home/flip/caretaker-llamacpp/scripts`,
   `ExecStart=scripts/start_llama.sh`), poort `127.0.0.1:11440`.
-  Start-args vandaag: `-c 262144 -ngl 99 -ctk q4_0 -ctv q4_0 --host 127.0.0.1
-  --port 11440 --slot-save-path ~/llama_slots --no-mmap --tensor-split
-  0.57,0.43 -nkvo --parallel 4` (default model
-  `Qwen3.6-35B-A3B-Uncensored-Aggressive.i1-Q4_K_M.gguf`).
+  Binary-pin via drop-in `30-flashnext-backend.conf`
+  (`Environment=LLAMA_SERVER_BINARY=...` + `TURBO_AUTO_ASYMMETRIC=0`,
+  overgezet uit de verwijderde `20-turboquant-backend.conf`; de oude
+  `10-b1295-backend.conf` is eveneens verwijderd — 30- is de enige pin).
+  Start-args uit `config/current_model.args` (caretaker schrijft die uit
+  `models.local.settings.yaml`): Flash-Next IQ3_S, `-c 150000 -ngl 99
+  -ctk/-ctv q8_0 --spec-type draft-mtp ... -ot exps=CPU --load-mode none`.
 - **Slots/context-save:** `~/llama_slots/` (`auto_save_*`-bestanden).
 - **Guardian (de gateway-kant):** systemd-unit `llama-guardian.service`,
   venv `~/guardian-llmprovider-gateway/venv`, nginx-mux op `:11434`/`:11435`/`:11436`.
@@ -557,6 +565,19 @@ tests/
   101 totaal). Volgende stap: PR aanmaken + `/review`; optioneel de gateway
   (`caretaker_runtime.py`) het `model_mismatch`-errorveld expliciet laten
   consumeren i.p.v. generieke 503-afhandeling.
+- **2026-10-21 (llama.cpp rollover):** binary-pin geconsolideerd — drop-in
+  `30-flashnext-backend.conf` wijst naar de unified TurboQuant+-merge
+  `worktrees/b11790-tq4/build/bin/llama-server` (merge `1837d005f` = upstream
+  b11790 + fork turbo4-KV; twee merge-verliezen hersteld: DSV4_HC_PRE/POST
+  CPU-dispatch-cases in `ggml-cpu.c` én de `GGML_TYPE_Q2_0`-entry in
+  `type_traits_cpu` — de fork had die verwijderd, maar GSQ-RCO-modellen
+  bevatten 9 Q2_0 `ffn_down_exps`-tensors → NULL `vec_dot` → segv onder
+  `-ot exps=CPU`; vanilla b11790 als discriminator bewees merge-specifiek).
+  `10-`/`20-`-drop-ins verwijderd, `TURBO_AUTO_ASYMMETRIC=0` overgezet naar
+  30-. Rollover via caretaker `/ensure` (strict /props OK), canary: health ok,
+  MTP-acceptatie 0.55, turbo4-boot OK op de productie-binary. Feiten →
+  Omgeving-sectie hierboven; guardian-zijde (registry-spec-executie) →
+  handoff guardian-repo.
 
 ## References
 

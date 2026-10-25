@@ -448,6 +448,37 @@ def _yaml_vram_limit_mb(config_path: str | None) -> int | None:
     return val
 
 
+def _read_health_polls(config_path: str | None) -> int | None:
+    """Read the top-level ``health_polls`` from the caretaker models file.
+
+    Large GGUFs (e.g. the 125B Flash-Next MoE) can take 200-300 s to reach
+    ``/health``, which exceeds the built-in default and makes ``/ensure``
+    abort (and stop the unit) before the load ever finishes. This knob lets a
+    host config raise the ensure health-wait without code changes. Mirrors the
+    best-effort contract of ``_read_vram_limit``: absent/unreadable/non-integer
+    → ``None`` (the built-in default stays in force).
+    """
+    import yaml as _yaml
+
+    try:
+        path = Path(config_path) if config_path else config_mod.models_file_path()
+        with path.open(encoding="utf-8") as fh:
+            data = _yaml.safe_load(fh) or {}
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("health_polls")
+    except Exception:  # noqa: BLE001 - best-effort config read
+        return None
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-integer health_polls=%r in %s", raw, path)
+        return None
+    return val
+
+
 class Caretaker:
     """Owns the local llama-server lifecycle behind the control API.
 
@@ -481,7 +512,13 @@ class Caretaker:
         self.aliases: dict[str, str] = dict(loaded.get("aliases", {}))
         self.server_process = server_process or _default_server_process()
         self.server_url = server_url
+        # An explicit constructor argument (tests, programmatic use) wins over
+        # the models-file knob; the configured value only replaces the default.
         self.health_polls = health_polls
+        if health_polls == DEFAULT_HEALTH_POLLS:
+            configured_polls = _read_health_polls(self.config_path)
+            if configured_polls is not None:
+                self.health_polls = configured_polls
         self.health_interval = health_interval
 
         # VRAM slot (Phase C): a single-per-caretaker scheduler serializes model
