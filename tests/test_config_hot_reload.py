@@ -663,3 +663,65 @@ async def test_same_name_size_update_released_when_stop_fails(
     assert "minimal" not in mgr.vram.active_sizes
     assert "minimal" not in mgr.vram.active_counts
     assert mgr._switch_in_progress is False
+
+
+# ================= warn-only re-book on the no-op fast-path (lead decision) =================
+async def test_noop_path_rebooks_changed_size_warn_only_fits(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """A pure size_mb edit produces no args-drift, so the next ensure takes the
+    no-op fast-path — which re-books the held slot in place (300→400, budget
+    500): fresh_load False, backend untouched, active_sizes tracks the config."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={"minimal": _sized_model(300)},
+        vram_limit_mb=500,
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+    stops_after_load = proc.stop_calls
+
+    _set_models_file(tmp_path, {"minimal": _sized_model(400)})
+    _bump_mtime(cfg, tick)
+    fresh_load = await mgr.switch_model("minimal")  # no force: no-op fast-path
+
+    assert fresh_load is False, "no drift → no-op fast-path"
+    assert proc.stop_calls == stops_after_load, "no-op must not touch the backend"
+    assert mgr.vram.active_sizes["minimal"] == 400, "no-op re-booked the slot"
+    assert mgr.current_model == "minimal"
+
+
+async def test_noop_path_over_budget_size_keeps_booking_and_warns(
+    tmp_path: Path, patch_paths: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Over-budget size edit (300→600, budget 500) on the no-op path: a
+    healthy backend is NEVER failed on a bookkeeping estimate — the no-op
+    still succeeds, the old booking stays, a warning is logged."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={"minimal": _sized_model(300)},
+        vram_limit_mb=500,
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+    stops_after_load = proc.stop_calls
+
+    _set_models_file(tmp_path, {"minimal": _sized_model(600)})
+    _bump_mtime(cfg, tick)
+    with caplog.at_level(logging.WARNING, logger="caretaker.manager"):
+        fresh_load = await mgr.switch_model("minimal")  # no force: no-op fast-path
+
+    assert fresh_load is False, "the no-op still succeeds (warn-only, never raises)"
+    assert proc.stop_calls == stops_after_load, "backend untouched"
+    assert mgr.vram.active_sizes["minimal"] == 300, "old booking kept"
+    assert mgr.current_model == "minimal"
+    assert any(
+        "keeps running with its previous booking" in record.getMessage()
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]

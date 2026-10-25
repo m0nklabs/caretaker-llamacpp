@@ -42,7 +42,7 @@ from .paths import (
     llama_slots_dir,
     server_url,
 )
-from .vram import VramScheduler, get_model_size_mb
+from .vram import VramLimitExceededError, VramScheduler, get_model_size_mb
 
 logger = logging.getLogger("caretaker.manager")
 
@@ -1472,6 +1472,36 @@ class Caretaker:
                     self._skip_next_context_save = True
                 else:
                     self.is_unloaded = False  # a live server is active; not unloaded
+                    # Warn-only VRAM re-book after a config hot-reload: the
+                    # no-op must never fail a healthy backend on a bookkeeping
+                    # estimate (raising here would flap a working model off
+                    # the gateway), but ``active_sizes`` should track a changed
+                    # ``size_mb`` in the common case so the next cross-model
+                    # acquire budget-checks on fresh numbers. The lifecycle
+                    # lock is held, so watchdog ticks cannot interleave;
+                    # ``_switch_in_progress`` stays False — this is not a
+                    # lifecycle transition, only slot bookkeeping.
+                    if self.vram is not None and model_name in self.vram.active_sizes:
+                        new_size = get_model_size_mb(
+                            model_name, self.models.get(model_name)
+                        )
+                        if new_size != self.vram.active_sizes.get(model_name):
+                            try:
+                                await self.vram.update_size(model_name, new_size)
+                                logger.info(
+                                    "VRAM slot re-sized (no-op path): '%s' → %dMB",
+                                    model_name,
+                                    new_size,
+                                )
+                            except VramLimitExceededError:
+                                logger.warning(
+                                    "Configured size_mb for '%s' (%dMB) exceeds the "
+                                    "VRAM budget — the model keeps running with its "
+                                    "previous booking (%dMB)",
+                                    model_name,
+                                    new_size,
+                                    self.vram.active_sizes.get(model_name),
+                                )
                     logger.info(f"Model {model_name} is already active")
                     return False
             else:
