@@ -816,8 +816,16 @@ class Caretaker:
         elif spec_type not in ("", "none", "draft-dflash"):
             # Speculative decoding WITHOUT an external draft model: either native
             # MTP layers (draft-mtp) or n-gram lookup (ngram-simple/ngram-map-k/
-            # ngram-mod/ngram-cache). Emit only --spec-type.
+            # ngram-mod/ngram-cache). Emit only --spec-type, plus the draft-KV
+            # quant knobs — honored on this embedded-MTP path too, but ONLY when
+            # the key is explicitly present in the config so every existing
+            # entry's args stay byte-identical (the f16 default stays silent;
+            # 2026-10-25 finding: these keys were dead letter on this branch).
             args_content += f" --spec-type {spec_type}"
+            if "draft_cache_type_k" in config:
+                args_content += f" --cache-type-k-draft {draft_cache_type_k}"
+            if "draft_cache_type_v" in config:
+                args_content += f" --cache-type-v-draft {draft_cache_type_v}"
             logger.info(f"⚡ Speculative decoding enabled (no draft): spec_type={spec_type}")
         elif spec_type == "draft-dflash":
             # draft-dflash requires an external draft model; without one it cannot
@@ -856,7 +864,11 @@ class Caretaker:
         Supported config keys (from models.yaml): path, context, ngl, kv_type,
         tensor_split, mmproj, extra_args, cuda_visible_devices, draft_model_path,
         spec_type, spec_draft_n_max, spec_draft_n_min, draft_cache_type_k,
-        draft_cache_type_v.
+        draft_cache_type_v. The draft cache keys are emitted on the external-
+        draft path (``draft_model_path`` set) and on the embedded-MTP path
+        (``spec_type`` set without ``draft_model_path``) only when explicitly
+        present in the config; on the embedded-MTP path the f16 default stays
+        silent so existing entries keep byte-identical args.
         """
         args_file = CURRENT_MODEL_ARGS_FILE
         env_file = CURRENT_MODEL_ENV_FILE

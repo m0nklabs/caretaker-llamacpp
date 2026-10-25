@@ -13,6 +13,9 @@ the ``_maybe_reload_config`` contract:
    config (``needs_reload: true`` instead of a KeyError raise).
 5. One route-level pin: ``POST /ensure`` hot-loads a model added to the file
    after a first 404, through ``caretaker.server.init`` injection.
+6. Embedded-MTP args build: ``draft_cache_type_k``/``draft_cache_type_v``
+   are honored (``--cache-type-k-draft``/``--cache-type-v-draft``) when
+   explicitly configured and stay silent otherwise (dead-key fix).
 """
 
 from __future__ import annotations
@@ -308,3 +311,56 @@ def test_ensure_hot_loads_model_added_after_first_404(
     assert r2.json()["ok"] is True
     assert r2.json()["loaded_model"] == "minimal"
     assert proc.events.count("start") >= 1
+
+
+# --------------------------------------------------- 8./9. embedded-MTP draft cache
+MTP_PATH = "/home/flip/models/mtp-embedded.gguf"
+MTP_SLOTS = "/usr/local/share/caretaker/fixture_slots"
+
+
+def test_embedded_mtp_explicit_draft_cache_keys_emitted(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """Embedded-MTP + explicit ``draft_cache_type_k/v`` → the draft-KV flags
+    are emitted (previously dead letter on this branch, 2026-10-25 finding)."""
+    mgr = _make_manager(
+        tmp_path,
+        process=FakeServerProcess(),
+        models={
+            "mtp": {
+                "path": MTP_PATH,
+                "context": 8192,
+                "ngl": 99,
+                "spec_type": "draft-mtp",
+                "draft_cache_type_k": "turbo4",
+                "draft_cache_type_v": "turbo4",
+            }
+        },
+    )
+    args_str, _ = mgr._build_args_string(mgr.build_runtime_config("mtp"))
+    assert "--cache-type-k-draft turbo4" in args_str
+    assert "--cache-type-v-draft turbo4" in args_str
+
+
+def test_embedded_mtp_without_draft_cache_keys_stays_silent(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """Embedded-MTP without the draft cache keys → NO draft-cache flags, args
+    byte-identical to the pre-fix behavior (f16 default stays silent)."""
+    mgr = _make_manager(
+        tmp_path,
+        process=FakeServerProcess(),
+        models={"mtp": {"path": MTP_PATH, "context": 8192, "ngl": 99, "spec_type": "draft-mtp"}},
+    )
+    args_str, _ = mgr._build_args_string(mgr.build_runtime_config("mtp"))
+
+    # Exact substring absence (the pin, word-level):
+    assert "--cache-type-k-draft" not in args_str
+    assert "--cache-type-v-draft" not in args_str
+    # Byte-identical golden: only --spec-type, nothing else spec-related.
+    golden = (
+        f"-m {MTP_PATH} -c 8192 -ngl 99 -ctk q4_0 -ctv q4_0 "
+        f"--host 127.0.0.1 --port 11440 --slot-save-path {MTP_SLOTS} --load-mode none "
+        "--spec-type draft-mtp"
+    )
+    assert args_str == golden
