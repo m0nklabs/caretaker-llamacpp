@@ -26,6 +26,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -37,6 +38,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 from caretaker import config as config_mod
 from caretaker.manager import DEFAULT_HEALTH_POLLS
 from caretaker.server import app, init
+from caretaker.vram import VramLimitExceededError
 
 from test_phase_a import FakeServerProcess, _make_manager
 
@@ -534,3 +536,130 @@ async def test_health_polls_restored_to_default_when_file_key_removed(
     _bump_mtime(cfg, tick)
     mgr.health()
     assert mgr.health_polls == DEFAULT_HEALTH_POLLS
+
+
+# ===================== PR-#15 review round: VRAM same-name re-size =====================
+class _StopFailingServerProcess(FakeServerProcess):
+    """FakeServerProcess whose Nth stop() raises (failure mid-switch teardown).
+
+    The cold load's stop must succeed; ``fail_on=2`` fails the switch's stop.
+    """
+
+    def __init__(self, fail_on: int = 2, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.fail_on = fail_on
+        self.stop_attempts = 0
+
+    async def stop(self) -> None:
+        self.stop_attempts += 1
+        if self.stop_attempts == self.fail_on:
+            raise RuntimeError("stop boom")
+
+
+def _sized_model(size_mb: int) -> dict:
+    return {"path": MODEL_A["path"], "context": 4096, "size_mb": size_mb}
+
+
+async def test_same_name_size_growth_beyond_budget_fails_before_stop(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """A hot-reloaded ``size_mb`` (300→600) under a 500MB budget must fail the
+    same-name switch with VramLimitExceededError BEFORE any backend teardown;
+    the stale-but-valid reservation stays and the old server keeps running."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={"minimal": _sized_model(300)},
+        vram_limit_mb=500,
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+    assert mgr.vram is not None
+    assert mgr.vram.active_sizes["minimal"] == 300
+    stops_after_load = proc.stop_calls
+
+    _set_models_file(tmp_path, {"minimal": _sized_model(600)})
+    _bump_mtime(cfg, tick)
+    # force=True: a pure size_mb edit produces no args-drift (the launch
+    # signature hashes args/env only), so the no-op fast-path would skip the
+    # VRAM block otherwise — force routes the switch through the real path
+    # where the re-size guard lives (same mechanism the watchdog uses).
+    with pytest.raises(VramLimitExceededError):
+        await mgr.switch_model("minimal", force=True)
+
+    assert proc.stop_calls == stops_after_load, (
+        "the switch must fail BEFORE touching the backend (no extra stop)"
+    )
+    assert mgr.vram.active_sizes["minimal"] == 300, "reservation unchanged on failure"
+    assert mgr.current_model == "minimal", "old server keeps running"
+    assert mgr._switch_in_progress is False, "no stuck flag after the failure"
+
+    # Shrinking to a fitting size (400 <= 500): the switch proceeds and the
+    # reservation is re-booked.
+    _set_models_file(tmp_path, {"minimal": _sized_model(400)})
+    _bump_mtime(cfg, tick)
+    await mgr.switch_model("minimal", force=True)
+    assert mgr.vram.active_sizes["minimal"] == 400
+    assert mgr.current_model == "minimal"
+
+
+async def test_same_name_size_update_reverted_on_pre_stop_failure(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """Failure BEFORE the stop (backend still runs the OLD footprint): the
+    published size update is reverted to the previous size; the original
+    exception propagates."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={"minimal": _sized_model(300)},
+        vram_limit_mb=500,
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+
+    _set_models_file(tmp_path, {"minimal": _sized_model(400)})
+    _bump_mtime(cfg, tick)
+    mgr._save_context = AsyncMock(side_effect=RuntimeError("save boom"))
+    with pytest.raises(RuntimeError, match="save boom"):
+        await mgr.switch_model("minimal", force=True)
+
+    assert mgr.vram.active_sizes["minimal"] == 300, "size update reverted"
+    assert mgr.current_model == "minimal", "backend untouched, still the old model"
+
+
+async def test_same_name_size_update_released_when_stop_fails(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """Failure AT the stop (current_model already cleared): the except-path
+    must NOT double-handle the size update — the existing same-name failure
+    contract releases the slot entirely, and the original stop-raise
+    propagates untouched."""
+    proc = _StopFailingServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={"minimal": _sized_model(300)},
+        vram_limit_mb=500,
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+    assert mgr.vram is not None
+
+    _set_models_file(tmp_path, {"minimal": _sized_model(400)})
+    _bump_mtime(cfg, tick)
+    with pytest.raises(RuntimeError, match="stop boom"):
+        await mgr.switch_model("minimal", force=True)
+
+    assert mgr.current_model is None
+    # Slot fully released (pre-existing same-name failure contract): the
+    # server is presumed dead, holding a phantom reservation would block
+    # others. No double handling: no revert, no extra release, no stuck flag.
+    assert "minimal" not in mgr.vram.active_sizes
+    assert "minimal" not in mgr.vram.active_counts
+    assert mgr._switch_in_progress is False

@@ -619,6 +619,13 @@ class Caretaker:
         # reset surface for Phase A).
         self._vision_validations: dict[str, str] = {}
 
+        # In-flight same-name VRAM re-size (config hot-reload): (model_name,
+        # previous_size_mb) once ``VramScheduler.update_size`` replaced the
+        # held slot's size. The except-path reverts it to the previous size
+        # while the OLD backend is still running (failure before the stop);
+        # cleared in the switch's finally.
+        self._vram_size_update: tuple[str, int] | None = None
+
     # ------------------------------------------------------ config hot-reload
     def _stat_config_sig(self) -> tuple[int, int] | None:
         """File signature ``(st_mtime_ns, st_size)`` of the models config.
@@ -1505,6 +1512,24 @@ class Caretaker:
                         model_name,
                         get_model_size_mb(model_name, self.models.get(model_name)),
                     )
+                else:
+                    # Same-name reload/restart (drift or force): the held slot
+                    # stays, but a config hot-reload may have changed the
+                    # entry's ``size_mb`` — re-book the footprint in place so
+                    # active_sizes cannot understate (later acquires would
+                    # overcommit). Strict and non-blocking: growing beyond the
+                    # budget fails the switch HERE, before any backend
+                    # teardown; shrinking just updates the reservation.
+                    old_size = self.vram.active_sizes.get(model_name)
+                    new_size = get_model_size_mb(
+                        model_name, self.models.get(model_name)
+                    )
+                    if old_size != new_size:
+                        await self.vram.update_size(model_name, new_size)
+                        # Booked for the except-path revert: the update is
+                        # published, but the backend still runs the OLD
+                        # footprint until the new process is up.
+                        self._vram_size_update = (model_name, old_size)
 
             logger.info(
                 "Switching from %s [%s] to %s [%s]",
@@ -1630,6 +1655,26 @@ class Caretaker:
             #   slot it kept (its server is dead; holding it would
             #   phantom-block others), a cold-start failure is a no-op decrement.
             if self.vram is not None:
+                # A same-name size update may have been published before the
+                # failure. Revert it while the OLD backend still runs (failure
+                # BEFORE the stop: ``current_model`` not yet cleared — it
+                # serves the old footprint, so the reservation must return to
+                # the old size). After the stop, the release branch below
+                # frees the slot entirely — no double handling. The revert is
+                # guarded: its own failure must never mask the original one.
+                pending_size_update = self._vram_size_update
+                self._vram_size_update = None
+                if pending_size_update is not None and self.current_model is not None:
+                    update_model, update_old_size = pending_size_update
+                    try:
+                        await self.vram.update_size(update_model, update_old_size)
+                    except Exception:  # noqa: BLE001 - revert is best-effort, never masks the raise
+                        logger.warning(
+                            "VRAM size revert for '%s' to %sMB failed — active_sizes "
+                            "may be inaccurate until the next switch",
+                            update_model,
+                            update_old_size,
+                        )
                 if self.current_model is not None:
                     if self.vram.active_counts.get(self.current_model, 0) == 0:
                         await self.vram.acquire(
@@ -1655,6 +1700,7 @@ class Caretaker:
             raise
         finally:
             self._switch_in_progress = False
+            self._vram_size_update = None
 
         # Only reached on the successful (re)load path: the backend was freshly
         # started, so in-memory session state is gone and the gateway may
