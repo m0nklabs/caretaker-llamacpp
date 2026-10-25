@@ -510,6 +510,16 @@ class Caretaker:
         # Double resolution is harmless: a canonical name is not an alias key,
         # so it passes through unchanged.
         self.aliases: dict[str, str] = dict(loaded.get("aliases", {}))
+        # Config hot-reload bookkeeping (f-config-hot-reload): the
+        # (st_mtime_ns, st_size) signature of the models file as loaded here.
+        # ``_maybe_reload_config`` re-reads the file only when this signature
+        # changes; a stat failure (missing file) stores None.
+        self._config_file_sig: tuple[int, int] | None = self._stat_config_sig()
+        # Whether the constructor received an explicit ``health_polls``
+        # override (i.e. a value different from the built-in default): only
+        # then is the models-file knob forbidden from touching
+        # ``self.health_polls`` on a hot reload.
+        self._health_polls_explicit: bool = health_polls != DEFAULT_HEALTH_POLLS
         self.server_process = server_process or _default_server_process()
         self.server_url = server_url
         # An explicit constructor argument (tests, programmatic use) wins over
@@ -577,6 +587,72 @@ class Caretaker:
         # cache stays in the gateway; caretaker only needs a no-op/bookkeeping
         # reset surface for Phase A).
         self._vision_validations: dict[str, str] = {}
+
+    # ------------------------------------------------------ config hot-reload
+    def _stat_config_sig(self) -> tuple[int, int] | None:
+        """File signature ``(st_mtime_ns, st_size)`` of the models config.
+
+        ``None`` when the file cannot be stat'ed (missing/unreadable).
+        """
+        try:
+            st = self.config_path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _maybe_reload_config(self) -> bool:
+        """Hot-reload the models config when its file changed on disk.
+
+        Fail-open contract — a broken edit never takes the daemon down and
+        never loses the working config:
+
+        - Missing/unreadable file (OSError on stat) → keep the current config
+          AND the stored signature (return ``False``); the file may reappear,
+          which then still counts as a change.
+        - Unchanged ``(st_mtime_ns, st_size)`` → cheap one-stat no-op.
+        - Changed file that fails to load (``ModelsConfigError``, OSError,
+          YAML errors — anything) → log ONE warning, KEEP the previous
+          in-memory config, and UPDATE the stored signature so the same
+          broken edit warns once instead of on every call.
+        - Successful load → atomically REPLACE ``self.models`` /
+          ``self.aliases`` with new dict objects (never mutate the old dicts:
+          an in-flight switch keeps operating on its snapshot), refresh
+          ``self.health_polls`` from the file only when the constructor did
+          NOT explicitly override it, and return ``True``.
+
+        Fully synchronous, so the dict swap is atomic with respect to
+        event-loop awaits; safe to call under the lifecycle lock
+        (``switch_model``/``unload``) or lock-free (``health()``).
+        """
+        sig = self._stat_config_sig()
+        if sig is None:
+            return False
+        if sig == self._config_file_sig:
+            return False
+        try:
+            loaded = config_mod.load_models_config(self.config_path)
+        except Exception as exc:  # noqa: BLE001 - fail-open: a broken edit must never crash the daemon
+            logger.warning(
+                "models config hot-reload failed (%s: %s) — keeping previous "
+                "in-memory config",
+                type(exc).__name__,
+                exc,
+            )
+            self._config_file_sig = sig
+            return False
+        self.models = dict(loaded["models"])
+        self.aliases = dict(loaded.get("aliases", {}))
+        self._config_file_sig = sig
+        if not self._health_polls_explicit:
+            configured_polls = _read_health_polls(self.config_path)
+            if configured_polls is not None:
+                self.health_polls = configured_polls
+        logger.info(
+            "config hot-reloaded: %d models, %d aliases",
+            len(self.models),
+            len(self.aliases),
+        )
+        return True
 
     # ---------------------------------------------------------------- helpers
     def _resolve_vision_mmproj(self, config: dict[str, Any]) -> str | None:
@@ -1240,6 +1316,10 @@ class Caretaker:
         one).
         """
         async with self._lifecycle_lock:
+            # Config hot-reload first: this switch must resolve aliases and
+            # validate against the freshest models.local.settings.yaml, not a
+            # snapshot from daemon start (or a previous call).
+            self._maybe_reload_config()
             # Invalidate even same-model/no-op observations: the foreground
             # request is authoritative over a previously scheduled restart.
             self._lifecycle_generation += 1
@@ -1531,6 +1611,7 @@ class Caretaker:
     async def unload(self) -> None:
         """Stop llama-server to free all VRAM. Guard against double-unload."""
         async with self._lifecycle_lock:
+            self._maybe_reload_config()
             self._lifecycle_generation += 1
             self._watchdog_retry_model = None
             await self._unload_locked()
@@ -1600,7 +1681,16 @@ class Caretaker:
         ``needs_reload`` is True when the backend cannot serve the current
         config as-is and a ``/ensure`` would be needed first: always when
         unloaded, and when the loaded model's launch signature is drifted
-        (see :meth:`check_drift`)."""
+        (see :meth:`check_drift`).
+
+        Lock-free and synchronous: the config hot-reload check at the top is
+        fully synchronous, so its in-memory dict swap is atomic with respect
+        to event-loop awaits. A switch already in flight keeps operating on
+        its old config snapshot and may transiently report
+        ``needs_reload: true`` until it persists its own launch signature —
+        expected and self-correcting on its next status read.
+        """
+        self._maybe_reload_config()
         if self.is_unloaded:
             return {
                 "loaded_model": None,
@@ -1610,6 +1700,24 @@ class Caretaker:
                 "loaded_at": None,
                 "idle_since": None,
             }
+        needs_reload = True
+        if self.current_model is not None:
+            if self.current_model not in self.models:
+                # Defensive for config hot-reload: the loaded model may have
+                # been removed from models.local.settings.yaml while the
+                # daemon keeps serving it. _config_drifted →
+                # _compute_launch_signature indexes self.models[model_name]
+                # and would raise KeyError out of a status read; report
+                # needs_reload instead — /ensure on the stale name 404s and
+                # the gateway/operator picks a still-configured model. The
+                # in-flight switch that loaded it kept its own snapshot, so
+                # this is transient until the next status read reflects the
+                # reloaded config.
+                needs_reload = True
+            else:
+                needs_reload = self._config_drifted(
+                    self.current_model, enable_vision=None, config_vision=True
+                )
         return {
             "loaded_model": self.current_model,
             "vision_enabled": self.current_vision_enabled,
@@ -1623,11 +1731,7 @@ class Caretaker:
             # forces it), NOT the loaded vision mode: folding in the loaded
             # mode would hide a config change that adds/removes mmproj and the
             # gateway would never issue the needed /ensure reload.
-            "needs_reload": self._config_drifted(
-                self.current_model, enable_vision=None, config_vision=True
-            )
-            if self.current_model is not None
-            else True,
+            "needs_reload": needs_reload,
         }
 
     # ------------------------------------------------------------- watchdog
