@@ -41,6 +41,18 @@ Config (env, mirrors the TTS/STT module idiom):
                                     the proxy closes it (default 300; 0 =
                                     never) — an abandoned client must not pin
                                     the idle release forever
+- ``CARETAKER_COMFY_MAX_CONCURRENT``    proxied connection slots (default 1):
+                                        clients wait for each other instead of
+                                        piling onto the GPU
+- ``CARETAKER_COMFY_SLOT_WAIT_TIMEOUT`` seconds a client may wait for a slot
+                                        (default 300; 0 = wait indefinitely)
+- ``CARETAKER_COMFY_VRAM_MIN_FREE_MB``  VRAM gate threshold (default 0 = gate
+                                        off): connections proceed only when the
+                                        GPU has at least this much free
+- ``CARETAKER_COMFY_VRAM_POLICY``       ``wait`` (default: nudge Comfy's /free
+                                        and re-probe) or ``fail`` (reject at
+                                        once with a 503)
+- ``CARETAKER_COMFY_VRAM_WAIT_SECONDS`` gate budget before rejecting (default 120)
 
 Mirrors the TTS/STT module contract: ``init()`` from server.py, a 30 s
 exception-proof watcher loop, and a ``status()`` for the control API.
@@ -49,6 +61,8 @@ exception-proof watcher loop, and a ``status()`` for the control API.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import os
 import time
@@ -70,6 +84,18 @@ _enabled = False
 # (Comfy web UI, a long-lived websocket) must not have its backend stopped
 # underneath it just because the queue happens to be empty.
 _active_connections = 0
+# Connection-slot serialization (API/MCP clients wait on each other) + the
+# VRAM gate state surfaced through astatus().
+_slot_semaphore: asyncio.Semaphore | None = None
+_slot_semaphore_size = 0
+_slot_active = 0
+_slot_waiting = 0
+_last_free_mb: int | None = None
+_vram_policy_warned = False
+# Serializes the VRAM gate: even with MAX_CONCURRENT > 1 only one probe/nudge
+# loop may run at a time, or N clients turn the /free nudge into a herd that
+# can unload Comfy models mid-job.
+_vram_gate_lock = asyncio.Lock()
 
 
 def _env(name: str, default: str) -> str:
@@ -218,6 +244,12 @@ async def astatus() -> dict[str, Any]:
         # tokens or internal paths and must not leak through the status API.
         "start_configured": bool(_env("CARETAKER_COMFY_START_COMMAND", "").strip()),
         "stop_configured": bool(_env("CARETAKER_COMFY_STOP_COMMAND", "").strip()),
+        "vram_gate_enabled": _vram_min_free_mb() > 0,
+        "vram_policy": _vram_policy(),
+        "max_concurrent": _max_concurrent(),
+        "slot_active": _slot_active,
+        "slot_waiting": _slot_waiting,
+        "last_free_mb": _last_free_mb,
     }
 
 
@@ -313,6 +345,220 @@ def upstream_target() -> tuple[str, int]:
     return (parsed.hostname or "127.0.0.1", parsed.port or 8189)
 
 
+def _max_concurrent() -> int:
+    return max(1, _env_int("CARETAKER_COMFY_MAX_CONCURRENT", 1))
+
+
+def _slot_wait_timeout() -> int:
+    return _env_int("CARETAKER_COMFY_SLOT_WAIT_TIMEOUT", 300)
+
+
+def _vram_min_free_mb() -> int:
+    return _env_int("CARETAKER_COMFY_VRAM_MIN_FREE_MB", 0)
+
+
+def _vram_policy() -> str:
+    return _env("CARETAKER_COMFY_VRAM_POLICY", "wait").strip().lower()
+
+
+def _vram_wait_seconds() -> int:
+    return _env_int("CARETAKER_COMFY_VRAM_WAIT_SECONDS", 120)
+
+
+def _get_slot_semaphore() -> asyncio.Semaphore:
+    """Loop-created, shared across proxied connections; rebuilt only while NO
+    slots are held or waited on (env is read per call, tests monkeypatch it),
+    so a permit is never credited to a semaphore a live connection did not
+    consume and queued waiters are never stranded on a stale instance."""
+    global _slot_semaphore, _slot_semaphore_size
+    want = _max_concurrent()
+    if _slot_semaphore is None or (
+        _slot_semaphore_size != want and _slot_active == 0 and _slot_waiting == 0
+    ):
+        _slot_semaphore = asyncio.Semaphore(want)
+        _slot_semaphore_size = want
+    return _slot_semaphore
+
+
+async def _probe_free_vram_mb() -> int | None:
+    """Minimum free VRAM across GPUs (nvidia-smi), or None on any failure.
+
+    Fail-open: a broken probe must never brick the proxy — the gate logs and
+    lets the connection through."""
+    global _last_free_mb
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "nvidia-smi",
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except BaseException:
+            # A cancelled communicate() leaves the child running — kill and
+            # reap it, or a wedged nvidia-smi leaks a zombie on every probe.
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            raise
+    except Exception:
+        logger.warning("⚠️ Comfy VRAM probe failed — gate fails open", exc_info=True)
+        return None
+    try:
+        values = [int(line.strip()) for line in out.decode().splitlines() if line.strip()]
+    except ValueError:
+        logger.warning("⚠️ Comfy VRAM probe returned unparsable output — gate fails open")
+        return None
+    if not values:
+        return None
+    _last_free_mb = min(values)
+    return _last_free_mb
+
+
+async def _synthetic_503(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, body: dict[str, Any]
+) -> None:
+    """Answer a not-yet-piped connection with a minimal HTTP 503 + JSON body.
+
+    The proxy speaks raw bytes; this is only ever sent BEFORE forwarding
+    starts, so no HTTP parsing is involved. Inbound bytes are drained first
+    (bounded): closing a socket with unread client data makes the TCP stack
+    emit RST, which can discard the 503 before the client ever reads it."""
+    payload = json.dumps(body).encode()
+    head = (
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    try:
+        drain_deadline = time.monotonic() + 2.0
+        while time.monotonic() < drain_deadline:
+            try:
+                if not await asyncio.wait_for(reader.read(65536), timeout=0.25):
+                    break  # EOF — the client is already gone
+            except TimeoutError:
+                break  # nothing more inbound within the read budget
+        writer.write(head + payload)
+        await writer.drain()
+    except Exception:
+        logger.debug("Comfy proxy: 503 write failed", exc_info=True)
+    finally:
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
+
+
+async def _vram_gate() -> dict[str, Any] | None:
+    """VRAM gate: return None to proceed, or a 503 body dict to reject.
+
+    ``wait`` policy nudges Comfy's /free (release cached models) and re-probes
+    within the wait budget; ``fail`` rejects on the first below-threshold
+    probe. Probe failure always passes (fail-open). Serialized by
+    ``_vram_gate_lock``: concurrent connections must not each spawn their own
+    probe/nudge loop — the /free herd can unload models mid-job."""
+    global _vram_policy_warned
+    min_free = _vram_min_free_mb()
+    if min_free <= 0:
+        return None
+    async with _vram_gate_lock:
+        policy = _vram_policy()
+        if policy not in ("wait", "fail"):
+            if not _vram_policy_warned:
+                logger.warning("⚠️ Unknown CARETAKER_COMFY_VRAM_POLICY %r — treating as wait", policy)
+                _vram_policy_warned = True
+            policy = "wait"
+        deadline = time.monotonic() + _vram_wait_seconds()
+        while True:
+            try:
+                free = await _probe_free_vram_mb()
+            except Exception:
+                logger.warning("⚠️ Comfy VRAM probe raised — gate fails open", exc_info=True)
+                return None
+            if free is None:
+                return None
+            if free >= min_free:
+                return None
+            if policy == "fail":
+                return {
+                    "error": "comfy_vram_unavailable",
+                    "message": "free VRAM below the comfy gate threshold",
+                    "free_mb": free,
+                    "required_mb": min_free,
+                }
+            if time.monotonic() >= deadline:
+                return {
+                    "error": "comfy_vram_unavailable",
+                    "message": "free VRAM stayed below threshold within the wait budget",
+                    "free_mb": free,
+                    "required_mb": min_free,
+                }
+            # Nudge Comfy to release cached models, then re-probe — but never
+            # while a job is running: /free can unload models mid-generation.
+            # Low VRAM with a running job simply keeps waiting until the
+            # budget runs out (the job owns the VRAM; we must not steal it).
+            snap = await _queue_snapshot()
+            if not snap or snap.get("queue_running"):
+                await asyncio.sleep(2.0)
+                continue
+            host, port = upstream_target()
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.post(f"http://{host}:{port}/free", json={"unload_models": True})
+            except Exception:
+                logger.debug("Comfy /free nudge failed during VRAM gate", exc_info=True)
+            await asyncio.sleep(2.0)
+
+
+async def _acquire_slot(timeout_s: int) -> tuple[bool, asyncio.Semaphore | None]:
+    """Acquire a connection slot; ``(False, None)`` on timeout. Tracks
+    active/waiting. Returns the acquired semaphore so the release credits the
+    exact instance — a mid-connection rebuild must not miscredit a permit."""
+    global _slot_active, _slot_waiting
+    sem = _get_slot_semaphore()
+    started = time.monotonic()
+    _slot_waiting += 1
+    try:
+        if timeout_s <= 0:
+            await sem.acquire()
+        else:
+            try:
+                await asyncio.wait_for(sem.acquire(), timeout=timeout_s)
+            except TimeoutError:
+                return False, None
+    finally:
+        _slot_waiting -= 1
+    _slot_active += 1
+    elapsed = time.monotonic() - started
+    if elapsed > 0.05:
+        logger.info("Comfy proxy: connection waited %.1fs for a slot", elapsed)
+    return True, sem
+
+
+def _release_slot(sem: asyncio.Semaphore) -> None:
+    """Release the semaphore this connection actually acquired."""
+    global _slot_active, _slot_semaphore
+    _slot_active = max(0, _slot_active - 1)
+    sem.release()
+    # asyncio.Semaphore never raises on over-release (unbounded, unlike
+    # threading.BoundedSemaphore), so a lost-permit race cannot be caught as
+    # ValueError. Instead the permit accounting is verified at the idle
+    # boundary — with no slots held AND no waiters (a waiting client receives
+    # the permit directly: value stays 0) every permit must be free, anything
+    # else is drift (phantom consumption on pre-3.12.4 asyncio, or a double
+    # release) and the semaphore is dropped for a clean rebuild.
+    if _slot_active == 0 and _slot_waiting == 0 and sem._value != _slot_semaphore_size:
+        logger.warning(
+            "⚠️ Comfy slot accounting drift (value=%s size=%s) — rebuilding semaphore",
+            sem._value,
+            _slot_semaphore_size,
+        )
+        _slot_semaphore = None
+
+
 async def _handle_client(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
@@ -337,17 +583,35 @@ async def _handle_client_inner(
         if not await start_comfy():
             client_writer.close()
             return
-    try:
-        upstream_reader, upstream_writer = await asyncio.open_connection(
-            internal_host, int(internal_port)
+    ok, sem = await _acquire_slot(_slot_wait_timeout())
+    if not ok:
+        await _synthetic_503(
+            client_reader,
+            client_writer,
+            {"error": "comfy_slot_timeout", "message": "Comfy proxy slot wait timed out"},
         )
-    except Exception as exc:  # noqa: BLE001 — comfy refusing after a "successful" start
-        logger.warning("Comfy wake proxy: upstream connect failed: %r", exc)
-        client_writer.close()
         return
-    to_upstream = asyncio.create_task(_pipe(client_reader, upstream_writer))
-    to_client = asyncio.create_task(_pipe(upstream_reader, client_writer))
-    await asyncio.gather(to_upstream, to_client, return_exceptions=True)
+    try:
+        # The gate runs INSIDE the slot (and is lock-serialized) so probing
+        # and /free nudges stay bounded by max_concurrent instead of fanning
+        # out per waiting client.
+        gate_error = await _vram_gate()
+        if gate_error is not None:
+            await _synthetic_503(client_reader, client_writer, gate_error)
+            return
+        try:
+            upstream_reader, upstream_writer = await asyncio.open_connection(
+                internal_host, int(internal_port)
+            )
+        except Exception as exc:  # noqa: BLE001 — comfy refusing after a "successful" start
+            logger.warning("Comfy wake proxy: upstream connect failed: %r", exc)
+            client_writer.close()
+            return
+        to_upstream = asyncio.create_task(_pipe(client_reader, upstream_writer))
+        to_client = asyncio.create_task(_pipe(upstream_reader, client_writer))
+        await asyncio.gather(to_upstream, to_client, return_exceptions=True)
+    finally:
+        _release_slot(sem)
 
 
 async def start_proxy() -> None:
