@@ -479,6 +479,37 @@ def _read_health_polls(config_path: str | None) -> int | None:
     return val
 
 
+def _config_validation_errors(loaded: config_mod.ModelsConfig) -> list[str]:
+    """Deep-validate a freshly loaded models config BEFORE publishing it.
+
+    ``load_models_config`` only guarantees top-level mapping shapes. A
+    hot-reload publishes the parsed dicts into a RUNNING daemon, so a
+    shallow-valid file with a ``null`` model entry, an entry missing its
+    ``path``, or a non-string alias target would replace the working config
+    and crash later ensure calls. This gate runs ONLY on hot-reload — boot
+    behavior (constructor load) is unchanged.
+    """
+    errors: list[str] = []
+    for name, entry in loaded["models"].items():
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"model key {name!r} is not a non-empty string")
+            continue
+        if not isinstance(entry, dict):
+            errors.append(
+                f"model entry {name!r} is not a mapping (got {type(entry).__name__})"
+            )
+        elif not isinstance(entry.get("path"), str) or not entry["path"].strip():
+            errors.append(f"model entry {name!r} has no non-empty string 'path'")
+    for alias, target in loaded.get("aliases", {}).items():
+        if not isinstance(alias, str) or not alias.strip():
+            errors.append(f"alias key {alias!r} is not a non-empty string")
+        if not isinstance(target, str) or not target.strip():
+            errors.append(
+                f"alias {alias!r} target {target!r} is not a non-empty string"
+            )
+    return errors
+
+
 class Caretaker:
     """Owns the local llama-server lifecycle behind the control API.
 
@@ -600,12 +631,22 @@ class Caretaker:
             return None
         return (st.st_mtime_ns, st.st_size)
 
-    def _maybe_reload_config(self) -> bool:
+    def _maybe_reload_config(self, *, defer_if_locked: bool = False) -> bool:
         """Hot-reload the models config when its file changed on disk.
 
         Fail-open contract — a broken edit never takes the daemon down and
         never loses the working config:
 
+        - With ``defer_if_locked=True`` (used by the lock-free ``health()``):
+          when the lifecycle lock is currently held, skip the reload
+          entirely and return ``False``. A switch in flight must persist the
+          launch signature computed from the config snapshot it STARTED
+          with — a mid-switch swap would make it persist a signature for a
+          backend launched from the old config (hiding drift, e.g. a ctx
+          edit) or fail the strict /props verification spuriously (a path
+          edit). During a switch, status therefore reports against the
+          snapshot the switch started with; the next status call AFTER the
+          switch persists its signature reloads and reflects the fresh file.
         - Missing/unreadable file (OSError on stat) → keep the current config
           AND the stored signature (return ``False``); the file may reappear,
           which then still counts as a change.
@@ -614,16 +655,27 @@ class Caretaker:
           YAML errors — anything) → log ONE warning, KEEP the previous
           in-memory config, and UPDATE the stored signature so the same
           broken edit warns once instead of on every call.
+        - Changed file that loads but fails deep validation (model entries
+          without a ``path``, null entries, non-string alias targets — see
+          :func:`_config_validation_errors`) → identical fail-open path: ONE
+          warning, previous config kept, signature updated. Validation runs
+          ONLY here, never at boot (constructor load behavior unchanged).
         - Successful load → atomically REPLACE ``self.models`` /
           ``self.aliases`` with new dict objects (never mutate the old dicts:
           an in-flight switch keeps operating on its snapshot), refresh
           ``self.health_polls`` from the file only when the constructor did
-          NOT explicitly override it, and return ``True``.
+          NOT explicitly override it (a REMOVED ``health_polls`` key restores
+          the built-in default), and return ``True``.
 
         Fully synchronous, so the dict swap is atomic with respect to
         event-loop awaits; safe to call under the lifecycle lock
         (``switch_model``/``unload``) or lock-free (``health()``).
         """
+        if defer_if_locked and self._lifecycle_lock.locked():
+            # A switch holds the lifecycle lock: it must land on the snapshot
+            # it started with (see docstring — mid-switch swaps corrupt the
+            # persisted launch signature).
+            return False
         sig = self._stat_config_sig()
         if sig is None:
             return False
@@ -640,13 +692,25 @@ class Caretaker:
             )
             self._config_file_sig = sig
             return False
+        validation_errors = _config_validation_errors(loaded)
+        if validation_errors:
+            logger.warning(
+                "models config hot-reload rejected (%s) — keeping previous "
+                "in-memory config",
+                "; ".join(validation_errors),
+            )
+            self._config_file_sig = sig
+            return False
         self.models = dict(loaded["models"])
         self.aliases = dict(loaded.get("aliases", {}))
         self._config_file_sig = sig
         if not self._health_polls_explicit:
             configured_polls = _read_health_polls(self.config_path)
-            if configured_polls is not None:
-                self.health_polls = configured_polls
+            # An ABSENT key un-configures the knob: restore the built-in
+            # default instead of keeping the last file override forever.
+            self.health_polls = (
+                configured_polls if configured_polls is not None else DEFAULT_HEALTH_POLLS
+            )
         logger.info(
             "config hot-reloaded: %d models, %d aliases",
             len(self.models),
@@ -1697,12 +1761,15 @@ class Caretaker:
 
         Lock-free and synchronous: the config hot-reload check at the top is
         fully synchronous, so its in-memory dict swap is atomic with respect
-        to event-loop awaits. A switch already in flight keeps operating on
-        its old config snapshot and may transiently report
-        ``needs_reload: true`` until it persists its own launch signature —
-        expected and self-correcting on its next status read.
+        to event-loop awaits. ``defer_if_locked=True`` skips the reload while
+        a switch holds the lifecycle lock — the in-flight switch must persist
+        the launch signature computed from the snapshot it started with, so
+        status during a switch reports against that snapshot; the next status
+        after the switch reloads and reflects the fresh file. A switch whose
+        loaded model is removed by a reload may transiently report
+        ``needs_reload: true`` until then — expected and self-correcting.
         """
-        self._maybe_reload_config()
+        self._maybe_reload_config(defer_if_locked=True)
         if self.is_unloaded:
             return {
                 "loaded_model": None,

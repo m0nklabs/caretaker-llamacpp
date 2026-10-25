@@ -20,6 +20,7 @@ the ``_maybe_reload_config`` contract:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -364,3 +365,172 @@ def test_embedded_mtp_without_draft_cache_keys_stays_silent(
         "--spec-type draft-mtp"
     )
     assert args_str == golden
+
+
+# ============================== PR-#15 review round: validation + defer ==============================
+class _GatedHealthServerProcess(FakeServerProcess):
+    """FakeServerProcess whose health_ok parks on an asyncio.Event.
+
+    Lets a test hold a switch mid-flight (inside ``_wait_for_health``, lock
+    held) while editing the models file — the exact race the defer-guard pins.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.gate_hits = 0
+
+    async def health_ok(self, url: str = "") -> bool:
+        self.gate_hits += 1
+        await self.gate.wait()
+        return True
+
+
+# --------------------------------------------------- validation before publish
+async def test_hot_reload_rejects_null_model_entry(
+    tmp_path: Path, patch_paths: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``models: {minimal: null}`` is shallow-valid but would crash later
+    ensures: hot-reload must REJECT it (fail-open, previous config kept)."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc, models={"minimal": dict(MODEL_A)})
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+
+    cfg.write_text(yaml.safe_dump({"models": {"minimal": None}, "aliases": {}}), encoding="utf-8")
+    _bump_mtime(cfg, tick)
+    with caplog.at_level(logging.WARNING, logger="caretaker.manager"):
+        await mgr.switch_model("minimal")  # daemon still works, no exception
+
+    assert mgr.models["minimal"] == MODEL_A, "broken edit must keep the previous config"
+    assert any(
+        "hot-reload rejected" in record.getMessage() for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
+
+    # The rejected edit consumed its signature (warn once); a later VALID
+    # edit still reloads.
+    _set_models_file(tmp_path, {"minimal": {"path": MODEL_A["path"], "context": 8192}})
+    _bump_mtime(cfg, tick)
+    await mgr.switch_model("minimal")
+    assert mgr.models["minimal"]["context"] == 8192
+
+
+async def test_hot_reload_rejects_entry_missing_path(
+    tmp_path: Path, patch_paths: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc, models={"minimal": dict(MODEL_A)})
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+
+    _set_models_file(tmp_path, {"minimal": {"context": 100}})
+    _bump_mtime(cfg, tick)
+    with caplog.at_level(logging.WARNING, logger="caretaker.manager"):
+        await mgr.switch_model("minimal")
+
+    assert mgr.models["minimal"] == MODEL_A
+    assert any("hot-reload rejected" in record.getMessage() for record in caplog.records)
+
+
+async def test_hot_reload_rejects_non_string_alias_target(
+    tmp_path: Path, patch_paths: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    proc = FakeServerProcess()
+    mgr = _make_manager(tmp_path, process=proc, models={"minimal": dict(MODEL_A)})
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+
+    _set_models_file(tmp_path, {"minimal": dict(MODEL_A)}, aliases={"mini": 5})
+    _bump_mtime(cfg, tick)
+    with caplog.at_level(logging.WARNING, logger="caretaker.manager"):
+        await mgr.switch_model("minimal")
+
+    assert mgr.aliases == {}, "a non-string alias target must be rejected wholesale"
+    assert mgr.models["minimal"] == MODEL_A
+    assert any("hot-reload rejected" in record.getMessage() for record in caplog.records)
+
+
+# --------------------------------------------------- defer during locked switches
+async def test_health_defers_reload_while_lifecycle_lock_held(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """A status call while the lifecycle lock is held must NOT swap the config
+    out from under an in-flight switch; after release, health() reloads."""
+    mgr = _make_manager(tmp_path, process=FakeServerProcess(), models={"minimal": dict(MODEL_A)})
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+
+    _set_models_file(tmp_path, {"minimal": dict(MODEL_A), "late": dict(MODEL_NEW)})
+    _bump_mtime(cfg, tick)
+
+    async with mgr._lifecycle_lock:
+        mgr.health()
+        assert "late" not in mgr.models, "defer: no reload while the lock is held"
+
+    mgr.health()
+    assert "late" in mgr.models, "after release, health() reloads normally"
+
+
+async def test_health_defers_reload_during_in_flight_switch(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """Mid-switch defer pin: a switch parked in its health-wait holds the
+    lock; health() must not swap self.models. The switch then persists the
+    launch signature computed from the snapshot it STARTED with, so the
+    file's fresh ctx value is NOT hidden by a mid-switch signature."""
+    proc = _GatedHealthServerProcess()
+    mgr = _make_manager(tmp_path, process=proc, models={"minimal": dict(MODEL_A)})
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+
+    task = asyncio.create_task(mgr.switch_model("minimal"))
+    for _ in range(500):
+        if proc.gate_hits > 0:
+            break
+        await asyncio.sleep(0)
+    assert proc.gate_hits > 0, "switch must be parked in the gated health probe"
+    assert mgr._lifecycle_lock.locked()
+
+    # The operator edits the file while the switch is in flight.
+    _set_models_file(tmp_path, {"minimal": {"path": MODEL_A["path"], "context": 8192}})
+    _bump_mtime(cfg, tick)
+
+    mgr.health()  # lock-free, but must defer the reload
+    assert mgr.models["minimal"]["context"] == 4096, "no mid-switch config swap"
+
+    proc.gate.set()
+    await task  # switch lands against its 4096 snapshot
+    assert mgr.current_model == "minimal"
+
+    # Follow-up health() reloads (lock free now) and reports HONEST drift:
+    # the persisted signature came from the 4096 snapshot, so the file's
+    # 8192 is not hidden (a mid-switch swap would have made this False).
+    health = mgr.health()
+    assert mgr.models["minimal"]["context"] == 8192
+    assert health["needs_reload"] is True
+
+
+# --------------------------------------------------- health_polls default restore
+async def test_health_polls_restored_to_default_when_file_key_removed(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """Removing the ``health_polls`` key from the file must restore the
+    built-in default on the next reload (no sticky last-override)."""
+    mgr = _make_manager(tmp_path, process=FakeServerProcess(), models={"minimal": dict(MODEL_A)})
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    assert mgr.health_polls == DEFAULT_HEALTH_POLLS
+
+    _set_models_file(tmp_path, {"minimal": dict(MODEL_A)}, extra={"health_polls": 400})
+    _bump_mtime(cfg, tick)
+    mgr.health()
+    assert mgr.health_polls == 400
+
+    _set_models_file(tmp_path, {"minimal": dict(MODEL_A)})  # key removed
+    _bump_mtime(cfg, tick)
+    mgr.health()
+    assert mgr.health_polls == DEFAULT_HEALTH_POLLS
