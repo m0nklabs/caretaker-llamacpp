@@ -105,6 +105,16 @@ async def _lifespan(app: FastAPI):
     """Arm the Comfy idle watcher + wake proxy and the llama-server crash
     watchdog at startup (both config-gated; no-ops when disabled/unset) — and
     clean them up at shutdown."""
+    # The comfy evict-policy hook (cross-workload GPU arbiter): when a proxied
+    # comfy connection cannot get VRAM, the gate may unload the LLM backend;
+    # the next LLM request re-loads it via /ensure. Fail-open: no manager
+    # instance (broken models config, test double) simply leaves evict
+    # unhooked and the gate behaves as the wait policy.
+    try:
+        _comfy.set_llama_evict_hook(_manager().unload)
+    except Exception as exc:  # noqa: BLE001 — fail-open by design
+        logger.warning("comfy evict hook not armed: %s", exc)
+        _comfy.set_llama_evict_hook(None)
     await _comfy.init_async()
     armed: Caretaker | None = None
     watchdog_settings = _watchdog_settings()

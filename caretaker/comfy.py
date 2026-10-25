@@ -53,6 +53,13 @@ Config (env, mirrors the TTS/STT module idiom):
                                         and re-probe) or ``fail`` (reject at
                                         once with a 503)
 - ``CARETAKER_COMFY_VRAM_WAIT_SECONDS`` gate budget before rejecting (default 120)
+- ``CARETAKER_COMFY_EVICT_MIN_TENURE_S`` anti-flap: minimum seconds between two
+                                        LLM evictions under the ``evict``
+                                        policy (default 180) — a queued comfy
+                                        burst must not unload/reload the LLM
+                                        on every request; the evicted LLM
+                                        re-loads itself on its next request
+                                        through the existing /ensure path
 
 Mirrors the TTS/STT module contract: ``init()`` from server.py, a 30 s
 exception-proof watcher loop, and a ``status()`` for the control API.
@@ -66,6 +73,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -96,6 +104,15 @@ _vram_policy_warned = False
 # loop may run at a time, or N clients turn the /free nudge into a herd that
 # can unload Comfy models mid-job.
 _vram_gate_lock = asyncio.Lock()
+# The evict-policy hook (cross-workload GPU arbiter, fase 2): when a proxied
+# comfy connection cannot get VRAM because the LLM owns it, the gate evicts
+# the llama backend via this hook and the next LLM request re-loads it
+# through the existing /ensure repair path. server.py injects
+# ``manager.unload`` at lifespan startup; the hook is a plain attribute so a
+# missing/injected manager degrades to a warning instead of a broken proxy.
+_llama_evict_hook: Callable[[], Awaitable[object]] | None = None
+_last_evict_monotonic: float | None = None
+_evict_count = 0
 
 
 def _env(name: str, default: str) -> str:
@@ -246,6 +263,13 @@ async def astatus() -> dict[str, Any]:
         "stop_configured": bool(_env("CARETAKER_COMFY_STOP_COMMAND", "").strip()),
         "vram_gate_enabled": _vram_min_free_mb() > 0,
         "vram_policy": _vram_policy(),
+        "evict_count": _evict_count,
+        "last_evict_epoch": (
+            round(time.time() - (time.monotonic() - _last_evict_monotonic), 1)
+            if _last_evict_monotonic is not None
+            else None
+        ),
+        "evict_hook_set": _llama_evict_hook is not None,
         "max_concurrent": _max_concurrent(),
         "slot_active": _slot_active,
         "slot_waiting": _slot_waiting,
@@ -365,6 +389,20 @@ def _vram_wait_seconds() -> int:
     return _env_int("CARETAKER_COMFY_VRAM_WAIT_SECONDS", 120)
 
 
+def _evict_min_tenure_s() -> int:
+    """Minimum seconds between two LLM evictions (anti-flap: a queued comfy
+    burst must not unload/reload the LLM every request)."""
+    return max(0, _env_int("CARETAKER_COMFY_EVICT_MIN_TENURE_S", 180))
+
+
+def set_llama_evict_hook(fn: Callable[[], Awaitable[object]] | None) -> None:
+    """Install the LLM-evict hook (server.py wires ``manager.unload`` at
+    lifespan startup). Passing None disarms evict (the gate then behaves as
+    the ``wait`` policy)."""
+    global _llama_evict_hook
+    _llama_evict_hook = fn
+
+
 def _get_slot_semaphore() -> asyncio.Semaphore:
     """Loop-created, shared across proxied connections; rebuilt only while NO
     slots are held or waited on (env is read per call, tests monkeypatch it),
@@ -457,21 +495,25 @@ async def _vram_gate() -> dict[str, Any] | None:
 
     ``wait`` policy nudges Comfy's /free (release cached models) and re-probes
     within the wait budget; ``fail`` rejects on the first below-threshold
-    probe. Probe failure always passes (fail-open). Serialized by
+    probe; ``evict`` additionally evicts the LLM backend via the injected
+    hook (once per ``EVICT_MIN_TENURE``) so a queued comfy job can claim the
+    GPU — the LLM re-loads on its next request through the /ensure path.
+    Probe failure always passes (fail-open). Serialized by
     ``_vram_gate_lock``: concurrent connections must not each spawn their own
     probe/nudge loop — the /free herd can unload models mid-job."""
-    global _vram_policy_warned
+    global _vram_policy_warned, _last_evict_monotonic, _evict_count
     min_free = _vram_min_free_mb()
     if min_free <= 0:
         return None
     async with _vram_gate_lock:
         policy = _vram_policy()
-        if policy not in ("wait", "fail"):
+        if policy not in ("wait", "fail", "evict"):
             if not _vram_policy_warned:
                 logger.warning("⚠️ Unknown CARETAKER_COMFY_VRAM_POLICY %r — treating as wait", policy)
                 _vram_policy_warned = True
             policy = "wait"
         deadline = time.monotonic() + _vram_wait_seconds()
+        nudged = False
         while True:
             try:
                 free = await _probe_free_vram_mb()
@@ -496,20 +538,57 @@ async def _vram_gate() -> dict[str, Any] | None:
                     "free_mb": free,
                     "required_mb": min_free,
                 }
-            # Nudge Comfy to release cached models, then re-probe — but never
-            # while a job is running: /free can unload models mid-generation.
-            # Low VRAM with a running job simply keeps waiting until the
-            # budget runs out (the job owns the VRAM; we must not steal it).
             snap = await _queue_snapshot()
             if not snap or snap.get("queue_running"):
+                # Busy (or unreachable): a job owns the VRAM and /free can
+                # unload models mid-generation — never nudge, never evict;
+                # just keep the re-probe rhythm until the budget runs out.
                 await asyncio.sleep(2.0)
                 continue
+            if policy == "evict" and nudged:
+                # Comfy's own cache was already released and VRAM is STILL
+                # short — escalate to the LLM hook so the queued comfy job
+                # can claim the GPU; the LLM re-loads via /ensure on demand.
+                if _llama_evict_hook is None:
+                    logger.warning("⚠️ Comfy evict policy without an LLM hook — behaving as wait")
+                    policy = "wait"
+                    await asyncio.sleep(2.0)
+                    continue
+                now = time.monotonic()
+                if (
+                    _last_evict_monotonic is not None
+                    and (now - _last_evict_monotonic) < _evict_min_tenure_s()
+                ):
+                    # Inside the anti-flap tenure: the LLM stays; the job
+                    # waits exactly like under the wait policy.
+                    await asyncio.sleep(2.0)
+                    continue
+                logger.info(
+                    "Comfy VRAM gate: evicting LLM backend (free %s MB < %s MB) for a queued comfy job",
+                    free,
+                    min_free,
+                )
+                try:
+                    await _llama_evict_hook()
+                except Exception:
+                    logger.warning("⚠️ Comfy evict hook failed — behaving as wait", exc_info=True)
+                    policy = "wait"
+                    await asyncio.sleep(2.0)
+                    continue
+                _last_evict_monotonic = now
+                _evict_count += 1
+                await asyncio.sleep(2.0)
+                continue
+            # Nudge Comfy to release cached models, then re-probe. The wait
+            # policy nudges on every idle pass; the evict policy nudges once
+            # and then escalates (the flag above).
             host, port = upstream_target()
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     await client.post(f"http://{host}:{port}/free", json={"unload_models": True})
             except Exception:
                 logger.debug("Comfy /free nudge failed during VRAM gate", exc_info=True)
+            nudged = True
             await asyncio.sleep(2.0)
 
 
