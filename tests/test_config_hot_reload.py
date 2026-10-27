@@ -36,7 +36,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from caretaker import config as config_mod
-from caretaker.manager import DEFAULT_HEALTH_POLLS
+from caretaker.manager import DEFAULT_HEALTH_POLLS, Caretaker
 from caretaker.server import app, init
 from caretaker.vram import VramLimitExceededError
 
@@ -883,3 +883,99 @@ async def test_swap_rollback_releases_unused_target_slot(
     )
     assert mgr.vram.active_counts.get("beta", 0) == 0, "no phantom target slot"
     assert mgr._vram_released_held is None
+
+
+# ------------------------------- startup signature capture + non-finite polls
+async def test_startup_edit_between_parse_and_signature_capture_is_not_lost(
+    tmp_path: Path, patch_paths: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write landing between the constructor's parse and its signature
+    capture must not be recorded as "already loaded".
+
+    Pre-fix ordering (signature taken AFTER the parse) paired the OLD
+    in-memory snapshot with the NEW file signature, so every later reload
+    check saw an unchanged file and the edit stayed unapplied until an
+    unrelated write changed mtime again. The signature is captured BEFORE the
+    parse now, so the stale signature makes the next check re-read the file.
+    """
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    real_load = config_mod.load_models_config
+    raced: list[bool] = []
+
+    def racing_load(path=None):
+        """Simulate the operator's write in the parse→stat window."""
+        loaded = real_load(path)  # the snapshot the constructor will publish
+        if not raced:
+            raced.append(True)
+            _set_models_file(
+                tmp_path, {"minimal": dict(MODEL_A), "added": dict(MODEL_NEW)}
+            )
+            _bump_mtime(cfg, tick)
+        return loaded
+
+    monkeypatch.setattr(config_mod, "load_models_config", racing_load)
+    mgr = _make_manager(
+        tmp_path, process=FakeServerProcess(), models={"minimal": dict(MODEL_A)}
+    )
+
+    assert raced, "fixture sanity: the constructor must have parsed the config"
+    assert "added" not in mgr.models, "the published snapshot is the pre-edit one"
+
+    assert mgr._maybe_reload_config() is True, (
+        "the pre-edit signature must not mask the file change"
+    )
+    assert "added" in mgr.models, "the update must still be applied on the next check"
+
+
+def test_non_finite_health_polls_edit_does_not_break_status(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """``health_polls: .inf`` must be ignored, not raised out of every entry point.
+
+    ``int(float('inf'))`` raises ``OverflowError``, which the pre-fix handler
+    (``TypeError``/``ValueError`` only) did not catch. Because the reload call
+    sat AFTER the config and signature were published, the first
+    status/switch/unload call after that edit failed while the file was
+    already recorded as loaded — the same "silently unapplied" trap.
+    """
+    mgr = _make_manager(
+        tmp_path, process=FakeServerProcess(), models={"minimal": dict(MODEL_A)}
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    assert mgr.health_polls == DEFAULT_HEALTH_POLLS
+
+    _set_models_file(
+        tmp_path, {"minimal": dict(MODEL_A)}, extra={"health_polls": float("inf")}
+    )
+    assert ".inf" in cfg.read_text(encoding="utf-8")
+    _bump_mtime(cfg, tick)
+
+    payload = mgr.health()  # pre-fix: OverflowError escapes here
+
+    assert payload["loaded_model"] is None
+    assert mgr.health_polls == DEFAULT_HEALTH_POLLS, "the bad value must not stick"
+
+    # The reload still went through: a later valid edit applies normally.
+    _set_models_file(
+        tmp_path, {"minimal": dict(MODEL_A)}, extra={"health_polls": 555}
+    )
+    _bump_mtime(cfg, tick)
+    mgr.health()
+    assert mgr.health_polls == 555
+
+
+def test_non_finite_health_polls_at_boot_falls_back_to_default(
+    tmp_path: Path,
+) -> None:
+    """Same ignore path at boot: ``.inf`` must not abort the daemon constructor.
+
+    ``__init__`` reads the knob too, so a non-finite value used to take the
+    whole caretaker down at startup instead of just losing the override.
+    """
+    cfg = _set_models_file(
+        tmp_path, {"minimal": dict(MODEL_A)}, extra={"health_polls": float("inf")}
+    )
+    mgr = Caretaker(config_path=str(cfg), server_process=FakeServerProcess())
+    assert mgr.health_polls == DEFAULT_HEALTH_POLLS

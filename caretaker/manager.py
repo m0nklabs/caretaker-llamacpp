@@ -456,7 +456,10 @@ def _read_health_polls(config_path: str | None) -> int | None:
     abort (and stop the unit) before the load ever finishes. This knob lets a
     host config raise the ensure health-wait without code changes. Mirrors the
     best-effort contract of ``_read_vram_limit``: absent/unreadable/non-integer
-    → ``None`` (the built-in default stays in force).
+    → ``None`` (the built-in default stays in force). Non-finite YAML floats
+    (``.inf``/``-.inf``) raise ``OverflowError`` from ``int()`` and take the
+    same ignore path — callers run this on the live daemon (boot AND after a
+    hot-reload), so a bad knob must never break a status/switch/unload call.
     """
     import yaml as _yaml
 
@@ -473,8 +476,10 @@ def _read_health_polls(config_path: str | None) -> int | None:
         return None
     try:
         val = int(raw)
-    except (TypeError, ValueError):
-        logger.warning("Ignoring non-integer health_polls=%r in %s", raw, path)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a non-finite float (``.inf``/``-.inf``) is not an
+        # integer poll count either — ignore it like any other invalid value.
+        logger.warning("Ignoring invalid health_polls=%r in %s", raw, path)
         return None
     return val
 
@@ -532,6 +537,19 @@ class Caretaker:
         check_vram: bool = True,
     ) -> None:
         self.config_path = Path(config_path) if config_path else config_mod.models_file_path()
+        # Config hot-reload bookkeeping (f-config-hot-reload): the
+        # (st_mtime_ns, st_size) signature of the models file snapshot read
+        # here. ``_maybe_reload_config`` re-reads the file only when this
+        # signature changes; a stat failure (missing file) stores None.
+        #
+        # Capture the signature BEFORE the parse. A write that lands between
+        # the two must leave a stale SIGNATURE, not a mismatched pair: with the
+        # signature taken afterwards, the edit would be recorded as "already
+        # loaded" while the in-memory config is still the old one, and
+        # ``_maybe_reload_config`` would keep skipping the file until some
+        # later unrelated edit changes it again. Statting first means the next
+        # reload check sees the change and re-parses.
+        initial_config_sig: tuple[int, int] | None = self._stat_config_sig()
         loaded = config_mod.load_models_config(self.config_path)
         self.models: dict[str, dict] = dict(loaded["models"])
         # Alias map (alias → canonical model name) from the same host config.
@@ -541,11 +559,7 @@ class Caretaker:
         # Double resolution is harmless: a canonical name is not an alias key,
         # so it passes through unchanged.
         self.aliases: dict[str, str] = dict(loaded.get("aliases", {}))
-        # Config hot-reload bookkeeping (f-config-hot-reload): the
-        # (st_mtime_ns, st_size) signature of the models file as loaded here.
-        # ``_maybe_reload_config`` re-reads the file only when this signature
-        # changes; a stat failure (missing file) stores None.
-        self._config_file_sig: tuple[int, int] | None = self._stat_config_sig()
+        self._config_file_sig = initial_config_sig
         # Whether the constructor received an explicit ``health_polls``
         # override (i.e. a value different from the built-in default): only
         # then is the models-file knob forbidden from touching
