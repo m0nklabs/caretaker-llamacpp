@@ -3,6 +3,7 @@ GPU services stop after 5 min of non-use and the caretaker restarts them on
 the next request)."""
 
 import asyncio
+import contextlib
 import socket
 import time
 
@@ -23,6 +24,10 @@ def _fresh_state():
     comfy_mod._last_free_mb = None
     comfy_mod._vram_policy_warned = False
     comfy_mod._vram_gate_lock = asyncio.Lock()
+    comfy_mod._llama_evict_hook = None
+    comfy_mod._last_evict_monotonic = None
+    comfy_mod._evict_count = 0
+    comfy_mod._evict_task = None
     yield
     if comfy_mod._proxy_server is not None:
         comfy_mod._proxy_server.close()
@@ -988,3 +993,448 @@ async def test_drift_check_degrades_without_private_value(monkeypatch):
     comfy_mod._release_slot(sem)  # no _value attribute -> no crash, no rebuild
     assert comfy_mod._slot_active == 0
     assert comfy_mod._slot_semaphore is sem  # kept as-is (check degraded off)
+
+
+# --- evict policy (fase 2: the cross-workload GPU arbiter) ---
+
+
+@pytest.mark.asyncio
+async def test_evict_policy_unloads_llm_after_nudge_fails(monkeypatch, proxy_listener, allow_test_listener):
+    """evict-policy: VRAM short -> one /free nudge (comfy can release its own
+    cache) -> VRAM STILL short -> the LLM hook fires and the connection
+    proceeds once the probe passes. Hook and nudge both asserted."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="evict")
+    monkeypatch.delenv("CARETAKER_COMFY_EVICT_MIN_TENURE_S", raising=False)
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    # probe sequence: low (nudge path) -> low (evict path) -> sufficient
+    probe_results = [500, 500, 5000]
+
+    async def fake_probe():
+        return probe_results.pop(0) if probe_results else 5000
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", fake_probe)
+
+    evictions = []
+
+    async def fake_evict():
+        evictions.append(1)
+
+    comfy_mod.set_llama_evict_hook(fake_evict)
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+    try:
+        async def echo(reader, writer):
+            data = await reader.read(100)
+            writer.write(data.upper())
+            await writer.drain()
+            writer.close()
+
+        upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
+        allow_test_listener(upstream)
+        monkeypatch.setenv("CARETAKER_COMFY_URL", f"http://127.0.0.1:{upstream.sockets[0].getsockname()[1]}")
+        port = await proxy_listener()
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"ping")
+        await writer.drain()
+        assert await asyncio.wait_for(reader.read(100), timeout=10) == b"PING"
+        writer.close()
+        upstream.close()
+    finally:
+        comfy_mod.set_llama_evict_hook(None)
+    assert free_posts == ["/free"]  # nudge first...
+    assert evictions == [1]  # ...then the hook, exactly once
+    assert comfy_mod._evict_count == 1
+
+
+@pytest.mark.asyncio
+async def test_evict_tenure_blocks_repeat_unloads(monkeypatch):
+    """Anti-flap: within CARETAKER_COMFY_EVICT_MIN_TENURE_S the hook must not
+    fire again — the LLM stays, the job keeps waiting (wait rhythm)."""
+    _env(
+        monkeypatch,
+        CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000",
+        CARETAKER_COMFY_VRAM_POLICY="evict",
+        CARETAKER_COMFY_EVICT_MIN_TENURE_S="600",
+        CARETAKER_COMFY_VRAM_WAIT_SECONDS="5",
+    )
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def low_probe():
+        return 500  # always short
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", low_probe)
+
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+    evictions = []
+
+    async def ok_evict():
+        evictions.append(1)
+
+    comfy_mod.set_llama_evict_hook(ok_evict)
+    try:
+        comfy_mod._last_evict_monotonic = time.monotonic()  # evicted 0 s ago
+        assert await comfy_mod._vram_gate() is not None  # budget burns out waiting
+        assert evictions == []  # tenure blocked the second unload
+    finally:
+        comfy_mod.set_llama_evict_hook(None)
+        comfy_mod._last_evict_monotonic = None
+
+
+@pytest.mark.asyncio
+async def test_evict_without_hook_degrades_to_wait(monkeypatch):
+    """No hook installed (broken models config, test double): the evict policy
+    must degrade to plain wait — never crash the proxy path."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="evict",
+         CARETAKER_COMFY_VRAM_WAIT_SECONDS="5")
+    comfy_mod.set_llama_evict_hook(None)
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def low_probe():
+        return 500
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", low_probe)
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+    assert await comfy_mod._vram_gate() is not None  # wait-shaped budget timeout
+
+
+@pytest.mark.asyncio
+async def test_evict_hook_failure_degrades_to_wait(monkeypatch):
+    """A raising hook must not crash the gate: it degrades to wait for the
+    rest of this connection's gate pass."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="evict",
+         CARETAKER_COMFY_VRAM_WAIT_SECONDS="5")
+    monkeypatch.delenv("CARETAKER_COMFY_EVICT_MIN_TENURE_S", raising=False)
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def low_probe():
+        return 500
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", low_probe)
+    free_posts = []
+
+    def transport_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+
+    async def bomb():
+        raise RuntimeError("manager exploded")
+
+    comfy_mod.set_llama_evict_hook(bomb)
+    try:
+        assert await comfy_mod._vram_gate() is not None  # waited out, no crash
+    finally:
+        comfy_mod.set_llama_evict_hook(None)
+    assert comfy_mod._evict_count == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_free_nudge_never_escalates_to_evict(monkeypatch):
+    """A /free that fails released nothing, so evict-policy must retry the cheap
+    path instead of unloading the LLM on a nudge that never happened
+    (PR-Piet finding, comfy.py:591)."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="evict",
+         CARETAKER_COMFY_VRAM_WAIT_SECONDS="5")
+    monkeypatch.delenv("CARETAKER_COMFY_EVICT_MIN_TENURE_S", raising=False)
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def low_probe():
+        return 500
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", low_probe)
+
+    free_posts = []
+
+    def failing_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(500, json={"error": "nudge failed"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(failing_handler), **kwargs),
+    )
+
+    evictions = []
+
+    async def fake_evict():
+        evictions.append(1)
+
+    comfy_mod.set_llama_evict_hook(fake_evict)
+    try:
+        assert await comfy_mod._vram_gate() is not None  # budget burns out -> 503
+    finally:
+        comfy_mod.set_llama_evict_hook(None)
+    assert evictions == []  # the LLM was never unloaded on a failed nudge
+    assert comfy_mod._evict_count == 0
+    assert len(free_posts) >= 2  # the nudge was retried, not treated as done
+
+
+@pytest.mark.asyncio
+async def test_busy_job_rearms_the_nudge_before_evict(monkeypatch):
+    """A comfy job that ran during the wait may have (re)loaded models and
+    undone the earlier /free, so the cheap nudge must run again before the LLM
+    is evicted (PR-Piet finding, comfy.py:547)."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="evict",
+         CARETAKER_COMFY_VRAM_WAIT_SECONDS="7")
+    monkeypatch.delenv("CARETAKER_COMFY_EVICT_MIN_TENURE_S", raising=False)
+
+    # idle (nudge) -> a job starts -> idle again (must nudge before evicting)
+    snapshots = [
+        {"queue_running": [], "queue_pending": []},
+        {"queue_running": [{"id": 1}], "queue_pending": []},
+    ]
+
+    async def snap():
+        return snapshots.pop(0) if snapshots else {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def low_probe():
+        return 500
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", low_probe)
+
+    events = []
+
+    def transport_handler(request):
+        events.append("free")
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+
+    async def fake_evict():
+        events.append("evict")
+
+    comfy_mod.set_llama_evict_hook(fake_evict)
+    try:
+        assert await comfy_mod._vram_gate() is not None  # budget burns out -> 503
+    finally:
+        comfy_mod.set_llama_evict_hook(None)
+    assert events == ["free", "free", "evict"]  # the post-busy pass nudged again
+
+
+# --- evict-hook deadline bounding (PR #16 review: unbounded eviction) ---
+
+
+def _short_vram_env(monkeypatch, wait_seconds: int = 3) -> None:
+    """VRAM short + ``evict`` policy + a tight gate budget, no sockets."""
+    _env(
+        monkeypatch,
+        CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000",
+        CARETAKER_COMFY_VRAM_POLICY="evict",
+        CARETAKER_COMFY_VRAM_WAIT_SECONDS=str(wait_seconds),
+    )
+    monkeypatch.delenv("CARETAKER_COMFY_EVICT_MIN_TENURE_S", raising=False)
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def low_probe():
+        return 500  # VRAM never recovers on its own
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", low_probe)
+
+    def transport_handler(request):
+        return httpx.Response(200, json={})  # the /free nudge "succeeds"
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+
+
+def _install_stalled_evict_hook() -> tuple[asyncio.Event, asyncio.Event]:
+    """Install a hook that never returns on its own (a wedged unload)."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stalled_evict():
+        started.set()
+        await release.wait()
+
+    comfy_mod.set_llama_evict_hook(stalled_evict)
+    return started, release
+
+
+async def _drop_stalled_evict_hook() -> None:
+    """Release/cancel the test hook and clear the module's in-flight ref."""
+    comfy_mod.set_llama_evict_hook(None)
+    task = comfy_mod._evict_task
+    comfy_mod._evict_task = None
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_stalled_evict_hook_is_bounded_by_the_wait_budget(monkeypatch):
+    """A hook that never returns must not hold the gate past its budget.
+
+    Regression for the PR #16 review finding (comfy.py:577): the hook await was
+    unbounded, so a stalled unload kept ``_vram_gate_lock`` forever and no
+    client ever got the configured 503.
+    """
+    budget = 3
+    _short_vram_env(monkeypatch, budget)
+    started, _release = _install_stalled_evict_hook()
+    try:
+        t0 = time.monotonic()
+        gate = await asyncio.wait_for(comfy_mod._vram_gate(), timeout=budget + 5)
+        elapsed = time.monotonic() - t0
+        assert started.is_set()  # the hook really was awaited, not skipped
+        assert gate is not None
+        assert gate["error"] == "comfy_vram_unavailable"
+        assert elapsed < budget + 3, f"gate answered after {elapsed:.1f}s (budget {budget}s)"
+        # The eviction never completed: bookkeeping must not claim one.
+        assert comfy_mod._evict_count == 0
+        assert comfy_mod._last_evict_monotonic is None
+    finally:
+        await _drop_stalled_evict_hook()
+
+
+@pytest.mark.asyncio
+async def test_stalled_evict_hook_does_not_block_the_next_connection(monkeypatch):
+    """A second gate call behind a stalled eviction must still answer.
+
+    On the unfixed head the first caller blocks inside the hook forever, so the
+    second caller blocks on ``_vram_gate_lock`` forever as well.
+    """
+    budget = 3
+    _short_vram_env(monkeypatch, budget)
+    started, _release = _install_stalled_evict_hook()
+    second: asyncio.Task | None = None
+    try:
+        t0 = time.monotonic()
+        first = asyncio.create_task(comfy_mod._vram_gate())
+        await asyncio.wait_for(started.wait(), timeout=budget + 5)  # hook in flight
+        second = asyncio.create_task(comfy_mod._vram_gate())
+        first_gate = await asyncio.wait_for(first, timeout=budget + 5)
+        first_elapsed = time.monotonic() - t0
+        second_gate = await asyncio.wait_for(second, timeout=budget + 10)
+        second_elapsed = time.monotonic() - t0
+        assert first_gate is not None and second_gate is not None
+        assert first_gate["error"] == "comfy_vram_unavailable"
+        assert second_gate["error"] == "comfy_vram_unavailable"
+        assert first_elapsed < budget + 3, f"first gate {first_elapsed:.1f}s (budget {budget}s)"
+        # The second caller queues behind the first one's budget, never behind
+        # the stalled hook: at most ~2 budgets, not "forever".
+        assert second_elapsed < (2 * budget) + 6, f"second gate {second_elapsed:.1f}s"
+        assert not _release.is_set()  # the hook never finished during the test
+        assert comfy_mod._evict_count == 0
+        assert comfy_mod._last_evict_monotonic is None
+        # The abandoned hook is detached (still pending), never stacked twice.
+        assert comfy_mod._evict_task is not None
+        assert not comfy_mod._evict_task.done()
+    finally:
+        if second is not None and not second.done():
+            second.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await second
+        await _drop_stalled_evict_hook()
+
+
+@pytest.mark.asyncio
+async def test_eviction_completing_after_the_budget_is_recorded_once(monkeypatch):
+    """A late unload is recorded when it *lands*, never when it was requested.
+
+    The gate answers its 503 at the budget and leaves the detached hook to
+    finish; ``evict_count``/``last_evict_epoch`` only move on completion, so the
+    anti-flap tenure starts from the real completion and no failed/abandoned
+    attempt is ever reported as an eviction.
+    """
+    budget = 3
+    _short_vram_env(monkeypatch, budget)
+    unloaded = asyncio.Event()
+
+    async def slow_evict():
+        await asyncio.sleep(2.5)  # outlives the remaining gate budget
+        unloaded.set()
+
+    comfy_mod.set_llama_evict_hook(slow_evict)
+    try:
+        t0 = time.monotonic()
+        gate = await asyncio.wait_for(comfy_mod._vram_gate(), timeout=budget + 5)
+        elapsed = time.monotonic() - t0
+        assert gate is not None and gate["error"] == "comfy_vram_unavailable"
+        assert elapsed < budget + 3, f"gate answered after {elapsed:.1f}s (budget {budget}s)"
+        assert comfy_mod._evict_count == 0  # not claimed while still unloading
+        task = comfy_mod._evict_task
+        assert task is not None and not task.done()
+        await asyncio.wait_for(task, timeout=5)
+        assert unloaded.is_set()
+        assert comfy_mod._evict_count == 1  # recorded exactly once, on completion
+        assert comfy_mod._last_evict_monotonic is not None
+    finally:
+        await _drop_stalled_evict_hook()
