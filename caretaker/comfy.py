@@ -113,6 +113,12 @@ _vram_gate_lock = asyncio.Lock()
 _llama_evict_hook: Callable[[], Awaitable[object]] | None = None
 _last_evict_monotonic: float | None = None
 _evict_count = 0
+# The eviction currently running, if any. The hook *is* a whole manager unload
+# (``stop()`` of a subprocess or ``systemctl stop``), so it is only ever waited
+# on until the gate's deadline — never cancelled (see ``_await_evict``) — and at
+# most ONE runs at a time: a second gate pass that finds it in flight waits its
+# own budget out instead of stacking unloads on the LLM.
+_evict_task: asyncio.Future[bool] | None = None
 
 
 def _env(name: str, default: str) -> str:
@@ -270,6 +276,7 @@ async def astatus() -> dict[str, Any]:
             else None
         ),
         "evict_hook_set": _llama_evict_hook is not None,
+        "evict_in_flight": _evict_task is not None and not _evict_task.done(),
         "max_concurrent": _max_concurrent(),
         "slot_active": _slot_active,
         "slot_waiting": _slot_waiting,
@@ -490,6 +497,77 @@ async def _synthetic_503(
             await writer.wait_closed()
 
 
+async def _evict_and_record(hook: Callable[[], Awaitable[object]]) -> bool:
+    """Await the injected evict hook and record only a *completed* eviction.
+
+    Runs as its own task (``_evict_task``) so the gate can bound its **wait**
+    without cancelling the unload. Bookkeeping happens here, before the task
+    completes, so ``status()``'s ``evict_count`` / ``last_evict_epoch`` — and
+    the anti-flap tenure derived from them — never claim an eviction that did
+    not finish: a failed hook records nothing (the gate then behaves as
+    ``wait``), and a timeout leaves the counters untouched until the unload
+    really lands.
+    """
+    global _last_evict_monotonic, _evict_count
+    try:
+        await hook()
+    except asyncio.CancelledError:
+        logger.warning("⚠️ Comfy evict hook was cancelled — no eviction recorded")
+        raise
+    except Exception:
+        logger.warning("⚠️ Comfy evict hook failed — no eviction recorded", exc_info=True)
+        return False
+    _last_evict_monotonic = time.monotonic()
+    _evict_count += 1
+    return True
+
+
+def _harvest_evict() -> bool:
+    """Drop the finished hook task; return True while one is still running."""
+    global _evict_task
+    task = _evict_task
+    if task is None:
+        return False
+    if not task.done():
+        return True
+    _evict_task = None  # outcome was already recorded by _evict_and_record
+    return False
+
+
+async def _await_evict(deadline: float, hook: Callable[[], Awaitable[object]]) -> str:
+    """Start (or join) the evict hook and wait at most until ``deadline``.
+
+    Returns ``"done"`` | ``"failed"`` | ``"cancelled"`` | ``"timeout"``. On
+    ``"timeout"`` the hook is **detached, never cancelled**: the hook is wired
+    to ``Caretaker.unload``, which awaits ``ServerProcess.stop()`` (``sudo
+    systemctl stop`` / SIGTERM+wait). Cancelling that mid-flight would leave the
+    child unreaped while ``_unload_locked`` skips every bookkeeping step — the
+    backend goes down but ``is_unloaded``/``current_model`` still claim a loaded
+    model and the VRAM slot stays booked, so the next ``/ensure`` can think the
+    GPU is full (or race the orphaned stop and have its fresh server killed).
+    The hook is therefore not cancellation-safe by construction; the least
+    harmful behaviour is to bound only *our wait*, answer the client, and let
+    the manager finish its own bounded stop (systemd ``TimeoutStopSec``,
+    ``DirectServerProcess`` 5 s TERM + 5 s KILL).
+    """
+    global _evict_task
+    task = _evict_task
+    if task is None or task.done():
+        task = asyncio.ensure_future(_evict_and_record(hook))
+        _evict_task = task
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        done, _pending = await asyncio.wait({task}, timeout=remaining)
+        if not done:
+            return "timeout"  # hook keeps running; the caller answers now
+    elif not task.done():
+        return "timeout"
+    _evict_task = None
+    if task.cancelled():
+        return "cancelled"
+    return "done" if task.result() else "failed"
+
+
 async def _vram_gate() -> dict[str, Any] | None:
     """VRAM gate: return None to proceed, or a 503 body dict to reject.
 
@@ -500,8 +578,10 @@ async def _vram_gate() -> dict[str, Any] | None:
     GPU — the LLM re-loads on its next request through the /ensure path.
     Probe failure always passes (fail-open). Serialized by
     ``_vram_gate_lock``: concurrent connections must not each spawn their own
-    probe/nudge loop — the /free herd can unload models mid-job."""
-    global _vram_policy_warned, _last_evict_monotonic, _evict_count
+    probe/nudge loop — the /free herd can unload models mid-job — and the
+    whole pass (including the eviction) is bounded by the wait budget, so a
+    stalled unload can never pin that lock (PR #16 review)."""
+    global _vram_policy_warned
     min_free = _vram_min_free_mb()
     if min_free <= 0:
         return None
@@ -559,6 +639,12 @@ async def _vram_gate() -> dict[str, Any] | None:
                     policy = "wait"
                     await asyncio.sleep(2.0)
                     continue
+                if _harvest_evict():
+                    # A previous eviction is still running (slow unload): never
+                    # stack a second unload; keep the re-probe rhythm until it
+                    # lands or the budget runs out (deadline check at the top).
+                    await asyncio.sleep(2.0)
+                    continue
                 now = time.monotonic()
                 if (
                     _last_evict_monotonic is not None
@@ -573,15 +659,28 @@ async def _vram_gate() -> dict[str, Any] | None:
                     free,
                     min_free,
                 )
-                try:
-                    await _llama_evict_hook()
-                except Exception:
-                    logger.warning("⚠️ Comfy evict hook failed — behaving as wait", exc_info=True)
+                outcome = await _await_evict(deadline, _llama_evict_hook)
+                if outcome == "timeout":
+                    # The unload outlived the wait budget: the client gets the
+                    # configured 503 now, the hook stays detached and finishes
+                    # on its own (never cancelled — see _await_evict). Nothing
+                    # is recorded for an eviction that has not completed.
+                    logger.warning(
+                        "⚠️ Comfy evict hook still running after the %ss wait budget — "
+                        "answering 503, unload left to finish",
+                        _vram_wait_seconds(),
+                    )
+                    return {
+                        "error": "comfy_vram_unavailable",
+                        "message": "LLM eviction did not finish within the wait budget",
+                        "free_mb": free,
+                        "required_mb": min_free,
+                    }
+                if outcome != "done":
+                    logger.warning("⚠️ Comfy evict hook did not complete — behaving as wait")
                     policy = "wait"
                     await asyncio.sleep(2.0)
                     continue
-                _last_evict_monotonic = now
-                _evict_count += 1
                 await asyncio.sleep(2.0)
                 continue
             # Nudge Comfy to release cached models, then re-probe. The wait
