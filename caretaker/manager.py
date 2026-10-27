@@ -42,7 +42,7 @@ from .paths import (
     llama_slots_dir,
     server_url,
 )
-from .vram import VramScheduler, get_model_size_mb
+from .vram import VramLimitExceededError, VramScheduler, get_model_size_mb
 
 logger = logging.getLogger("caretaker.manager")
 
@@ -456,7 +456,10 @@ def _read_health_polls(config_path: str | None) -> int | None:
     abort (and stop the unit) before the load ever finishes. This knob lets a
     host config raise the ensure health-wait without code changes. Mirrors the
     best-effort contract of ``_read_vram_limit``: absent/unreadable/non-integer
-    → ``None`` (the built-in default stays in force).
+    → ``None`` (the built-in default stays in force). Non-finite YAML floats
+    (``.inf``/``-.inf``) raise ``OverflowError`` from ``int()`` and take the
+    same ignore path — callers run this on the live daemon (boot AND after a
+    hot-reload), so a bad knob must never break a status/switch/unload call.
     """
     import yaml as _yaml
 
@@ -473,10 +476,43 @@ def _read_health_polls(config_path: str | None) -> int | None:
         return None
     try:
         val = int(raw)
-    except (TypeError, ValueError):
-        logger.warning("Ignoring non-integer health_polls=%r in %s", raw, path)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a non-finite float (``.inf``/``-.inf``) is not an
+        # integer poll count either — ignore it like any other invalid value.
+        logger.warning("Ignoring invalid health_polls=%r in %s", raw, path)
         return None
     return val
+
+
+def _config_validation_errors(loaded: config_mod.ModelsConfig) -> list[str]:
+    """Deep-validate a freshly loaded models config BEFORE publishing it.
+
+    ``load_models_config`` only guarantees top-level mapping shapes. A
+    hot-reload publishes the parsed dicts into a RUNNING daemon, so a
+    shallow-valid file with a ``null`` model entry, an entry missing its
+    ``path``, or a non-string alias target would replace the working config
+    and crash later ensure calls. This gate runs ONLY on hot-reload — boot
+    behavior (constructor load) is unchanged.
+    """
+    errors: list[str] = []
+    for name, entry in loaded["models"].items():
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"model key {name!r} is not a non-empty string")
+            continue
+        if not isinstance(entry, dict):
+            errors.append(
+                f"model entry {name!r} is not a mapping (got {type(entry).__name__})"
+            )
+        elif not isinstance(entry.get("path"), str) or not entry["path"].strip():
+            errors.append(f"model entry {name!r} has no non-empty string 'path'")
+    for alias, target in loaded.get("aliases", {}).items():
+        if not isinstance(alias, str) or not alias.strip():
+            errors.append(f"alias key {alias!r} is not a non-empty string")
+        if not isinstance(target, str) or not target.strip():
+            errors.append(
+                f"alias {alias!r} target {target!r} is not a non-empty string"
+            )
+    return errors
 
 
 class Caretaker:
@@ -501,6 +537,19 @@ class Caretaker:
         check_vram: bool = True,
     ) -> None:
         self.config_path = Path(config_path) if config_path else config_mod.models_file_path()
+        # Config hot-reload bookkeeping (f-config-hot-reload): the
+        # (st_mtime_ns, st_size) signature of the models file snapshot read
+        # here. ``_maybe_reload_config`` re-reads the file only when this
+        # signature changes; a stat failure (missing file) stores None.
+        #
+        # Capture the signature BEFORE the parse. A write that lands between
+        # the two must leave a stale SIGNATURE, not a mismatched pair: with the
+        # signature taken afterwards, the edit would be recorded as "already
+        # loaded" while the in-memory config is still the old one, and
+        # ``_maybe_reload_config`` would keep skipping the file until some
+        # later unrelated edit changes it again. Statting first means the next
+        # reload check sees the change and re-parses.
+        initial_config_sig: tuple[int, int] | None = self._stat_config_sig()
         loaded = config_mod.load_models_config(self.config_path)
         self.models: dict[str, dict] = dict(loaded["models"])
         # Alias map (alias → canonical model name) from the same host config.
@@ -510,6 +559,12 @@ class Caretaker:
         # Double resolution is harmless: a canonical name is not an alias key,
         # so it passes through unchanged.
         self.aliases: dict[str, str] = dict(loaded.get("aliases", {}))
+        self._config_file_sig = initial_config_sig
+        # Whether the constructor received an explicit ``health_polls``
+        # override (i.e. a value different from the built-in default): only
+        # then is the models-file knob forbidden from touching
+        # ``self.health_polls`` on a hot reload.
+        self._health_polls_explicit: bool = health_polls != DEFAULT_HEALTH_POLLS
         self.server_process = server_process or _default_server_process()
         self.server_url = server_url
         # An explicit constructor argument (tests, programmatic use) wins over
@@ -577,6 +632,119 @@ class Caretaker:
         # cache stays in the gateway; caretaker only needs a no-op/bookkeeping
         # reset surface for Phase A).
         self._vision_validations: dict[str, str] = {}
+
+        # In-flight same-name VRAM re-size (config hot-reload): (model_name,
+        # previous_size_mb) once ``VramScheduler.update_size`` replaced the
+        # held slot's size. The except-path reverts it to the previous size
+        # while the OLD backend is still running (failure before the stop);
+        # cleared in the switch's finally AND at the teardown boundary.
+        self._vram_size_update: tuple[str, int] | None = None
+        # In-flight released slot of a swap: (model_name, held_size_mb) once
+        # the running model's reservation was released to make room for the
+        # target. The except-path re-books this EXACT size while the old
+        # backend still runs (failure before the stop) — recomputing it from
+        # the hot-reloaded config could no longer fit and would leave the live
+        # model unreserved. Cleared with ``_vram_size_update`` (same window).
+        self._vram_released_held: tuple[str, int] | None = None
+
+    # ------------------------------------------------------ config hot-reload
+    def _stat_config_sig(self) -> tuple[int, int] | None:
+        """File signature ``(st_mtime_ns, st_size)`` of the models config.
+
+        ``None`` when the file cannot be stat'ed (missing/unreadable).
+        """
+        try:
+            st = self.config_path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _maybe_reload_config(self, *, defer_if_locked: bool = False) -> bool:
+        """Hot-reload the models config when its file changed on disk.
+
+        Fail-open contract — a broken edit never takes the daemon down and
+        never loses the working config:
+
+        - With ``defer_if_locked=True`` (used by the lock-free ``health()``):
+          when the lifecycle lock is currently held, skip the reload
+          entirely and return ``False``. A switch in flight must persist the
+          launch signature computed from the config snapshot it STARTED
+          with — a mid-switch swap would make it persist a signature for a
+          backend launched from the old config (hiding drift, e.g. a ctx
+          edit) or fail the strict /props verification spuriously (a path
+          edit). During a switch, status therefore reports against the
+          snapshot the switch started with; the next status call AFTER the
+          switch persists its signature reloads and reflects the fresh file.
+        - Missing/unreadable file (OSError on stat) → keep the current config
+          AND the stored signature (return ``False``); the file may reappear,
+          which then still counts as a change.
+        - Unchanged ``(st_mtime_ns, st_size)`` → cheap one-stat no-op.
+        - Changed file that fails to load (``ModelsConfigError``, OSError,
+          YAML errors — anything) → log ONE warning, KEEP the previous
+          in-memory config, and UPDATE the stored signature so the same
+          broken edit warns once instead of on every call.
+        - Changed file that loads but fails deep validation (model entries
+          without a ``path``, null entries, non-string alias targets — see
+          :func:`_config_validation_errors`) → identical fail-open path: ONE
+          warning, previous config kept, signature updated. Validation runs
+          ONLY here, never at boot (constructor load behavior unchanged).
+        - Successful load → atomically REPLACE ``self.models`` /
+          ``self.aliases`` with new dict objects (never mutate the old dicts:
+          an in-flight switch keeps operating on its snapshot), refresh
+          ``self.health_polls`` from the file only when the constructor did
+          NOT explicitly override it (a REMOVED ``health_polls`` key restores
+          the built-in default), and return ``True``.
+
+        Fully synchronous, so the dict swap is atomic with respect to
+        event-loop awaits; safe to call under the lifecycle lock
+        (``switch_model``/``unload``) or lock-free (``health()``).
+        """
+        if defer_if_locked and self._lifecycle_lock.locked():
+            # A switch holds the lifecycle lock: it must land on the snapshot
+            # it started with (see docstring — mid-switch swaps corrupt the
+            # persisted launch signature).
+            return False
+        sig = self._stat_config_sig()
+        if sig is None:
+            return False
+        if sig == self._config_file_sig:
+            return False
+        try:
+            loaded = config_mod.load_models_config(self.config_path)
+        except Exception as exc:  # noqa: BLE001 - fail-open: a broken edit must never crash the daemon
+            logger.warning(
+                "models config hot-reload failed (%s: %s) — keeping previous "
+                "in-memory config",
+                type(exc).__name__,
+                exc,
+            )
+            self._config_file_sig = sig
+            return False
+        validation_errors = _config_validation_errors(loaded)
+        if validation_errors:
+            logger.warning(
+                "models config hot-reload rejected (%s) — keeping previous "
+                "in-memory config",
+                "; ".join(validation_errors),
+            )
+            self._config_file_sig = sig
+            return False
+        self.models = dict(loaded["models"])
+        self.aliases = dict(loaded.get("aliases", {}))
+        self._config_file_sig = sig
+        if not self._health_polls_explicit:
+            configured_polls = _read_health_polls(self.config_path)
+            # An ABSENT key un-configures the knob: restore the built-in
+            # default instead of keeping the last file override forever.
+            self.health_polls = (
+                configured_polls if configured_polls is not None else DEFAULT_HEALTH_POLLS
+            )
+        logger.info(
+            "config hot-reloaded: %d models, %d aliases",
+            len(self.models),
+            len(self.aliases),
+        )
+        return True
 
     # ---------------------------------------------------------------- helpers
     def _resolve_vision_mmproj(self, config: dict[str, Any]) -> str | None:
@@ -740,8 +908,16 @@ class Caretaker:
         elif spec_type not in ("", "none", "draft-dflash"):
             # Speculative decoding WITHOUT an external draft model: either native
             # MTP layers (draft-mtp) or n-gram lookup (ngram-simple/ngram-map-k/
-            # ngram-mod/ngram-cache). Emit only --spec-type.
+            # ngram-mod/ngram-cache). Emit only --spec-type, plus the draft-KV
+            # quant knobs — honored on this embedded-MTP path too, but ONLY when
+            # the key is explicitly present in the config so every existing
+            # entry's args stay byte-identical (the f16 default stays silent;
+            # 2026-10-25 finding: these keys were dead letter on this branch).
             args_content += f" --spec-type {spec_type}"
+            if "draft_cache_type_k" in config:
+                args_content += f" --cache-type-k-draft {draft_cache_type_k}"
+            if "draft_cache_type_v" in config:
+                args_content += f" --cache-type-v-draft {draft_cache_type_v}"
             logger.info(f"⚡ Speculative decoding enabled (no draft): spec_type={spec_type}")
         elif spec_type == "draft-dflash":
             # draft-dflash requires an external draft model; without one it cannot
@@ -780,7 +956,11 @@ class Caretaker:
         Supported config keys (from models.yaml): path, context, ngl, kv_type,
         tensor_split, mmproj, extra_args, cuda_visible_devices, draft_model_path,
         spec_type, spec_draft_n_max, spec_draft_n_min, draft_cache_type_k,
-        draft_cache_type_v.
+        draft_cache_type_v. The draft cache keys are emitted on the external-
+        draft path (``draft_model_path`` set) and on the embedded-MTP path
+        (``spec_type`` set without ``draft_model_path``) only when explicitly
+        present in the config; on the embedded-MTP path the f16 default stays
+        silent so existing entries keep byte-identical args.
         """
         args_file = CURRENT_MODEL_ARGS_FILE
         env_file = CURRENT_MODEL_ENV_FILE
@@ -1240,6 +1420,10 @@ class Caretaker:
         one).
         """
         async with self._lifecycle_lock:
+            # Config hot-reload first: this switch must resolve aliases and
+            # validate against the freshest models.local.settings.yaml, not a
+            # snapshot from daemon start (or a previous call).
+            self._maybe_reload_config()
             # Invalidate even same-model/no-op observations: the foreground
             # request is authoritative over a previously scheduled restart.
             self._lifecycle_generation += 1
@@ -1309,6 +1493,36 @@ class Caretaker:
                     self._skip_next_context_save = True
                 else:
                     self.is_unloaded = False  # a live server is active; not unloaded
+                    # Warn-only VRAM re-book after a config hot-reload: the
+                    # no-op must never fail a healthy backend on a bookkeeping
+                    # estimate (raising here would flap a working model off
+                    # the gateway), but ``active_sizes`` should track a changed
+                    # ``size_mb`` in the common case so the next cross-model
+                    # acquire budget-checks on fresh numbers. The lifecycle
+                    # lock is held, so watchdog ticks cannot interleave;
+                    # ``_switch_in_progress`` stays False — this is not a
+                    # lifecycle transition, only slot bookkeeping.
+                    if self.vram is not None and model_name in self.vram.active_sizes:
+                        new_size = get_model_size_mb(
+                            model_name, self.models.get(model_name)
+                        )
+                        if new_size != self.vram.active_sizes.get(model_name):
+                            try:
+                                await self.vram.update_size(model_name, new_size)
+                                logger.info(
+                                    "VRAM slot re-sized (no-op path): '%s' → %dMB",
+                                    model_name,
+                                    new_size,
+                                )
+                            except VramLimitExceededError:
+                                logger.warning(
+                                    "Configured size_mb for '%s' (%dMB) exceeds the "
+                                    "VRAM budget — the model keeps running with its "
+                                    "previous booking (%dMB)",
+                                    model_name,
+                                    new_size,
+                                    self.vram.active_sizes.get(model_name),
+                                )
                     logger.info(f"Model {model_name} is already active")
                     return False
             else:
@@ -1343,12 +1557,39 @@ class Caretaker:
             held_model = self.current_model if self.vram is not None else None
             if self.vram is not None:
                 if held_model is not None and held_model != model_name:
+                    # Capture the EXACT reservation before releasing it: the
+                    # rollback must re-book this number, not a recomputation
+                    # from the (hot-reloadable) config — a grown ``size_mb``
+                    # need not fit the budget the running process was admitted
+                    # under, so a recomputed restore could fail and leave the
+                    # live model unreserved.
+                    held_size = self.vram.active_sizes.get(held_model)
                     await self.vram.release(held_model)
+                    if held_size is not None:
+                        self._vram_released_held = (held_model, held_size)
                 if held_model != model_name:
                     await self.vram.acquire(
                         model_name,
                         get_model_size_mb(model_name, self.models.get(model_name)),
                     )
+                else:
+                    # Same-name reload/restart (drift or force): the held slot
+                    # stays, but a config hot-reload may have changed the
+                    # entry's ``size_mb`` — re-book the footprint in place so
+                    # active_sizes cannot understate (later acquires would
+                    # overcommit). Strict and non-blocking: growing beyond the
+                    # budget fails the switch HERE, before any backend
+                    # teardown; shrinking just updates the reservation.
+                    old_size = self.vram.active_sizes.get(model_name)
+                    new_size = get_model_size_mb(
+                        model_name, self.models.get(model_name)
+                    )
+                    if old_size != new_size:
+                        await self.vram.update_size(model_name, new_size)
+                        # Booked for the except-path revert: the update is
+                        # published, but the backend still runs the OLD
+                        # footprint until the new process is up.
+                        self._vram_size_update = (model_name, old_size)
 
             logger.info(
                 "Switching from %s [%s] to %s [%s]",
@@ -1373,6 +1614,17 @@ class Caretaker:
                     )
                 else:
                     await self._save_context(f"auto_save_{self.current_model}")
+
+            # Teardown boundary — the pre-stop rollback window ends HERE. Both
+            # rollback tokens describe the OLD backend's footprint, which only
+            # exists until this stop: a same-name re-size revert or a released
+            # swap slot restored after the stop would overwrite the booking of
+            # the process that comes up instead (understating ``active_sizes``
+            # for whatever runs next), and a post-start failure sets
+            # ``current_model`` again, so the except-path guard can no longer
+            # tell an old backend from the new one.
+            self._vram_size_update = None
+            self._vram_released_held = None
 
             # 2. Stop llama-server. The old model is no longer running: clear the
             #    active-model bookkeeping NOW, so a later exception (args write,
@@ -1474,8 +1726,53 @@ class Caretaker:
             #   slot it kept (its server is dead; holding it would
             #   phantom-block others), a cold-start failure is a no-op decrement.
             if self.vram is not None:
+                # A same-name size update may have been published before the
+                # failure. Revert it while the OLD backend still runs (failure
+                # BEFORE the stop: ``current_model`` not yet cleared — it
+                # serves the old footprint, so the reservation must return to
+                # the old size). After the stop, the release branch below
+                # frees the slot entirely — no double handling. The revert is
+                # guarded: its own failure must never mask the original one.
+                pending_size_update = self._vram_size_update
+                self._vram_size_update = None
+                released_held = self._vram_released_held
+                self._vram_released_held = None
+                if pending_size_update is not None and self.current_model is not None:
+                    update_model, update_old_size = pending_size_update
+                    try:
+                        await self.vram.update_size(update_model, update_old_size)
+                    except Exception:  # noqa: BLE001 - revert is best-effort, never masks the raise
+                        logger.warning(
+                            "VRAM size revert for '%s' to %sMB failed — active_sizes "
+                            "may be inaccurate until the next switch",
+                            update_model,
+                            update_old_size,
+                        )
                 if self.current_model is not None:
-                    if self.vram.active_counts.get(self.current_model, 0) == 0:
+                    if released_held is not None:
+                        # Nothing of the failed swap target survives: it never
+                        # started, so a slot its acquire already booked must be
+                        # freed — otherwise it is a phantom that, together with
+                        # the restored footprint, blocks every later acquire on
+                        # space no release can free.
+                        if self.vram.active_counts.get(model_name, 0) > 0:
+                            await self.vram.release(model_name)
+                        # The swap released the running model's slot to make
+                        # room for the target. This failure is pre-stop (a
+                        # post-stop failure has already retired the token), so
+                        # the old backend still runs and gets the EXACT
+                        # reservation it held back — non-blocking, because a
+                        # running backend's footprint is reality even when the
+                        # reloaded config no longer fits the budget.
+                        await self.vram.restore_held(*released_held)
+                        logger.info(
+                            "VRAM slot for '%s' restored (%dMB) after the failed "
+                            "switch to '%s'",
+                            released_held[0],
+                            released_held[1],
+                            model_name,
+                        )
+                    elif self.vram.active_counts.get(self.current_model, 0) == 0:
                         await self.vram.acquire(
                             self.current_model,
                             get_model_size_mb(
@@ -1499,6 +1796,8 @@ class Caretaker:
             raise
         finally:
             self._switch_in_progress = False
+            self._vram_size_update = None
+            self._vram_released_held = None
 
         # Only reached on the successful (re)load path: the backend was freshly
         # started, so in-memory session state is gone and the gateway may
@@ -1531,6 +1830,7 @@ class Caretaker:
     async def unload(self) -> None:
         """Stop llama-server to free all VRAM. Guard against double-unload."""
         async with self._lifecycle_lock:
+            self._maybe_reload_config()
             self._lifecycle_generation += 1
             self._watchdog_retry_model = None
             await self._unload_locked()
@@ -1600,7 +1900,19 @@ class Caretaker:
         ``needs_reload`` is True when the backend cannot serve the current
         config as-is and a ``/ensure`` would be needed first: always when
         unloaded, and when the loaded model's launch signature is drifted
-        (see :meth:`check_drift`)."""
+        (see :meth:`check_drift`).
+
+        Lock-free and synchronous: the config hot-reload check at the top is
+        fully synchronous, so its in-memory dict swap is atomic with respect
+        to event-loop awaits. ``defer_if_locked=True`` skips the reload while
+        a switch holds the lifecycle lock — the in-flight switch must persist
+        the launch signature computed from the snapshot it started with, so
+        status during a switch reports against that snapshot; the next status
+        after the switch reloads and reflects the fresh file. A switch whose
+        loaded model is removed by a reload may transiently report
+        ``needs_reload: true`` until then — expected and self-correcting.
+        """
+        self._maybe_reload_config(defer_if_locked=True)
         if self.is_unloaded:
             return {
                 "loaded_model": None,
@@ -1610,6 +1922,24 @@ class Caretaker:
                 "loaded_at": None,
                 "idle_since": None,
             }
+        needs_reload = True
+        if self.current_model is not None:
+            if self.current_model not in self.models:
+                # Defensive for config hot-reload: the loaded model may have
+                # been removed from models.local.settings.yaml while the
+                # daemon keeps serving it. _config_drifted →
+                # _compute_launch_signature indexes self.models[model_name]
+                # and would raise KeyError out of a status read; report
+                # needs_reload instead — /ensure on the stale name 404s and
+                # the gateway/operator picks a still-configured model. The
+                # in-flight switch that loaded it kept its own snapshot, so
+                # this is transient until the next status read reflects the
+                # reloaded config.
+                needs_reload = True
+            else:
+                needs_reload = self._config_drifted(
+                    self.current_model, enable_vision=None, config_vision=True
+                )
         return {
             "loaded_model": self.current_model,
             "vision_enabled": self.current_vision_enabled,
@@ -1623,11 +1953,7 @@ class Caretaker:
             # forces it), NOT the loaded vision mode: folding in the loaded
             # mode would hide a config change that adds/removes mmproj and the
             # gateway would never issue the needed /ensure reload.
-            "needs_reload": self._config_drifted(
-                self.current_model, enable_vision=None, config_vision=True
-            )
-            if self.current_model is not None
-            else True,
+            "needs_reload": needs_reload,
         }
 
     # ------------------------------------------------------------- watchdog

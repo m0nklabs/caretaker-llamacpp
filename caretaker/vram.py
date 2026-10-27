@@ -176,3 +176,102 @@ class VramScheduler:
                 self.active_sizes.pop(model_name, None)
             self.condition.notify_all()
             logger.info("VRAM released for '%s'", model_name)
+
+    async def restore_held(self, model_name: str, size_mb: int) -> None:
+        """Re-book the EXACT reservation of a model whose server still runs.
+
+        Failure-path counterpart of :meth:`release`: the manager releases the
+        running model's slot to make room for a swap target, and when that
+        target's acquisition (or anything else before the teardown) fails, the
+        old backend never stopped and must get its previous reservation back.
+        The caller passes the size it captured *before* the release, not a
+        recomputation from the (possibly hot-reloaded) config: a grown
+        ``size_mb`` estimate need not fit the budget the running process was
+        admitted under, and recomputing would leave a live model unreserved.
+
+        Deliberately non-blocking, unlike :meth:`acquire`: the reservation
+        describes an already resident process, so reality outranks the budget.
+        If restoring pushes the active sum over ``limit_mb`` (another model
+        took part of the budget while the slot was released) that is logged as
+        a warning and left visible — waiting could never be satisfied by any
+        release this path is able to make.
+
+        A model that still holds a slot is left untouched (idempotent, no
+        double count).
+        """
+        async with self.condition:
+            if self.active_counts.get(model_name, 0) > 0:
+                logger.info(
+                    "VRAM restore skipped for '%s': slot still held (%dMB)",
+                    model_name,
+                    self.active_sizes.get(model_name, 0),
+                )
+                return
+            self.active_counts[model_name] += 1
+            self.active_sizes[model_name] = size_mb
+            total = sum(self.active_sizes.values())
+            if total > self.limit_mb:
+                logger.warning(
+                    "VRAM bookkeeping over budget after restoring '%s' (%dMB): "
+                    "active %dMB > limit %dMB — a running backend keeps its "
+                    "reservation",
+                    model_name,
+                    size_mb,
+                    total,
+                    self.limit_mb,
+                )
+            logger.info(
+                "VRAM reservation restored for '%s' (active: %s, %dMB)",
+                model_name,
+                list(self.active_sizes),
+                total,
+            )
+
+    async def update_size(self, model_name: str, new_size_mb: int) -> None:
+        """Re-size the slot of an ACTIVE model in place (never blocks).
+
+        Used by the manager when a same-name model's configured footprint
+        (``size_mb``) changed via config hot-reload: the held reservation must
+        track the new footprint, otherwise ``active_sizes`` understates and a
+        later acquire can overcommit the budget.
+
+        Strict and fail-fast — this runs while the manager holds its lifecycle
+        lock, and the same-name switch itself could only free the space it
+        needs, so waiting would deadlock (swap-deadlock rule):
+
+        - ``model_name`` not currently active → ``ValueError`` ("not held").
+        - The budget check replaces the model's own size in the active sum;
+          growing beyond ``limit_mb`` raises :class:`VramLimitExceededError`
+          WITHOUT changing ``active_sizes`` (the caller fails the switch
+          honestly BEFORE touching the backend).
+        - When it fits, the size is swapped in place; ``active_counts`` is
+          untouched and waiters are notified (a shrink may free room).
+
+        A ``new_size_mb`` of 0 (unknown footprint) is accepted like an
+        ``acquire`` with 0: the model claims no VRAM.
+        """
+        if model_name not in self.active_sizes:
+            raise ValueError(
+                f"Model '{model_name}' has no active VRAM slot (not held)"
+            )
+        async with self.condition:
+            needed_vram = (
+                sum(self.active_sizes.values())
+                - self.active_sizes[model_name]
+                + new_size_mb
+            )
+            if needed_vram > self.limit_mb:
+                raise VramLimitExceededError(
+                    f"Model '{model_name}' cannot grow to {new_size_mb}MB: active "
+                    f"VRAM would be {needed_vram}MB but the limit is {self.limit_mb}MB"
+                )
+            self.active_sizes[model_name] = new_size_mb
+            self.condition.notify_all()
+            logger.info(
+                "VRAM slot re-sized for '%s': %dMB (active: %s, %dMB <= %dMB)",
+                model_name,
+                new_size_mb,
+                list(self.active_sizes),
+                needed_vram,
+                self.limit_mb,
+            )
