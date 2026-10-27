@@ -543,6 +543,11 @@ async def _vram_gate() -> dict[str, Any] | None:
                 # Busy (or unreachable): a job owns the VRAM and /free can
                 # unload models mid-generation — never nudge, never evict;
                 # just keep the re-probe rhythm until the budget runs out.
+                # A job that ran during the wait may have (re)loaded models and
+                # undone an earlier /free, so the cheap nudge path is re-armed:
+                # under ``evict`` the LLM must not be unloaded on the strength
+                # of a nudge that a later job invalidated.
+                nudged = False
                 await asyncio.sleep(2.0)
                 continue
             if policy == "evict" and nudged:
@@ -585,10 +590,18 @@ async def _vram_gate() -> dict[str, Any] | None:
             host, port = upstream_target()
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
-                    await client.post(f"http://{host}:{port}/free", json={"unload_models": True})
+                    response = await client.post(
+                        f"http://{host}:{port}/free", json={"unload_models": True}
+                    )
+                response.raise_for_status()
             except Exception:
                 logger.debug("Comfy /free nudge failed during VRAM gate", exc_info=True)
-            nudged = True
+            else:
+                # Only a nudge that actually ran counts as "comfy released its
+                # cache". A failed /free frees nothing, so marking it would let
+                # the next pass evict the LLM while the shortfall is unchanged —
+                # retry the cheap path instead (bounded by the wait budget).
+                nudged = True
             await asyncio.sleep(2.0)
 
 

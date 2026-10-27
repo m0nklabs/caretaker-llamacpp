@@ -1180,3 +1180,99 @@ async def test_evict_hook_failure_degrades_to_wait(monkeypatch):
     finally:
         comfy_mod.set_llama_evict_hook(None)
     assert comfy_mod._evict_count == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_free_nudge_never_escalates_to_evict(monkeypatch):
+    """A /free that fails released nothing, so evict-policy must retry the cheap
+    path instead of unloading the LLM on a nudge that never happened
+    (PR-Piet finding, comfy.py:591)."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="evict",
+         CARETAKER_COMFY_VRAM_WAIT_SECONDS="5")
+    monkeypatch.delenv("CARETAKER_COMFY_EVICT_MIN_TENURE_S", raising=False)
+
+    async def snap():
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def low_probe():
+        return 500
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", low_probe)
+
+    free_posts = []
+
+    def failing_handler(request):
+        free_posts.append(request.url.path)
+        return httpx.Response(500, json={"error": "nudge failed"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(failing_handler), **kwargs),
+    )
+
+    evictions = []
+
+    async def fake_evict():
+        evictions.append(1)
+
+    comfy_mod.set_llama_evict_hook(fake_evict)
+    try:
+        assert await comfy_mod._vram_gate() is not None  # budget burns out -> 503
+    finally:
+        comfy_mod.set_llama_evict_hook(None)
+    assert evictions == []  # the LLM was never unloaded on a failed nudge
+    assert comfy_mod._evict_count == 0
+    assert len(free_posts) >= 2  # the nudge was retried, not treated as done
+
+
+@pytest.mark.asyncio
+async def test_busy_job_rearms_the_nudge_before_evict(monkeypatch):
+    """A comfy job that ran during the wait may have (re)loaded models and
+    undone the earlier /free, so the cheap nudge must run again before the LLM
+    is evicted (PR-Piet finding, comfy.py:547)."""
+    _env(monkeypatch, CARETAKER_COMFY_VRAM_MIN_FREE_MB="1000", CARETAKER_COMFY_VRAM_POLICY="evict",
+         CARETAKER_COMFY_VRAM_WAIT_SECONDS="7")
+    monkeypatch.delenv("CARETAKER_COMFY_EVICT_MIN_TENURE_S", raising=False)
+
+    # idle (nudge) -> a job starts -> idle again (must nudge before evicting)
+    snapshots = [
+        {"queue_running": [], "queue_pending": []},
+        {"queue_running": [{"id": 1}], "queue_pending": []},
+    ]
+
+    async def snap():
+        return snapshots.pop(0) if snapshots else {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(comfy_mod, "_queue_snapshot", snap)
+
+    async def low_probe():
+        return 500
+
+    monkeypatch.setattr(comfy_mod, "_probe_free_vram_mb", low_probe)
+
+    events = []
+
+    def transport_handler(request):
+        events.append("free")
+        return httpx.Response(200, json={})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        comfy_mod.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(transport_handler), **kwargs),
+    )
+
+    async def fake_evict():
+        events.append("evict")
+
+    comfy_mod.set_llama_evict_hook(fake_evict)
+    try:
+        assert await comfy_mod._vram_gate() is not None  # budget burns out -> 503
+    finally:
+        comfy_mod.set_llama_evict_hook(None)
+    assert events == ["free", "free", "evict"]  # the post-busy pass nudged again
