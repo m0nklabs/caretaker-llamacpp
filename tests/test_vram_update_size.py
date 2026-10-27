@@ -59,3 +59,43 @@ async def test_update_size_accounts_for_other_active_models() -> None:
     with pytest.raises(VramLimitExceededError):
         await sched.update_size("b", 360)
     assert sched.active_sizes == {"a": 200, "b": 150}
+
+
+# ---------------------------------------------------------------- restore_held
+async def test_restore_held_rebooks_released_slot_exactly() -> None:
+    """A swap releases the running model's slot; the failure path re-books the
+    EXACT captured size (not a recomputed one) with a single count."""
+    sched = VramScheduler(500)
+    await sched.acquire("a", 300)
+    held = sched.active_sizes["a"]
+    await sched.release("a")
+    assert sched.active_sizes == {}
+
+    await sched.restore_held("a", held)
+    assert sched.active_sizes == {"a": 300}
+    assert sched.active_counts["a"] == 1
+
+
+async def test_restore_held_is_idempotent_when_slot_still_held() -> None:
+    """Restoring over a slot that is still held must not double-count."""
+    sched = VramScheduler(500)
+    await sched.acquire("a", 300)
+    await sched.restore_held("a", 300)
+    assert sched.active_sizes == {"a": 300}
+    assert sched.active_counts["a"] == 1
+
+
+async def test_restore_held_ignores_budget_but_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reality outranks the budget: a running backend keeps its reservation
+    even when a failed swap left the target booked too (over-limit is logged,
+    never blocked — waiting could not free anything on this path)."""
+    sched = VramScheduler(500)
+    await sched.acquire("b", 400)  # the failed target's leftover slot
+    with caplog.at_level("WARNING", logger="caretaker.vram"):
+        await sched.restore_held("a", 300)
+    assert sched.active_sizes == {"a": 300, "b": 400}
+    assert any(
+        "over budget after restoring" in record.getMessage() for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]

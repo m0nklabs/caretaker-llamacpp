@@ -725,3 +725,161 @@ async def test_noop_path_over_budget_size_keeps_booking_and_warns(
         "keeps running with its previous booking" in record.getMessage()
         for record in caplog.records
     ), [record.getMessage() for record in caplog.records]
+
+
+# ============ review round 3: pre-stop rollback restores the HELD reservation ============
+async def test_swap_failure_restores_exact_held_size_not_reloaded_estimate(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """A→B swap where the target alone is over budget: beta's acquire fails
+    AFTER alpha's slot was released, while alpha's backend keeps running.
+
+    The rollback must restore alpha's EXACT previous reservation (300MB) — not
+    a recomputation from the hot-reloaded config (600MB), which no longer fits
+    under the 500MB budget: that would leave the still-running alpha
+    unreserved (later acquires could overcommit) and mask the original budget
+    error with a second one from the rollback itself.
+    """
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={"alpha": _sized_model(300), "beta": _sized_model(600)},
+        vram_limit_mb=500,
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("alpha")
+    assert mgr.vram is not None
+    assert mgr.vram.active_sizes["alpha"] == 300
+    stops_after_load = proc.stop_calls
+
+    # The operator hot-edits alpha's estimate beyond the budget, then asks for
+    # beta (itself bigger than the whole budget): the swap releases alpha's
+    # slot first, so beta's acquire fails with alpha already unbooked.
+    _set_models_file(tmp_path, {"alpha": _sized_model(600), "beta": _sized_model(600)})
+    _bump_mtime(cfg, tick)
+    with pytest.raises(VramLimitExceededError) as excinfo:
+        await mgr.switch_model("beta")
+
+    assert mgr.vram.active_sizes.get("alpha") == 300, (
+        "the running backend's exact held reservation is restored, not the "
+        f"reloaded estimate: {dict(mgr.vram.active_sizes)}"
+    )
+    assert "beta" in str(excinfo.value), (
+        f"the target's budget failure must not be masked by its rollback: {excinfo.value}"
+    )
+    assert proc.stop_calls == stops_after_load, (
+        "the failure is pre-stop: alpha's backend keeps running"
+    )
+    assert mgr.current_model == "alpha"
+    assert "beta" not in mgr.vram.active_counts, "no phantom slot for the failed target"
+    assert mgr._vram_released_held is None, "the rollback token is consumed"
+    assert mgr._switch_in_progress is False
+
+
+async def test_post_start_failure_keeps_new_size_booking(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """Same-name reload 300→400 (fits): a failure AFTER the new backend is up
+    (context restore cancelled) must NOT revert the booking to 300.
+
+    The revert window ends at teardown: once llama-server is stopped, the old
+    footprint no longer exists and the freshly booked 400MB describes the
+    process that is now running — reverting understates ``active_sizes`` and
+    lets a later acquire overcommit, i.e. exactly the bug the size-tracking
+    fix is meant to prevent.
+    """
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={"minimal": _sized_model(300)},
+        vram_limit_mb=500,
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("minimal")
+    assert mgr.vram is not None
+
+    _set_models_file(tmp_path, {"minimal": _sized_model(400)})
+    _bump_mtime(cfg, tick)
+    mgr._load_context = AsyncMock(side_effect=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await mgr.switch_model("minimal", force=True)
+
+    assert mgr.current_model == "minimal", "the new backend is up and verified"
+    assert mgr.vram.active_sizes["minimal"] == 400, (
+        "the new backend's booking survives a post-start failure: "
+        f"{dict(mgr.vram.active_sizes)}"
+    )
+    assert mgr._vram_size_update is None, "no rollback token survives the switch"
+
+
+async def test_post_start_swap_failure_does_not_restore_released_old_slot(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """Guard for the swap rollback token: alpha→beta (300→400, budget 500) with
+    a post-start failure must NOT resurrect alpha's released 300MB slot — alpha
+    is stopped, only beta's 400MB booking may remain."""
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={"alpha": _sized_model(300), "beta": _sized_model(400)},
+        vram_limit_mb=500,
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("alpha")
+    assert mgr.vram is not None
+
+    _set_models_file(tmp_path, {"alpha": _sized_model(300), "beta": _sized_model(400)})
+    _bump_mtime(cfg, tick)
+    mgr._load_context = AsyncMock(side_effect=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await mgr.switch_model("beta", force=True)
+
+    assert mgr.current_model == "beta"
+    assert dict(mgr.vram.active_sizes) == {"beta": 400}, (
+        f"only the running model may hold a slot: {dict(mgr.vram.active_sizes)}"
+    )
+    assert mgr._vram_released_held is None
+
+
+async def test_swap_rollback_releases_unused_target_slot(
+    tmp_path: Path, patch_paths: None
+) -> None:
+    """alpha(300)→beta(400), budget 500: a pre-stop failure AFTER beta's slot
+    was acquired (auto-save cancelled) must release beta's unused reservation
+    and restore alpha's exact held size.
+
+    A leftover ``beta`` slot would be a phantom: beta never started, yet the
+    booked 400MB + alpha's real footprint exceed the budget, so every later
+    acquire (including a retry of beta itself) would block on space no release
+    can free.
+    """
+    proc = FakeServerProcess()
+    mgr = _make_manager(
+        tmp_path,
+        process=proc,
+        models={"alpha": _sized_model(300), "beta": _sized_model(400)},
+        vram_limit_mb=500,
+    )
+    cfg = tmp_path / "models.local.settings.yaml"
+    tick = [time.time_ns()]
+    await mgr.switch_model("alpha")
+    assert mgr.vram is not None
+
+    _set_models_file(tmp_path, {"alpha": _sized_model(300), "beta": _sized_model(400)})
+    _bump_mtime(cfg, tick)
+    mgr._save_context = AsyncMock(side_effect=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await mgr.switch_model("beta", force=True)
+
+    assert mgr.current_model == "alpha", "pre-stop failure: alpha keeps running"
+    assert dict(mgr.vram.active_sizes) == {"alpha": 300}, (
+        f"only the running model may hold a slot: {dict(mgr.vram.active_sizes)}"
+    )
+    assert mgr.vram.active_counts.get("beta", 0) == 0, "no phantom target slot"
+    assert mgr._vram_released_held is None

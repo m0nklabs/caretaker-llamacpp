@@ -623,8 +623,15 @@ class Caretaker:
         # previous_size_mb) once ``VramScheduler.update_size`` replaced the
         # held slot's size. The except-path reverts it to the previous size
         # while the OLD backend is still running (failure before the stop);
-        # cleared in the switch's finally.
+        # cleared in the switch's finally AND at the teardown boundary.
         self._vram_size_update: tuple[str, int] | None = None
+        # In-flight released slot of a swap: (model_name, held_size_mb) once
+        # the running model's reservation was released to make room for the
+        # target. The except-path re-books this EXACT size while the old
+        # backend still runs (failure before the stop) — recomputing it from
+        # the hot-reloaded config could no longer fit and would leave the live
+        # model unreserved. Cleared with ``_vram_size_update`` (same window).
+        self._vram_released_held: tuple[str, int] | None = None
 
     # ------------------------------------------------------ config hot-reload
     def _stat_config_sig(self) -> tuple[int, int] | None:
@@ -1536,7 +1543,16 @@ class Caretaker:
             held_model = self.current_model if self.vram is not None else None
             if self.vram is not None:
                 if held_model is not None and held_model != model_name:
+                    # Capture the EXACT reservation before releasing it: the
+                    # rollback must re-book this number, not a recomputation
+                    # from the (hot-reloadable) config — a grown ``size_mb``
+                    # need not fit the budget the running process was admitted
+                    # under, so a recomputed restore could fail and leave the
+                    # live model unreserved.
+                    held_size = self.vram.active_sizes.get(held_model)
                     await self.vram.release(held_model)
+                    if held_size is not None:
+                        self._vram_released_held = (held_model, held_size)
                 if held_model != model_name:
                     await self.vram.acquire(
                         model_name,
@@ -1584,6 +1600,17 @@ class Caretaker:
                     )
                 else:
                     await self._save_context(f"auto_save_{self.current_model}")
+
+            # Teardown boundary — the pre-stop rollback window ends HERE. Both
+            # rollback tokens describe the OLD backend's footprint, which only
+            # exists until this stop: a same-name re-size revert or a released
+            # swap slot restored after the stop would overwrite the booking of
+            # the process that comes up instead (understating ``active_sizes``
+            # for whatever runs next), and a post-start failure sets
+            # ``current_model`` again, so the except-path guard can no longer
+            # tell an old backend from the new one.
+            self._vram_size_update = None
+            self._vram_released_held = None
 
             # 2. Stop llama-server. The old model is no longer running: clear the
             #    active-model bookkeeping NOW, so a later exception (args write,
@@ -1694,6 +1721,8 @@ class Caretaker:
                 # guarded: its own failure must never mask the original one.
                 pending_size_update = self._vram_size_update
                 self._vram_size_update = None
+                released_held = self._vram_released_held
+                self._vram_released_held = None
                 if pending_size_update is not None and self.current_model is not None:
                     update_model, update_old_size = pending_size_update
                     try:
@@ -1706,7 +1735,30 @@ class Caretaker:
                             update_old_size,
                         )
                 if self.current_model is not None:
-                    if self.vram.active_counts.get(self.current_model, 0) == 0:
+                    if released_held is not None:
+                        # Nothing of the failed swap target survives: it never
+                        # started, so a slot its acquire already booked must be
+                        # freed — otherwise it is a phantom that, together with
+                        # the restored footprint, blocks every later acquire on
+                        # space no release can free.
+                        if self.vram.active_counts.get(model_name, 0) > 0:
+                            await self.vram.release(model_name)
+                        # The swap released the running model's slot to make
+                        # room for the target. This failure is pre-stop (a
+                        # post-stop failure has already retired the token), so
+                        # the old backend still runs and gets the EXACT
+                        # reservation it held back — non-blocking, because a
+                        # running backend's footprint is reality even when the
+                        # reloaded config no longer fits the budget.
+                        await self.vram.restore_held(*released_held)
+                        logger.info(
+                            "VRAM slot for '%s' restored (%dMB) after the failed "
+                            "switch to '%s'",
+                            released_held[0],
+                            released_held[1],
+                            model_name,
+                        )
+                    elif self.vram.active_counts.get(self.current_model, 0) == 0:
                         await self.vram.acquire(
                             self.current_model,
                             get_model_size_mb(
@@ -1731,6 +1783,7 @@ class Caretaker:
         finally:
             self._switch_in_progress = False
             self._vram_size_update = None
+            self._vram_released_held = None
 
         # Only reached on the successful (re)load path: the backend was freshly
         # started, so in-memory session state is gone and the gateway may
