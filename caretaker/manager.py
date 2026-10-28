@@ -418,14 +418,25 @@ def _parse_server_url(url: str = "") -> tuple[str, int | None]:
     return host, parsed.port
 
 
-def _yaml_vram_limit_mb(config_path: str | None) -> int | None:
-    """Read an optional ``vram_limit_mb`` from the models YAML root.
+def _read_optional_int_knob(
+    config_path: str | None,
+    key: str,
+    *,
+    reader: str,
+) -> int | None:
+    """Read one optional integer knob from the caretaker models YAML root.
 
-    A caretaker may declare its VRAM budget at the top of its own
-    ``models.local.settings.yaml`` (the same document that holds ``models``).
-    ``None`` (no field / unreadable / non-numeric) means "not configured" →
-    the caretaker enforces no VRAM slot. Best-effort: a parse error never
-    blocks construction.
+    This is the single reader for the numeric knobs in that file. Before it,
+    each knob had its own copy of this logic and they drifted: ``health_polls``
+    learned to survive non-finite floats while ``vram_limit_mb`` did not, so
+    ``vram_limit_mb: .inf`` aborted the daemon at boot with ``OverflowError``
+    from ``int()`` (issue #17) — the reader runs in ``__init__``, so a bad knob
+    took the whole unit down instead of being ignored.
+
+    Contract, identical for every knob that uses it: absent, unreadable,
+    non-integer and non-finite → ``None`` with exactly one warning, which means
+    "not configured" and leaves the built-in default in force. A parse error
+    never blocks construction or a hot-reload status call.
     """
     import yaml as _yaml
 
@@ -435,17 +446,31 @@ def _yaml_vram_limit_mb(config_path: str | None) -> int | None:
             data = _yaml.safe_load(fh) or {}
         if not isinstance(data, dict):
             return None
-        raw = data.get("vram_limit_mb")
+        raw = data.get(key)
     except Exception:  # noqa: BLE001 - best-effort config read
         return None
     if raw is None:
         return None
     try:
-        val = int(raw)
-    except (TypeError, ValueError):
-        logger.warning("Ignoring non-integer vram_limit_mb=%r in %s", raw, path)
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a non-finite float (``.inf``/``-.inf``/``.nan``) is not
+        # an integer knob value either. This is the one branch that must never
+        # be narrowed per knob — see the docstring and issue #17.
+        logger.warning("Ignoring invalid %s=%r in %s (%s)", key, raw, path, reader)
         return None
-    return val
+
+
+def _yaml_vram_limit_mb(config_path: str | None) -> int | None:
+    """Read an optional ``vram_limit_mb`` from the models YAML root.
+
+    A caretaker may declare its VRAM budget at the top of its own
+    ``models.local.settings.yaml`` (the same document that holds ``models``).
+    ``None`` (no field / unreadable / non-numeric / non-finite) means "not
+    configured" → the caretaker enforces no VRAM slot. Best-effort: a parse
+    error never blocks construction.
+    """
+    return _read_optional_int_knob(config_path, "vram_limit_mb", reader="vram limit")
 
 
 def _read_health_polls(config_path: str | None) -> int | None:
@@ -454,34 +479,13 @@ def _read_health_polls(config_path: str | None) -> int | None:
     Large GGUFs (e.g. the 125B Flash-Next MoE) can take 200-300 s to reach
     ``/health``, which exceeds the built-in default and makes ``/ensure``
     abort (and stop the unit) before the load ever finishes. This knob lets a
-    host config raise the ensure health-wait without code changes. Mirrors the
-    best-effort contract of ``_read_vram_limit``: absent/unreadable/non-integer
-    → ``None`` (the built-in default stays in force). Non-finite YAML floats
-    (``.inf``/``-.inf``) raise ``OverflowError`` from ``int()`` and take the
-    same ignore path — callers run this on the live daemon (boot AND after a
-    hot-reload), so a bad knob must never break a status/switch/unload call.
+    host config raise the ensure health-wait without code changes. Same
+    best-effort contract as ``_yaml_vram_limit_mb``: absent/unreadable/
+    non-integer/non-finite → ``None`` (the built-in default stays in force).
+    Callers run this on the live daemon (boot AND after a hot-reload), so a bad
+    knob must never break a status/switch/unload call.
     """
-    import yaml as _yaml
-
-    try:
-        path = Path(config_path) if config_path else config_mod.models_file_path()
-        with path.open(encoding="utf-8") as fh:
-            data = _yaml.safe_load(fh) or {}
-        if not isinstance(data, dict):
-            return None
-        raw = data.get("health_polls")
-    except Exception:  # noqa: BLE001 - best-effort config read
-        return None
-    if raw is None:
-        return None
-    try:
-        val = int(raw)
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError: a non-finite float (``.inf``/``-.inf``) is not an
-        # integer poll count either — ignore it like any other invalid value.
-        logger.warning("Ignoring invalid health_polls=%r in %s", raw, path)
-        return None
-    return val
+    return _read_optional_int_knob(config_path, "health_polls", reader="ensure health wait")
 
 
 def _config_validation_errors(loaded: config_mod.ModelsConfig) -> list[str]:
