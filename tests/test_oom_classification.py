@@ -71,10 +71,16 @@ def test_crash_record_serialization_is_additive():
         "exit_code": 137,
         "config_snapshot": {"context": 4096},
     }
-    assert CrashRecord(**original).to_dict() == {**original, "oom": False, "oom_source": None}
-    assert CrashRecord(**original, oom=True, oom_source="cuda").to_dict() == {
-        **original, "oom": True, "oom_source": "cuda",
+    # Additive: every original key keeps its value, and the crash record grows
+    # fields over time (``oom``/``oom_source``, then ``signal`` for the
+    # backend-death contract) without changing the ones already there.
+    assert CrashRecord(**original).to_dict() == {
+        **original, "oom": False, "oom_source": None, "signal": None,
     }
+    assert CrashRecord(**original, oom=True, oom_source="cuda").to_dict() == {
+        **original, "oom": True, "oom_source": "cuda", "signal": None,
+    }
+    assert CrashRecord(**original, signal="SIGKILL").to_dict()["signal"] == "SIGKILL"
 
 
 def test_ensure_503_passes_classified_crash_details(

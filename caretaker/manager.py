@@ -101,6 +101,23 @@ def classify_oom(error_text: str) -> tuple[bool, str | None]:
 _SIGNAL_EXIT_BASE = 128
 
 
+async def _service_signal(process: object) -> str | None:
+    """Ask a backend for the signal that killed it, tolerating duck-typed fakes.
+
+    ``ServerProcess`` defines ``service_signal``, but tests and injected doubles
+    implement only the surface they need (the same reason ``server.py`` guards
+    ``start_watchdog`` with ``hasattr``). A backend that cannot answer is
+    "unknown", never an error on the crash path.
+    """
+    getter = getattr(process, "service_signal", None)
+    if getter is None:
+        return None
+    try:
+        return await getter()
+    except Exception:  # noqa: BLE001 - introspection must never mask a crash
+        return None
+
+
 def death_cause(crash: CrashRecord) -> tuple[str, int | None, str | None]:
     """Return ``(cause, exit_code, signal_name)`` for the backend-death contract.
 
@@ -1319,7 +1336,7 @@ class Caretaker:
             config_snapshot=config_snap,
             oom=oom,
             oom_source=oom_source,
-            signal=await self.server_process.service_signal(),
+            signal=await _service_signal(self.server_process),
         )
 
         self.last_crash = crash
