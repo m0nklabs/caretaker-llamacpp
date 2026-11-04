@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -92,6 +93,42 @@ def classify_oom(error_text: str) -> tuple[bool, str | None]:
         return True, "cuda" if "cuda" in text else "kernel"
     return False, None
 
+
+
+# Exit codes 128+N mean "terminated by signal N" (POSIX shell convention, which
+# systemd also reports). Used to turn a bare exit status into a signal name so
+# Guardian's ``last_death.cause`` can distinguish ``signal`` from ``exit_code``.
+_SIGNAL_EXIT_BASE = 128
+
+
+def death_cause(crash: "CrashRecord") -> tuple[str, int | None, str | None]:
+    """Return ``(cause, exit_code, signal_name)`` for the backend-death contract.
+
+    ``oom`` wins when the crash text matched a memory failure; otherwise a
+    ``128+N`` exit code is reported as ``signal`` with its name; everything else
+    — including an unknown exit status — is ``exit_code``, which is honest about
+    "it stopped on its own and we do not know why".
+
+    The cause vocabulary is Guardian's (``docs/API_REFERENCE.md``): ``oom``,
+    ``signal``, ``exit_code``. A newer cause is carried verbatim on the wire by
+    the consumer, so adding one here is a compatible change.
+    """
+    if crash.oom:
+        return "oom", crash.exit_code, None
+    code = crash.exit_code
+    if isinstance(code, int) and not isinstance(code, bool) and code > _SIGNAL_EXIT_BASE:
+        name = _signal_name(code - _SIGNAL_EXIT_BASE)
+        if name is not None:
+            return "signal", code, name
+    return "exit_code", code, None
+
+
+def _signal_name(number: int) -> str | None:
+    """Return ``SIGKILL``-style name for a signal number, or ``None`` if unknown."""
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return None
 
 @dataclass
 class CrashRecord:
@@ -596,6 +633,10 @@ class Caretaker:
         self._loaded_at: float | None = None
         self.crash_history: list[CrashRecord] = []
         self.last_crash: CrashRecord | None = None
+        #: Last *unattended* backend death, in the wire shape of Guardian's
+        #: ``last_death`` contract. ``None`` = nothing to report (the key is
+        #: still present on the wire: absent means "predates the contract").
+        self.last_death: dict[str, Any] | None = None
 
         # Watchdog bookkeeping (Phase C). The watchdog is not started here; the
         # operator starts it via ``start_watchdog()`` (F5-deploy wiring).
@@ -1921,6 +1962,11 @@ class Caretaker:
                 "needs_reload": True,
                 "loaded_at": None,
                 "idle_since": None,
+                # A deliberate unload is not a death: ``last_death`` keeps
+                # reporting the last real one (or None), and ``backend_alive``
+                # is False because nothing is deliberately running.
+                "last_death": self.last_death,
+                "backend_alive": False,
             }
         needs_reload = True
         if self.current_model is not None:
@@ -1954,7 +2000,54 @@ class Caretaker:
             # mode would hide a config change that adds/removes mmproj and the
             # gateway would never issue the needed /ensure reload.
             "needs_reload": needs_reload,
+            # Backend-death contract (Guardian docs/API_REFERENCE.md):
+            # ``last_death`` is present and may be ``None`` — omitting the key
+            # means "this daemon predates the contract", a different statement.
+            # ``backend_alive`` is the daemon's own view: a model is loaded and
+            # not deliberately unloaded. A watchdog-detected death clears
+            # ``current_model``, so this flips to False when the daemon *knows*
+            # the backend is gone, not when a probe happens to fail.
+            "last_death": self.last_death,
+            "backend_alive": not self.is_unloaded and self.current_model is not None,
         }
+
+    def _publish_last_death(self, crash: CrashRecord) -> None:
+        """Publish an **unattended** backend death for ``GET /status``.
+
+        Only the watchdog path calls this: a death observed while nobody asked
+        the daemon to load anything is the invisible case Guardian's contract
+        exists for. A death **during** an ``/ensure`` the daemon served is
+        reported to that caller as ``model_load_failed`` + ``crash_details``
+        and deliberately does *not* move ``last_death`` — otherwise a failed
+        load would masquerade as a crash that happened to an idle backend.
+
+        ``unload()`` never calls this either: a deliberate stop is not a death.
+
+        ``event_id`` is a fresh uuid4 per death so Guardian can dedupe exactly
+        (without it, two byte-identical deaths can collapse into one record).
+        """
+        cause, exit_code, signal_name = death_cause(crash)
+        record: dict[str, Any] = {
+            "cause": cause,
+            "model": crash.model,
+            "timestamp": crash.timestamp,
+            "event_id": uuid.uuid4().hex,
+        }
+        if exit_code is not None:
+            record["exit_code"] = exit_code
+        if signal_name is not None:
+            record["signal"] = signal_name
+        detail = (crash.error_message or "").strip().splitlines()
+        if detail:
+            record["detail"] = detail[0][:200]
+        self.last_death = record
+        logger.warning(
+            "Unattended backend death published: cause=%s model=%s exit=%s signal=%s",
+            cause,
+            crash.model,
+            exit_code,
+            signal_name or "-",
+        )
 
     # ------------------------------------------------------------- watchdog
     def start_watchdog(
@@ -2036,7 +2129,10 @@ class Caretaker:
             self._switch_in_progress = True
             try:
                 logger.warning("Watchdog: backend unhealthy for '%s' — recording crash", model)
-                await self._detect_crash(model)
+                crash = await self._detect_crash(model)
+                # Unattended death: nobody asked for a load, so this is exactly
+                # the case Guardian cannot see without the contract.
+                self._publish_last_death(crash)
             finally:
                 self._switch_in_progress = False
             backoff = self._watchdog_backoff
