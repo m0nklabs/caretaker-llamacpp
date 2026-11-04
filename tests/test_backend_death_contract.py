@@ -271,3 +271,41 @@ async def test_an_unreadable_systemd_state_is_not_a_signal(
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _boom)
     assert await proc.service_signal() is None
+
+
+# ── the production call site (the coverage that makes the rest meaningful) ──
+
+
+@pytest.mark.asyncio
+async def test_the_watchdog_tick_publishes_the_death(tmp_path: Path) -> None:
+    """Drive the real ``_watchdog_tick``: the publication must come from there.
+
+    Every other test here calls ``_publish_last_death`` directly, so deleting
+    its only production call would leave them all green while unattended deaths
+    became invisible again — the exact failure this PR exists to fix. This test
+    fails if the watchdog stops publishing.
+    """
+    mgr = _make_manager(tmp_path)
+    mgr.current_model = "minimal"
+    mgr.is_unloaded = False
+
+    mgr.server_process.health_ok = AsyncMock(return_value=False)  # backend is gone
+    mgr.server_process.crash_error = AsyncMock(return_value="killed by signal")
+    mgr.server_process.service_exit_code = AsyncMock(return_value=9)
+    mgr.server_process.service_signal = AsyncMock(return_value="SIGKILL")
+    mgr.server_process.stop = AsyncMock(return_value=None)
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    # Stop the tick before the restart leg: the death is published when the
+    # crash is detected, which is what this test is about.
+    mgr._switch_model_locked = _noop
+
+    await mgr._watchdog_tick()
+
+    health = mgr.health()
+    assert health["last_death"] is not None, "the watchdog must publish unattended deaths"
+    assert health["last_death"]["cause"] == "signal"
+    assert health["last_death"]["signal"] == "SIGKILL"
+    assert health["last_death"]["model"] == "minimal"
