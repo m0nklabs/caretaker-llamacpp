@@ -25,7 +25,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
-
 from caretaker.manager import Caretaker, CrashRecord, death_cause
 
 
@@ -44,14 +43,14 @@ def _make_manager(tmp_path: Path) -> Caretaker:
 
 
 def _crash(**kwargs) -> CrashRecord:
-    base = dict(
-        timestamp="2026-11-04T04:00:00+00:00",
-        model="minimal",
-        error_message="backend died",
-        exit_code=None,
+    """A crash record with the boring fields filled in; ``kwargs`` override."""
+    return CrashRecord(
+        timestamp=kwargs.pop("timestamp", "2026-11-04T04:00:00+00:00"),
+        model=kwargs.pop("model", "minimal"),
+        error_message=kwargs.pop("error_message", "backend died"),
+        exit_code=kwargs.pop("exit_code", None),
+        **kwargs,
     )
-    base.update(kwargs)
-    return CrashRecord(**base)
 
 
 # ── the cause derivation ────────────────────────────────────────────────
@@ -150,6 +149,7 @@ async def test_a_death_during_a_served_ensure_does_not_move_last_death(
     mgr = _make_manager(tmp_path)
     mgr.server_process.crash_error = AsyncMock(return_value="model_load_failed")
     mgr.server_process.service_exit_code = AsyncMock(return_value=1)
+    mgr.server_process.service_signal = AsyncMock(return_value=None)
     mgr.server_process.stop = AsyncMock(return_value=None)
 
     crash = await mgr._detect_crash("minimal")
@@ -178,9 +178,8 @@ def test_an_unload_keeps_the_last_death_and_reports_not_alive(tmp_path: Path) ->
 
 def test_status_route_exposes_the_contract(tmp_path: Path) -> None:
     """``GET /status`` is what Guardian polls; the fields must survive the route."""
-    from fastapi.testclient import TestClient
-
     from caretaker import server
+    from fastapi.testclient import TestClient
 
     mgr = _make_manager(tmp_path)
     mgr._publish_last_death(_crash(oom=True, exit_code=1, error_message="CUDA out of memory"))
@@ -202,3 +201,73 @@ def _test_key() -> str:
 
     os.environ.setdefault("CARETAKER_KEY", "test-key")
     return os.environ["CARETAKER_KEY"]
+
+
+# ── the systemd path (the one production actually uses) ─────────────────
+
+
+def test_a_backend_reported_signal_wins_over_the_status_heuristic() -> None:
+    """systemd puts the signal *number* in ``ExecMainStatus``: 9, not 137.
+
+    Without the backend's own signal report, a SIGKILL would be published as
+    ``cause: exit_code`` with ``exit_code: 9`` — an ordinary-looking non-zero
+    exit, which is exactly the misreading this contract exists to prevent.
+    """
+    cause, exit_code, signal_name = death_cause(_crash(exit_code=9, signal="SIGKILL"))
+    assert (cause, exit_code, signal_name) == ("signal", 9, "SIGKILL")
+
+
+@pytest.mark.asyncio
+async def test_systemd_signal_death_is_read_from_exec_main_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ExecMainCode`` distinguishes a signal death from an ordinary exit."""
+    from caretaker.manager import SystemdServerProcess
+
+    proc = SystemdServerProcess(service="llama-server")
+
+    async def _show(*args, **kwargs):
+        class _P:
+            async def communicate(self):
+                return (b"ExecMainCode=2\nExecMainStatus=9\n", b"")
+
+        return _P()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _show)
+    assert await proc.service_signal() == "SIGKILL"
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_exit_is_not_reported_as_a_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ExecMainCode=1`` is a normal exit, whatever the status number is."""
+    from caretaker.manager import SystemdServerProcess
+
+    proc = SystemdServerProcess(service="llama-server")
+
+    async def _show(*args, **kwargs):
+        class _P:
+            async def communicate(self):
+                return (b"ExecMainCode=1\nExecMainStatus=9\n", b"")
+
+        return _P()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _show)
+    assert await proc.service_signal() is None
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_systemd_state_is_not_a_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Introspection failure must degrade to "unknown", never to a guess."""
+    from caretaker.manager import SystemdServerProcess
+
+    proc = SystemdServerProcess(service="llama-server")
+
+    async def _boom(*args, **kwargs):
+        raise OSError("systemctl missing")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _boom)
+    assert await proc.service_signal() is None

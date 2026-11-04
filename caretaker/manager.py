@@ -101,7 +101,7 @@ def classify_oom(error_text: str) -> tuple[bool, str | None]:
 _SIGNAL_EXIT_BASE = 128
 
 
-def death_cause(crash: "CrashRecord") -> tuple[str, int | None, str | None]:
+def death_cause(crash: CrashRecord) -> tuple[str, int | None, str | None]:
     """Return ``(cause, exit_code, signal_name)`` for the backend-death contract.
 
     ``oom`` wins when the crash text matched a memory failure; otherwise a
@@ -115,6 +115,11 @@ def death_cause(crash: "CrashRecord") -> tuple[str, int | None, str | None]:
     """
     if crash.oom:
         return "oom", crash.exit_code, None
+    if crash.signal:
+        # The backend told us it was a signal death. systemd reports the signal
+        # *number* in ExecMainStatus (9 for SIGKILL), so the status alone would
+        # read as an ordinary exit code — this is the authoritative source.
+        return "signal", crash.exit_code, crash.signal
     code = crash.exit_code
     if isinstance(code, int) and not isinstance(code, bool) and code > _SIGNAL_EXIT_BASE:
         name = _signal_name(code - _SIGNAL_EXIT_BASE)
@@ -141,6 +146,11 @@ class CrashRecord:
     config_snapshot: dict | None = None
     oom: bool = False
     oom_source: str | None = None
+    #: Signal name when the backend was killed by one (``SIGKILL`` &c). A
+    #: backend that reports a signal death as a plain status (systemd's
+    #: ``ExecMainStatus`` holds the signal *number*) must supply this, or the
+    #: death is indistinguishable from an ordinary non-zero exit.
+    signal: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -151,6 +161,7 @@ class CrashRecord:
             "config_snapshot": self.config_snapshot,
             "oom": self.oom,
             "oom_source": self.oom_source,
+            "signal": self.signal,
         }
 
 
@@ -231,6 +242,16 @@ class ServerProcess(ABC):
 
     async def service_exit_code(self) -> int | None:
         """Return the last run's exit code, if known."""
+        return None
+
+    async def service_signal(self) -> str | None:
+        """Return the signal that killed the last run, if it was killed by one.
+
+        ``None`` means "not a signal death, or not knowable from this backend".
+        A backend that reports a signal death as a plain exit status (systemd
+        puts the *signal number* in ``ExecMainStatus``) must override this, or
+        the death is indistinguishable from an ordinary non-zero exit.
+        """
         return None
 
 
@@ -328,6 +349,38 @@ class SystemdServerProcess(ServerProcess):
             return int(val)
         except Exception:  # noqa: BLE001
             return None
+
+    async def service_signal(self) -> str | None:
+        """Return the signal name when systemd reports a signal death.
+
+        ``ExecMainStatus`` holds the **signal number** for a signal death (9 for
+        SIGKILL), not the shell-encoded 128+N — so a bare status cannot be told
+        apart from an ordinary exit code. ``ExecMainCode`` is what distinguishes
+        them: 1 = exited, 2 = killed by a signal, 3 = killed and dumped core.
+        Only 2 and 3 are signal deaths.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "show", self.service,
+                "-p", "ExecMainCode", "-p", "ExecMainStatus",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+        except Exception:  # noqa: BLE001 - introspection must never raise
+            return None
+        fields: dict[str, str] = {}
+        for line in stdout.decode(errors="replace").splitlines():
+            key, _, value = line.partition("=")
+            fields[key.strip()] = value.strip()
+        try:
+            code = int(fields.get("ExecMainCode", ""))
+            status = int(fields.get("ExecMainStatus", ""))
+        except ValueError:
+            return None
+        if code not in (2, 3):
+            return None
+        return _signal_name(status)
 
     @staticmethod
     def _extract_crash_error_from_lines(lines: list[str]) -> str:
@@ -1266,6 +1319,7 @@ class Caretaker:
             config_snapshot=config_snap,
             oom=oom,
             oom_source=oom_source,
+            signal=await self.server_process.service_signal(),
         )
 
         self.last_crash = crash
