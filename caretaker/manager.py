@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -93,6 +94,76 @@ def classify_oom(error_text: str) -> tuple[bool, str | None]:
     return False, None
 
 
+
+# Exit codes 128+N mean "terminated by signal N" (POSIX shell convention, which
+# systemd also reports). Used to turn a bare exit status into a signal name so
+# Guardian's ``last_death.cause`` can distinguish ``signal`` from ``exit_code``.
+_SIGNAL_EXIT_BASE = 128
+
+
+async def _service_signal(process: object) -> str | None:
+    """Ask a backend for the signal that killed it, tolerating duck-typed fakes.
+
+    ``ServerProcess`` defines ``service_signal``, but tests and injected doubles
+    implement only the surface they need (the same reason ``server.py`` guards
+    ``start_watchdog`` with ``hasattr``). A backend that cannot answer is
+    "unknown", never an error on the crash path.
+    """
+    getter = getattr(process, "service_signal", None)
+    if getter is None:
+        return None
+    try:
+        return await getter()
+    except Exception:  # noqa: BLE001 - introspection must never mask a crash
+        return None
+
+
+def death_cause(crash: CrashRecord) -> tuple[str, int | None, str | None]:
+    """Return ``(cause, exit_code, signal_name)`` for the backend-death contract.
+
+    ``oom`` wins when the crash text matched a memory failure; otherwise a
+    ``128+N`` exit code is reported as ``signal`` with its name; everything else
+    — including an unknown exit status — is ``exit_code``, which is honest about
+    "it stopped on its own and we do not know why".
+
+    The cause vocabulary is Guardian's (``docs/API_REFERENCE.md``): ``oom``,
+    ``signal``, ``exit_code``. A newer cause is carried verbatim on the wire by
+    the consumer, so adding one here is a compatible change.
+    """
+    if crash.oom:
+        return "oom", crash.exit_code, None
+    if crash.signal:
+        # The backend told us it was a signal death. systemd reports the signal
+        # *number* in ExecMainStatus (9 for SIGKILL), so the status alone would
+        # read as an ordinary exit code — this is the authoritative source.
+        return "signal", crash.exit_code, crash.signal
+    code = crash.exit_code
+    if isinstance(code, int) and not isinstance(code, bool) and code > _SIGNAL_EXIT_BASE:
+        name = _signal_name(code - _SIGNAL_EXIT_BASE)
+        if name is not None:
+            return "signal", code, name
+    return "exit_code", code, None
+
+
+def _signal_name(number: int) -> str | None:
+    """Return ``SIGKILL``-style name for a signal number, or ``None`` if unknown.
+
+    Realtime signals (``SIGRTMIN``..``SIGRTMAX``) are **not** members of
+    :class:`signal.Signals` on Linux, so the enum lookup raises ``ValueError``
+    for them. They are still real signal deaths — a backend killed with
+    ``SIGRTMIN+1`` must not be published as an ordinary exit code — so the
+    range is named explicitly.
+    """
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        pass
+    rtmin = getattr(signal, "SIGRTMIN", None)
+    rtmax = getattr(signal, "SIGRTMAX", None)
+    if rtmin is not None and rtmax is not None and rtmin <= number <= rtmax:
+        return f"SIGRTMIN+{number - rtmin}"
+    return None
+
 @dataclass
 class CrashRecord:
     """Record of a llama-server crash event."""
@@ -104,6 +175,11 @@ class CrashRecord:
     config_snapshot: dict | None = None
     oom: bool = False
     oom_source: str | None = None
+    #: Signal name when the backend was killed by one (``SIGKILL`` &c). A
+    #: backend that reports a signal death as a plain status (systemd's
+    #: ``ExecMainStatus`` holds the signal *number*) must supply this, or the
+    #: death is indistinguishable from an ordinary non-zero exit.
+    signal: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -114,6 +190,7 @@ class CrashRecord:
             "config_snapshot": self.config_snapshot,
             "oom": self.oom,
             "oom_source": self.oom_source,
+            "signal": self.signal,
         }
 
 
@@ -194,6 +271,16 @@ class ServerProcess(ABC):
 
     async def service_exit_code(self) -> int | None:
         """Return the last run's exit code, if known."""
+        return None
+
+    async def service_signal(self) -> str | None:
+        """Return the signal that killed the last run, if it was killed by one.
+
+        ``None`` means "not a signal death, or not knowable from this backend".
+        A backend that reports a signal death as a plain exit status (systemd
+        puts the *signal number* in ``ExecMainStatus``) must override this, or
+        the death is indistinguishable from an ordinary non-zero exit.
+        """
         return None
 
 
@@ -291,6 +378,38 @@ class SystemdServerProcess(ServerProcess):
             return int(val)
         except Exception:  # noqa: BLE001
             return None
+
+    async def service_signal(self) -> str | None:
+        """Return the signal name when systemd reports a signal death.
+
+        ``ExecMainStatus`` holds the **signal number** for a signal death (9 for
+        SIGKILL), not the shell-encoded 128+N — so a bare status cannot be told
+        apart from an ordinary exit code. ``ExecMainCode`` is what distinguishes
+        them: 1 = exited, 2 = killed by a signal, 3 = killed and dumped core.
+        Only 2 and 3 are signal deaths.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "show", self.service,
+                "-p", "ExecMainCode", "-p", "ExecMainStatus",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+        except Exception:  # noqa: BLE001 - introspection must never raise
+            return None
+        fields: dict[str, str] = {}
+        for line in stdout.decode(errors="replace").splitlines():
+            key, _, value = line.partition("=")
+            fields[key.strip()] = value.strip()
+        try:
+            code = int(fields.get("ExecMainCode", ""))
+            status = int(fields.get("ExecMainStatus", ""))
+        except ValueError:
+            return None
+        if code not in (2, 3):
+            return None
+        return _signal_name(status)
 
     @staticmethod
     def _extract_crash_error_from_lines(lines: list[str]) -> str:
@@ -596,6 +715,10 @@ class Caretaker:
         self._loaded_at: float | None = None
         self.crash_history: list[CrashRecord] = []
         self.last_crash: CrashRecord | None = None
+        #: Last *unattended* backend death, in the wire shape of Guardian's
+        #: ``last_death`` contract. ``None`` = nothing to report (the key is
+        #: still present on the wire: absent means "predates the contract").
+        self.last_death: dict[str, Any] | None = None
 
         # Watchdog bookkeeping (Phase C). The watchdog is not started here; the
         # operator starts it via ``start_watchdog()`` (F5-deploy wiring).
@@ -1225,6 +1348,7 @@ class Caretaker:
             config_snapshot=config_snap,
             oom=oom,
             oom_source=oom_source,
+            signal=await _service_signal(self.server_process),
         )
 
         self.last_crash = crash
@@ -1921,6 +2045,11 @@ class Caretaker:
                 "needs_reload": True,
                 "loaded_at": None,
                 "idle_since": None,
+                # A deliberate unload is not a death: ``last_death`` keeps
+                # reporting the last real one (or None), and ``backend_alive``
+                # is False because nothing is deliberately running.
+                "last_death": self.last_death,
+                "backend_alive": False,
             }
         needs_reload = True
         if self.current_model is not None:
@@ -1954,7 +2083,54 @@ class Caretaker:
             # mode would hide a config change that adds/removes mmproj and the
             # gateway would never issue the needed /ensure reload.
             "needs_reload": needs_reload,
+            # Backend-death contract (Guardian docs/API_REFERENCE.md):
+            # ``last_death`` is present and may be ``None`` — omitting the key
+            # means "this daemon predates the contract", a different statement.
+            # ``backend_alive`` is the daemon's own view: a model is loaded and
+            # not deliberately unloaded. A watchdog-detected death clears
+            # ``current_model``, so this flips to False when the daemon *knows*
+            # the backend is gone, not when a probe happens to fail.
+            "last_death": self.last_death,
+            "backend_alive": not self.is_unloaded and self.current_model is not None,
         }
+
+    def _publish_last_death(self, crash: CrashRecord) -> None:
+        """Publish an **unattended** backend death for ``GET /status``.
+
+        Only the watchdog path calls this: a death observed while nobody asked
+        the daemon to load anything is the invisible case Guardian's contract
+        exists for. A death **during** an ``/ensure`` the daemon served is
+        reported to that caller as ``model_load_failed`` + ``crash_details``
+        and deliberately does *not* move ``last_death`` — otherwise a failed
+        load would masquerade as a crash that happened to an idle backend.
+
+        ``unload()`` never calls this either: a deliberate stop is not a death.
+
+        ``event_id`` is a fresh uuid4 per death so Guardian can dedupe exactly
+        (without it, two byte-identical deaths can collapse into one record).
+        """
+        cause, exit_code, signal_name = death_cause(crash)
+        record: dict[str, Any] = {
+            "cause": cause,
+            "model": crash.model,
+            "timestamp": crash.timestamp,
+            "event_id": uuid.uuid4().hex,
+        }
+        if exit_code is not None:
+            record["exit_code"] = exit_code
+        if signal_name is not None:
+            record["signal"] = signal_name
+        detail = (crash.error_message or "").strip().splitlines()
+        if detail:
+            record["detail"] = detail[0][:200]
+        self.last_death = record
+        logger.warning(
+            "Unattended backend death published: cause=%s model=%s exit=%s signal=%s",
+            cause,
+            crash.model,
+            exit_code,
+            signal_name or "-",
+        )
 
     # ------------------------------------------------------------- watchdog
     def start_watchdog(
@@ -2036,7 +2212,10 @@ class Caretaker:
             self._switch_in_progress = True
             try:
                 logger.warning("Watchdog: backend unhealthy for '%s' — recording crash", model)
-                await self._detect_crash(model)
+                crash = await self._detect_crash(model)
+                # Unattended death: nobody asked for a load, so this is exactly
+                # the case Guardian cannot see without the contract.
+                self._publish_last_death(crash)
             finally:
                 self._switch_in_progress = False
             backoff = self._watchdog_backoff
