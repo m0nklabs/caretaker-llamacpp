@@ -146,11 +146,23 @@ def death_cause(crash: CrashRecord) -> tuple[str, int | None, str | None]:
 
 
 def _signal_name(number: int) -> str | None:
-    """Return ``SIGKILL``-style name for a signal number, or ``None`` if unknown."""
+    """Return ``SIGKILL``-style name for a signal number, or ``None`` if unknown.
+
+    Realtime signals (``SIGRTMIN``..``SIGRTMAX``) are **not** members of
+    :class:`signal.Signals` on Linux, so the enum lookup raises ``ValueError``
+    for them. They are still real signal deaths — a backend killed with
+    ``SIGRTMIN+1`` must not be published as an ordinary exit code — so the
+    range is named explicitly.
+    """
     try:
         return signal.Signals(number).name
     except ValueError:
-        return None
+        pass
+    rtmin = getattr(signal, "SIGRTMIN", None)
+    rtmax = getattr(signal, "SIGRTMAX", None)
+    if rtmin is not None and rtmax is not None and rtmin <= number <= rtmax:
+        return f"SIGRTMIN+{number - rtmin}"
+    return None
 
 @dataclass
 class CrashRecord:

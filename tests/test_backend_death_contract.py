@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
-from caretaker.manager import Caretaker, CrashRecord, death_cause
+from caretaker.manager import Caretaker, CrashRecord, _signal_name, death_cause
 
 
 def _make_manager(tmp_path: Path) -> Caretaker:
@@ -321,3 +321,35 @@ async def test_the_watchdog_tick_publishes_the_death(tmp_path: Path) -> None:
     assert health["last_death"]["cause"] == "signal"
     assert health["last_death"]["signal"] == "SIGKILL"
     assert health["last_death"]["model"] == "minimal"
+
+
+def test_a_realtime_signal_is_named_not_dropped() -> None:
+    """Realtime signals are not ``signal.Signals`` members on Linux.
+
+    ``signal.Signals(SIGRTMIN + 1)`` raises ``ValueError``, so an enum-only
+    lookup returns ``None`` and a realtime signal death would be published as
+    ``cause: exit_code`` — an ordinary-looking exit for a killed backend.
+    """
+    import signal as _signal
+
+    from caretaker.manager import _signal_name
+
+    rtmin = getattr(_signal, "SIGRTMIN", None)
+    if rtmin is None:  # pragma: no cover - non-Linux
+        pytest.skip("no realtime signals on this platform")
+    assert _signal_name(rtmin) == "SIGRTMIN"
+    assert _signal_name(rtmin + 1) == "SIGRTMIN+1"
+    assert _signal_name(_signal.SIGRTMAX) == "SIGRTMAX"
+
+
+def test_a_realtime_signal_death_is_published_as_a_signal() -> None:
+    """End to end: the cause must be ``signal``, not ``exit_code``."""
+    import signal as _signal
+
+    rtmin = getattr(_signal, "SIGRTMIN", None)
+    if rtmin is None:  # pragma: no cover - non-Linux
+        pytest.skip("no realtime signals on this platform")
+    cause, exit_code, signal_name = death_cause(
+        _crash(exit_code=rtmin + 1, signal=_signal_name(rtmin + 1))
+    )
+    assert (cause, exit_code, signal_name) == ("signal", rtmin + 1, "SIGRTMIN+1")
