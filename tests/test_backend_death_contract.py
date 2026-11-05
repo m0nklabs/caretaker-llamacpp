@@ -159,17 +159,29 @@ async def test_a_death_during_a_served_ensure_does_not_move_last_death(
     assert mgr.health()["last_death"] is None
 
 
-def test_an_unload_keeps_the_last_death_and_reports_not_alive(tmp_path: Path) -> None:
-    """A deliberate stop is not a death and must not erase the real one."""
+@pytest.mark.asyncio
+async def test_an_unload_keeps_the_last_death_and_reports_not_alive(
+    tmp_path: Path,
+) -> None:
+    """A deliberate stop is not a death and must not erase the real one.
+
+    This drives the **real** ``unload()`` rather than setting ``is_unloaded``:
+    a test that flips the flag by hand would still pass if ``unload()`` erased
+    ``last_death`` or published the deliberate stop as a death, which is the
+    exclusion this contract depends on.
+    """
     mgr = _make_manager(tmp_path)
+    mgr.current_model = "minimal"
+    mgr.server_process.stop = AsyncMock(return_value=None)
     mgr._publish_last_death(_crash(exit_code=137))
-    published = mgr.health()["last_death"]
+    published = dict(mgr.health()["last_death"])
 
-    mgr.is_unloaded = True
+    await mgr.unload()
+
     health = mgr.health()
-
     assert health["is_unloaded"] is True
     assert health["backend_alive"] is False
+    # Byte-identical: same event, not a re-published or cleared one.
     assert health["last_death"] == published
 
 
