@@ -8,10 +8,6 @@ on:
 
 permissions:
   contents: read
-  # codecov-action v6 can authenticate without a secret through GitHub OIDC.
-  # Without id-token: write it falls back to a token, and a tokenless public-repo
-  # upload is rejected with 'Token required' — while the job still goes green.
-  id-token: write
 
 jobs:
   checks:
@@ -43,13 +39,7 @@ jobs:
       - name: Compile
         run: '"$CHECK_VENV/bin/python" -m compileall -q caretaker tests'
       - name: Test
-        run: '"$CHECK_VENV/bin/python" -m pytest tests/ -q -p no:cacheprovider --cov=caretaker --cov-report=xml'
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
-        with:
-          files: ./coverage.xml
-          fail_ci_if_error: false
-          verbose: true
+        run: '"$CHECK_VENV/bin/python" -m pytest tests/ -q -p no:cacheprovider --cov=caretaker --cov-report=term-missing'
       - name: Remove run-local environment
         if: always()
         run: |
