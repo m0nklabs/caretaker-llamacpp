@@ -8,6 +8,10 @@ on:
 
 permissions:
   contents: read
+  # codecov-action v6 can authenticate without a secret through GitHub OIDC.
+  # Without id-token: write it falls back to a token, and a tokenless public-repo
+  # upload is rejected with 'Token required' — while the job still goes green.
+  id-token: write
 
 jobs:
   checks:
