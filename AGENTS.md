@@ -480,6 +480,7 @@ tests/
 .github/workflows/
   pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
   python-ci.yml     Isolated Python 3.12/3.14 checks using project-pinned development tools
+                    (+ pytest-cov → coverage.xml, tokenless Codecov upload, SHA-pinned action)
 ```
 
 ## Handoff
@@ -578,6 +579,31 @@ tests/
   MTP-acceptatie 0.55, turbo4-boot OK op de productie-binary. Feiten →
   Omgeving-sectie hierboven; guardian-zijde (registry-spec-executie) →
   handoff guardian-repo.
+- **2026-11-10 (Codecov-coverage bedraad):** branch `f-codecov-coverage`,
+  issue #22. Root `codecov.yml` maakt `codecov/project` + `codecov/patch`
+  **informational** (gemeten les uit m0nklabs/oelala: de default patch-status
+  is rood op een docs-only PR zonder dekkbare regels — #236 docs-only rood vs
+  #239 code groen; een check die om een correcte reden rood staat leert mensen
+  rode checks negeren) en `ignore`t `docs/**`, `tests/**`, `scripts/**`.
+  `pytest-cov==7.1.0` in de `dev`-extra (exacte pin, zelfde stijl als
+  `pytest==9.1.1`/`ruff==0.16.5`); de Test-stap in `python-ci.yml` houdt zijn
+  bestaande args (`tests/ -q -p no:cacheprovider`) en krijgt er alléén
+  `--cov=caretaker --cov-report=xml` bij; upload-stap
+  `codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f` — die SHA
+  **is** de commit waar tag `v6` (en `v6.0.2`; upstream wijst `v7.0.0` naar
+  dezelfde tree) naar wijst, dus de pin is immutabel en het comment `# v6`
+  klopt — met `files: ./coverage.xml`, `fail_ci_if_error: false`,
+  `verbose: true`. Tokenloos: publiek repo, Codecov-GitHub-App is org-wide,
+  nergens een `CODECOV_TOKEN`.
+  **Geen extra `ignore`-entries:** `--cov=caretaker` meet alleen de vlakke
+  `caretaker/`-package, dus docs/tests/scripts (en de gitignorde
+  `caretaker.egg-info/`) staan niet in het rapport; meer paden negeren zou
+  speculatie zijn. `.gitignore` kreeg `.coverage` + `coverage.xml` (lokaal
+  gegenereerde artefacten).
+  **Lokaal (3.12 clean venv, exacte CI-commando):** **335 passed, 1 skipped**,
+  ruff clean, `pip check` clean, `coverage.xml` geschreven met 11 files /
+  1655 van 2029 lijnen (81,6% line-rate). **CI-bewijs** (upload-log +
+  codecov-commitstatus) volgt op de PR; tot dan is dit blok lokaal bewijs.
 
 ## References
 

@@ -6,6 +6,8 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.coverage
+coverage.xml
 
 # data / secrets — never commit
 .env

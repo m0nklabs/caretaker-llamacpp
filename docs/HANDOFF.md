@@ -3,6 +3,14 @@
 > Cold file (niet in de prompt-cache): actuele status + sessie-overdracht. Nieuwe blokken **bovenaan** appen.
 > Werkwijze → `~/.dsh/AGENTS.md` ("AGENTS.md maintenance discipline") + repo `AGENTS.md`.
 
+## 2026-11-10 — Codecov-coverage bedraad — DSH (deepseek-v4.1-flash-1017)
+
+- **Goal:** coverage zichtbaar maken in Codecov zonder een nieuwe faalmodus in CI te introduceren. Scope: alleen dit repo; branch `f-codecov-coverage`, issue #22.
+- **Waarom geen defaults:** Codecov's default patch-status faalt een PR zonder dekkbare regels (gemeten in `m0nklabs/oelala`: #236 docs-only = rood, #239 code = groen). Root `codecov.yml` zet daarom `project` én `patch` op `informational: true` en `ignore`t `docs/**`, `tests/**`, `scripts/**`; de reden staat als comment in het bestand.
+- **Changes:** (1) `codecov.yml` nieuw; (2) `pytest-cov==7.1.0` in de `dev`-extra van `pyproject.toml`; (3) `python-ci.yml` — Test-stap behoudt `tests/ -q -p no:cacheprovider` en krijgt `--cov=caretaker --cov-report=xml`, plus een upload-stap gepind op commit `fb8b3582c8e4def4969c97caa2f19720cb33a72f` (de commit waar tag `v6`/`v6.0.2` naar wijst; `v7.0.0` upstream wijst naar dezelfde tree) met `fail_ci_if_error: false` + `verbose: true`; (4) `.gitignore` — `.coverage` + `coverage.xml`.
+- **Geen extra `ignore`-paden:** `--cov=caretaker` meet alleen de vlakke package; het rapport bevat 11 files (81,6% line-rate), dus generated/vendored paden negeren zou speculatie zijn.
+- **Verificatie (lokaal, 3.12 clean venv, exacte CI-commando):** **335 passed, 1 skipped**, `ruff check caretaker tests` clean, `pip check` clean, `coverage.xml` geschreven. **CI-bewijs (upload-log + codecov-commitstatus) staat in de PR-beschrijving/-comments** — een groene job alleen is geen bewijs dat er iets geüpload is.
+
 ## 2026-10-03 (slot) — PR #12 gemerged + beide hosts gedeployed — DSH (glm-5.3)
 
 - **Merge:** PR #12 squash-merged naar `main` als **`71bce35`** na volledig groene review-loop: nieuwe geïsoleerde Python CI groen op GitHub (3.12 in 1m43s ÉN 3.14 — de 3.14-runner-beschikbaarheid is hiermee bewezen), alle 3 review-threads beantwoord+resolved (fixes `2535a7c`/`5d96314`/`5721550`), tier-1 PR-Piet op de nieuwe head: **`key_issues_to_review: []`**.
