@@ -39,7 +39,7 @@ jobs:
       - name: Compile
         run: '"$CHECK_VENV/bin/python" -m compileall -q caretaker tests'
       - name: Test
-        run: '"$CHECK_VENV/bin/python" -m pytest tests/ -q -p no:cacheprovider'
+        run: '"$CHECK_VENV/bin/python" -m pytest tests/ -q -p no:cacheprovider --cov=caretaker --cov-report=term-missing --cov-fail-under=80'
       - name: Remove run-local environment
         if: always()
         run: |
