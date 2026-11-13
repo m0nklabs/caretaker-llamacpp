@@ -400,6 +400,12 @@ ai-kvm-2 (Linux, GPU #1)              14700K (Windows, GPU #2)
   Ordinary tests must mock production I/O, not depend on live services or turn
   blocked connections into simulated outages. Test-owned loopback listeners need
   explicit scoped permission in the test I/O guard.
+- **Coverage policy:** keep `--cov=caretaker --cov-report=term-missing` with
+  `--cov-fail-under=80` in both Python CI matrix jobs. No Codecov upload,
+  external coverage status or XML report is required. Measure the `caretaker/`
+  package, not the whole checkout; percentages from another scope do not prove
+  the gate's margin. Current evidence and superseded upload notes are explained
+  in `docs/HANDOFF.md`.
 - **Backend credentials:** `CARETAKER_BACKEND_KEY` (env, read per call via
   `backend_headers()`) supplies a Bearer header to the backend-protected calls
   only (`GET /props`, slots save/restore context calls). The health probe stays
@@ -480,7 +486,7 @@ tests/
 .github/workflows/
   pr-piet.yml       Review-loop (org-reusable m0nklabs/pr-piet)
   python-ci.yml     Isolated Python 3.12/3.14 checks using project-pinned development tools
-                    (+ pytest-cov → coverage.xml, tokenless Codecov upload, SHA-pinned action)
+                    (pytest-cov measures caretaker/; local 80% floor; no Codecov upload)
 ```
 
 ## Handoff
@@ -579,6 +585,11 @@ tests/
   MTP-acceptatie 0.55, turbo4-boot OK op de productie-binary. Feiten →
   Omgeving-sectie hierboven; guardian-zijde (registry-spec-executie) →
   handoff guardian-repo.
+- **2026-11-10 (historical Codecov implementation, superseded):** the entry
+  below records the earlier upload design, not the current workflow. The local
+  gate policy and measured CI baseline supersede it; see `docs/HANDOFF.md` under
+  "2026-11-13 — Local coverage policy correction". No upload or XML status is
+  currently promised.
 - **2026-11-10 (Codecov-coverage bedraad):** branch `f-codecov-coverage`,
   issue #22. Root `codecov.yml` maakt `codecov/project` + `codecov/patch`
   **informational** (gemeten les uit m0nklabs/oelala: de default patch-status
