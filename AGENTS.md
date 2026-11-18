@@ -4,23 +4,37 @@
 > Claude Code: `CLAUDE.md` → hier. Goose: `.goosehints` → hier.
 > Current state, verified findings, checks and open review conditions: `./docs/HANDOFF.md`. Implementation plan: `./PLAN.md`. Historical status entries below are not proof of the current checkout or deployment.
 
-## Wat is dit project
+## Product mission and current scope
 
-`caretaker-llamacpp` is de **manager-daemon die de levenscyclus van
-llama-server bezit**, per GPU-host. Spiegelbeeld van Guardian: *guardian* =
-gatekeeper (gateway/proxy-laag), *caretaker* = verzorger/onderhouder (de
-wrapper naast llama-server die hem spawns, bewaakt en unloadt).
+Caretaker's planned mission is an exceptional cross-platform **resource and service
+manager/controller**, complementary to Guardian. [PLAN.md](PLAN.md) is the sole
+canonical roadmap: current-main evidence, authority boundaries, OS/backend matrix
+and planned R1–R7 tracks. Existing llama.cpp, Comfy, TTS and STT adapters are not a
+generic controller. Linux systemd and Windows direct/NSSM paths exist; macOS is not
+established by portable Python tests or the non-Windows systemd default.
 
-Ontstaan uit het opsplitsingsplan `GATEWAY_MANAGER_SPLIT.md` (operator-besluit
-2026-08-26): de `local`-levenscyclus moet uit Guardian en als eigen proces
-naast llama-server draaien, zodat **alles wat modellen serveert een provider
-is** en Guardian puur de gateway + logger wordt.
+Caretaker executes host lifecycle/resource control; Guardian owns client policy,
+service selection, traffic and application protocols. Never introduce a second
+lifecycle owner, generic remote command execution or a duplicate gateway. Preserve
+compatibility and prove behavior before claiming support, security or performance.
 
-## Waar dit project onderdeel van is
+## Context and history pointers
 
-Dit repo is **niet op zichzelf staand** — het is **fase F5 van de Guardian 2.0
-masterplan** (issue #1 in `m0nklabs/guardian-llmprovider-gateway`,
-`docs/IMPLEMENTATION_PLAN.md`, canoniek). Fasevolgorde F0–F7:
+Read [docs/HANDOFF.md](docs/HANDOFF.md) only for current state, named open work or
+continuation; findings belong in [docs/AGENT_JOURNAL.md](docs/AGENT_JOURNAL.md).
+[docs/archive/agent-instructions-2026-09-22.md](docs/archive/agent-instructions-2026-09-22.md)
+is the declared history archive, including verbatim replaced issue-24 context.
+Keep stable rules/pointers here; dated status stays cold. Preserve historical
+entries below rather than treating them as current deployment evidence.
+
+## Historical Guardian extraction context (F0–F7)
+
+The original split originated in Guardian's F5 specification
+(`docs/IMPLEMENTATION_PLAN.md`, historical F0–F7 migration plan). The sequence
+below is retained history, not the current product roadmap, present ownership
+contract or proof of deployment. Current Caretaker work is canonical in
+[PLAN.md](PLAN.md); Guardian's active roadmap is `docs/ROADMAP.md` in its repo.
+Historical phase sequence:
 
 - **F0–F4 (GEMMERGED):** foundation/rename, CI, per-provider config (F2),
   local als managed provider (F3), en **F4 = registry/keuze/discovery
@@ -43,18 +57,30 @@ en wat NIET verhuist (registry/keuze, `is_switch_allowed`, idle-unload-
 beslissing, admin/status/metrics-readouts) + risico's die het API-contract
 bepalen (`POST /ensure`, `POST /unload`, `GET /status`, allen Bearer).
 
-**Review-werkstroom (zelfde cultuur als guardian):** dit repo heeft
-`.github/workflows/pr-piet.yml` (org-reusable `m0nklabs/pr-piet`, tier-1
-deepseek + optionele tier-2; `single_call_review: true` experimenteel). Na
-**elke laatste commit** → `gh pr comment <n> --body "/review"` (mens-account
-`m0nk111`). **Merge-criterium (operator): mergeen pas als er GEEN openstaande
-bevindingen/threads uit de review zijn** (weerlegd+beantwoord telt niet);
-geen auto-approve/auto-merge — human merge. Concurrency-cancel van de
-auto-`pull_request`-run is een bekend patroon → herstel met
-`gh run rerun <run-id> --failed`. **PR's van `ecc-tools[bot]` (ECC-bundle,
-bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
+## Git, review and merge rules
 
-## Status (2026-08-28)
+- After the final **push**, and every subsequent push, post a comment whose body
+  is exactly `/review` from the human account `m0nk111` here; bot senders are
+  ignored. A pre-push request or model-suffixed request alone does not satisfy it.
+- Require a **completed independent review of the current head**, all findings
+  fixed or evidence-answered and threads handled, and passing checks. Verify
+  findings before accepting or refuting them. No self-approval. Failed/cancelled
+  infrastructure is not a clean review; preserve issue #21 as unresolved until
+  actual current-head review evidence proves otherwise.
+- This account's waiting window is **2 hours**. Record its anchor: the last
+  outstanding review answer, or for no findings the completed current-head review
+  plus green checks, whichever is later; never before the latest push. A closing
+  comment is normal, **not a prerequisite**. At merge time read all latest
+  comments/reviews/commits, handle new activity (restart the clock if it needs a
+  reply/fix/decision), refresh base/head/merge state and reverify checks. Silence
+  is not evidence of a completed review. Global rules govern merge authority.
+- Authentication, secrets, migrations, deployment and dependency majors retain
+  explicit human gates regardless of the clock. Never change a deployment,
+  restart a service or repair another repository merely to unblock review.
+- Do not touch externally owned `ecc-tools[bot]` PRs. Current review/deployment/
+  coverage evidence belongs in the handoff; do not close #19/#21/#22 by inference.
+
+## Historical status (original 2026-08-28 heading; later entries retained)
 
 - **Watchdog-wiring (2026-09-25, branch `f-watchdog-wiring`, PR open):**
   de 2026-09-16-handoff ("`start_watchdog()` wordt nergens aangeroepen — de
@@ -286,59 +312,29 @@ bv. PR #2) NIET aanraken** — die komen van een externe bot-workflow.
   produceert `-c None -ngl None` — dat IS de guardian-identieke output (de `4096`/`99`-
   default geldt alleen bij afwezige key). Golden-test pinnt dit bewust.
 
-## Scope — wat hoort WEL hier (alleen de lifecycle-kern)
+## Current lifecycle and resource ownership rules
 
-Ontleed uit `engine/manager.py` (~1637 regels), hard geteld:
+- The manager serializes llama switch/unload/stop and generation-validates watchdog
+  observations. API lifespan arms/stops the config-gated watchdog; old “not wired”
+  or “caller must wire” entries below are history, not present behavior.
+- Llama `idle_since` is load time, not last inference activity. Guardian decides
+  traffic-idle unload; Caretaker executes it. TTS/STT own ensure-refreshed timers;
+  Comfy has adapter-specific queue/connection checks. None establishes a global
+  active-work lease or universally safe cross-service eviction contract.
+- Existing resource accounting/probes are limited. Unknown GPU usage is not proof
+  of free capacity; the planned conservative R5 policy is not a claim about today's
+  fail-open NVIDIA probes or estimated-size VRAM scheduler.
+- Control routes require the per-daemon `CARETAKER_KEY`: missing/non-ASCII key
+  yields 503 per request; missing/wrong client key yields 401. This is not TLS,
+  fine-grained authorization or a startup bind prohibition. Backend credentials
+  are separate. Non-loopback transport/exposure and least privilege require the
+  R6 threat model and explicit authorization; do not expose the Comfy wake proxy
+  on the assumption that control-route Bearer auth protects its raw TCP listener.
+- [PLAN.md](PLAN.md) owns the target desired/observed/generation, adapter, resource,
+  lease/drain, native support, diagnostics/security and benchmark contracts.
+  Historical split tables/API/topology are archived, not parallel current canon.
 
-| Regels | Categorie | Hoort waar? |
-|---|---|---|
-| ~1050 | **Echte lifecycle**: spawn/stop/restart, args-bouw, drift-detectie, health-check, crash-detectie + auto-restart, unload, ComfyUI VRAM vrijmaken, context-save/restore | **Hier (caretaker)** |
-| ~40 | VRAM-slot-acquisitie (`VRAMScheduler.acquire/release`) | Hier |
-| ~40 | `reload_backend_after_connect_error` (herstel-pad) | Hier |
-| ~25 | Idle-unload watcher | Hier, MAAR verweven met verkeer (contract met gateway) |
-| ~509 | Registry/keuze/discovery (`resolve_model`, preferred tool/reasoning model, vision-cache, context-metadata, public model map) | **Blijft in de gateway — F4 GEDAAN** (`ModelRegistry`, `app/local_inference/model_registry.py`) |
-| ~130 | Resolutie/sizes/timeouts (`local_inference/models.py`) | Gateway |
-| ~78 | Settings lezen (`_load_aliases`, `_load_switch_allowlist`, `_load_config`) | Gedeeld — leest dezelfde YAML, geen kopie |
-
-**Principe: settings zijn geen manager-werk.** `models.local.settings.yaml`
-is de enige gedeelde bron; de caretaker leest hem alleen (geen keuze-
-logica/registratie kopiëren).
-
-## Design-contract (uit het plan)
-
-Dunne control-API, eigen proces naast llama-server op poort **11441**:
-
-```
-GET  /status            → geladen model + gpu/vram-status
-POST /ensure {model}    → laad model (VRAM-slot, swap); idempotent
-POST /unload            → unload (of zelf na N minuten — met verkeers-input)
-(OpenAI-inferentie-API blijft rechtstreeks llama-server: http://127.0.0.1:11440/v1)
-```
-
-**Security (operator-besluit 2026-08-27): per-caretaker één eigen key.** Elke
-control-call (`/status`, `/ensure`, `/unload`) vereist
-`Authorization: Bearer ${CARETAKER_KEY}`; zonder geldige key → 401. Elke
-GPU-host heeft zijn eigen key (net als cloud providers bij Guardian): de
-gateway slaat die per host op in de provider-entry
-(`config/providers/<host>-local.settings.yaml`, `api_key: ${...}`, nooit
-committen). De caretaker leest de key uit env/secret, nooit uit de repo.
-LAN-IP-allowlist mag aanvullend, nooit vervangend.
-
-Contract gateway ↔ manager:
-
-- Gateway roept vóór een forward optioneel `POST /ensure {model}` aan;
-  daarna `POST /v1/chat/completions` op llama-server.
-- Manager kan zelf een swap triggeren (idle-unload) → gateway vangt
-  404 `model_not_loaded` / 503 af en retryt met `ensure`.
-- **Verkeers-input:** gateway geeft actieve request/queue-aantallen door;
-  de idle-beslissing mag bij de gateway blijven, uitvoering in de manager.
-- `GET /status` voedt de discovery van de gateway (manager is bron van
-  waarheid voor de lokale GPU).
-- In de gateway wordt `local` een passieve provider-entry:
-  `base_url: http://127.0.0.1:11440/v1`, `management_url: http://127.0.0.1:11441`,
-  `managed: false`.
-
-## Deployment-topologie (operator 2026-08-26)
+## Historical deployment topology (operator 2026-08-26; not current verification)
 
 **De manager is per GPU-host** (niet alleen lokaal):
 
@@ -356,7 +352,7 @@ ai-kvm-2 (Linux, GPU #1)              14700K (Windows, GPU #2)
 - `providers.settings.yaml` op ai-kvm-2 verwijst naar beide management_urls
   (`http://192.168.1.35:11441` + `http://192.168.1.x:11441`).
 
-## Omgeving (feitelijk, geverifieerd)
+## Historical environment evidence (dated below; not live verification)
 
 - **llama-server binary (sinds 2026-10-21):** `~/llama_cpp_official/worktrees/b11790-tq4/build/bin/llama-server`
   — unified TurboQuant+ merge (`1837d005f` = upstream b11790 `0efe8e4c6` + fork
@@ -427,28 +423,24 @@ ai-kvm-2 (Linux, GPU #1)              14700K (Windows, GPU #2)
   (intern project); Engels voor code, API en publieke docs.
 - **Commit-identity = de modelnaam van de agent** (zelfde als guardian-repo;
   nooit overschrijven naar `PR-Piet`).
-- **AGENTS.md altijd bijwerken — inclusief verse bevindingen.** Elke
-  gedragsverandering, bugfix, config-wijziging én elk feit dat moest worden
-  uitgezocht gaat in DEZELFDE sessie dit bestand in (vóór de commit). De
-  handoff-sectie is het primaire continuïteitsmechanisme tussen sessies;
-  een stale handoff is een bug. Regel van duim: moest je code/config/docs
-  inspecteren om te weten hoe iets werkt → schrijf het meteen op.
+- **Documentation maintenance:** keep durable rules and task-directed pointers in
+  this file; current dated state/checks/next actions in `docs/HANDOFF.md`, findings
+  in `docs/AGENT_JOURNAL.md`, history in the declared archive. Archive replaced
+  dated entries verbatim first; preserve unresolved work and a carry-forward link.
+  Do not duplicate a roadmap or append every observation to hot instructions.
 - **Subagents maximaliseren (verse context).** De lead houdt het plan,
   kinderen doen mechanisch/implementatie-/meetwerk. Eén schrijver per
   cwd/worktree; serialiseer edits aan gedeelde bestanden.
 - **Dit repo is een daemon-repo:** systeemunit (`caretaker-llamacpp.service`)
   + eigen logging horen erbij zodra er iets draait.
-- **Niet dupliceren:** de ontwerpdetails staan in de plan-docs van het
-  guardian-repo; dit bestand indexeert en verwijst, legt niet opnieuw uit.
-- **PR-review-loop vóór elke merge:** na elke laatste commit `/review` posten
-  (mens-account `m0nk111`), merge pas zonder openstaande bevindingen
-  (weerlegd+beantwoord telt niet), human merge. ECC-bundle-PR's van
-  `ecc-tools[bot]` niet aanraken.
+- **Do not duplicate:** Caretaker's canonical roadmap is `PLAN.md`; Guardian owns
+  its traffic/policy roadmap. Use the Git/review rules above and global merge
+  gates, not superseded historical workflow notes.
 
 ## Directory map
 
 ```text
-PLAN.md             Gefaseerd implementatieplan (fases A–E + gateway-wiring)
+PLAN.md             Canonical controller roadmap R1–R7 + historical A–E/wiring specification
 AGENTS.md           Dit bestand
 pyproject.toml      Package `caretaker` (Python >=3.12; dev: pytest/ruff)
 requirements.txt    Runtime dependency list; isolated CI installs the project with .[dev]
@@ -489,7 +481,7 @@ tests/
                     (pytest-cov measures caretaker/; local 80% floor; no Codecov upload)
 ```
 
-## Handoff
+## Historical handoff entries (current state: docs/HANDOFF.md)
 
 - 2026-08-26: repo aangemaakt (leeg, publiek: `m0nklabs/caretaker-llamacpp`).
   AGENTS.md-scaffold + **`PLAN.md`** (gefaseerd plan fases A–E + gateway-
@@ -626,5 +618,5 @@ tests/
 - Per-provider config: `~/guardian-llmprovider-gateway/docs/CONFIG_PROVIDER_FILES.md`
 - Masterplan (issue #1 in het guardian-repo):
   `~/guardian-llmprovider-gateway/docs/IMPLEMENTATION_PLAN.md`
-- Guardian (huidige implementatie, alles draait daar nu):
+- Guardian (gateway repository, not a deployment claim):
   `~/guardian-llmprovider-gateway/AGENTS.md`
