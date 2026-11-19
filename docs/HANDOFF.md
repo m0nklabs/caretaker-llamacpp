@@ -3,6 +3,12 @@
 > Cold file (niet in de prompt-cache): actuele status + sessie-overdracht. Nieuwe blokken **bovenaan** appen.
 > Werkwijze → `~/.dsh/AGENTS.md` ("AGENTS.md maintenance discipline") + repo `AGENTS.md`.
 
+## 2026-11-19 — Review infrastructure evidence correction (#24 / PR #25) — DSH caretaker-nov19 (openrouter/openai/gpt-6.1-sol)
+
+- **Scope / baseline:** documentation-only remediation in the isolated PR worktree; clean branch `docs/24-controller-quality-roadmap` at `5df09f67966bf36d30fb7b1c401adea48b71f8dc` and fresh GitHub main `89ad9ac67618bf531b69872a349ab55458354312` verified before editing. Only the review-infrastructure row in [PLAN.md](../PLAN.md) and this additive note are changed; existing history is preserved.
+- **Correction / evidence:** the [2026-11-04 issue correction](https://github.com/m0nklabs/caretaker-llamacpp/issues/21#issuecomment-6636065974) disproves the historical model-suffixed workaround: both request forms failed then. PR #25's [exact `/review` request](https://github.com/m0nklabs/caretaker-llamacpp/pull/25#issuecomment-6993322144) on 2026-11-18 was followed by a [completed no-findings review](https://github.com/m0nklabs/caretaker-llamacpp/pull/25#pullrequestreview-5966145619) at `5df09f67966bf36d30fb7b1c401adea48b71f8dc`. This is scoped evidence of exact-request success, not proof of universal infrastructure repair. [Issue #21](https://github.com/m0nklabs/caretaker-llamacpp/issues/21) remains open; its both-form acceptance is still unverified.
+- **Boundaries / next action:** no staging, commit, push, review request, issue closure, runtime/config/dependency change, live/native/GPU probe or service operation. Production checkout and its pre-existing dirty files are untouched. Parent owns publication and fresh current-head review/checks/window handling after any push; the earlier review does not cover this remediation.
+
 ## 2026-11-18 — Controller mission and quality roadmap (#24) — DSH (openrouter/openai/gpt-6.1-sol)
 
 - **Goal / ownership:** implement [issue #24](https://github.com/m0nklabs/caretaker-llamacpp/issues/24) documentation only in the isolated current-main worktree, branch `docs/24-controller-quality-roadmap`, base `89ad9ac`. Parent/lead owns publication and independent current-head PR review. No commit/index/push/GitHub writes, dependency installation, production-checkout edits, source/config changes, live probes or service operations performed.
