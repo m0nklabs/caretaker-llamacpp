@@ -1,12 +1,33 @@
 # caretaker-llamacpp
 
-`caretaker-llamacpp` is the **per-GPU-host manager daemon that owns the llama-server
-lifecycle**: it spawns, stops, reloads and monitors the local `llama-server` behind a
-thin, authenticated control API on port `:11441` (`GET /status`, `POST /ensure`,
-`POST /unload`). OpenAI inference stays direct to `llama-server` on `:11440/v1` and is
-**not** handled by this daemon. See the phased implementation plan in
-[`PLAN.md`](./PLAN.md) for the full roadmap (phases A–E) and the context/goals in
-section 0 of that file.
+Caretaker's mission is to become an exceptional **cross-platform resource and
+service manager/controller**, complementary to Guardian. Caretaker owns host
+lifecycle/resource execution; Guardian owns client policy, routing, traffic and
+application protocols. This is a planned expansion, not a claim that a generic
+controller, complete cross-platform support or state-of-the-art performance ships.
+
+**Implemented today:** llama.cpp lifecycle and Comfy/TTS/STT adapters, behind an
+authenticated control API (default loopback `:11441`), with workload-specific
+health, idle and resource coordination. Inference remains on the engine endpoints;
+Caretaker is not a second general inference gateway. Existing Comfy TCP wake-proxy
+behavior is adapter-specific and does not share the control routes' Bearer gate.
+Linux systemd and Windows direct-process/NSSM paths exist; macOS support is not
+established (non-Windows llama process selection currently defaults to systemd).
+
+[PLAN.md](PLAN.md) is the **canonical roadmap**, with evidence/status distinctions,
+the OS/install/CPU/CUDA/ROCm/Metal matrix, R1–R7 planned tracks, dependencies and
+acceptance gates: authoritative desired/observed state and generations, onboarded
+adapters, reconciliation/drain/leases, multi-resource capacity, security/redacted
+observability, reproducible debugging and baseline-calibrated innovation. Original
+A–E history remains there, explicitly historical. Unit CI does not certify native
+services or GPUs; untested cells remain explicit.
+
+See [AGENTS.md](AGENTS.md) for engineering rules and [the handoff](docs/HANDOFF.md)
+for dated evidence and open work. Deployment drift [#19](https://github.com/m0nklabs/caretaker-llamacpp/issues/19),
+review infrastructure [#21](https://github.com/m0nklabs/caretaker-llamacpp/issues/21)
+and local coverage [#22](https://github.com/m0nklabs/caretaker-llamacpp/issues/22)
+remain distinct from the mission documentation; merged source is not proof of
+running deployment. No runtime/service change follows from this roadmap.
 
 ## Development checks
 
@@ -18,14 +39,17 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip check
 .venv/bin/python -m ruff check caretaker tests
 .venv/bin/python -m compileall -q caretaker tests
-.venv/bin/python -m pytest tests/ -q -p no:cacheprovider
+.venv/bin/python -m pytest tests/ -q -p no:cacheprovider \
+  --cov=caretaker --cov-report=term-missing --cov-fail-under=80
 ```
 
 CI runs the same installation and checks in isolated Python 3.12 and 3.14
 virtual environments. Pytest, pytest-asyncio and Ruff versions are pinned in
 `pyproject.toml`; Ruff also rejects a mismatched executable version. Its target
-is the minimum supported Python 3.12, not the developer's interpreter. Runtime
-and transitive dependencies are not fully locked by these development-tool pins.
+is the minimum supported Python 3.12, not the developer's interpreter. The local
+coverage floor measures `caretaker/`, not the whole checkout; no Codecov upload or
+external coverage status is required. Runtime and transitive dependencies are not
+fully locked by these development-tool pins.
 The repository owns this CI job because the shared workflow installs unpinned
 Ruff and uses preinstalled runtime dependencies; a local dev pin alone would not
 control that workflow.
